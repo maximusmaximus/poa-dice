@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>POA Dice — Agent-First Provably Fair Dice Slider &amp; Shared Bankroll Vault</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Top Network & Dev Reserve Telemetry Bar -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="brand-logo" aria-hidden="true">🎲</div>
+      <div>
+        <div class="brand-title-row">
+          <h1 class="brand-title">POA DICE</h1>
+          <span class="badge badge-protocol">poa-mainnet-1</span>
+          <span id="sseStatusBadge" class="badge badge-live">
+            <span class="pulse-dot"></span>
+            <span id="sseStatusText">LIVE SSE</span>
+          </span>
+        </div>
+        <p class="brand-subtitle">Agent-First Provably Fair Crypto Dice Slider &amp; Shared ERC-4626 Bankroll Vault</p>
+      </div>
+    </div>
+
+    <div class="topbar-metrics">
+      <div class="metric-pill">
+        <span class="metric-label">BANKROLL NAV</span>
+        <span id="topBankNav" class="metric-value highlight-emerald">250,000.000000 POA</span>
+      </div>
+      <div class="metric-pill">
+        <span class="metric-label">AVAILABLE LIQUIDITY</span>
+        <span id="topBankAvail" class="metric-value">250,000.000000 POA</span>
+      </div>
+      <div class="metric-pill">
+        <span class="metric-label">KELLY MAX PROFIT (1%)</span>
+        <span id="topKellyMax" class="metric-value highlight-cyan">2,500.000000 POA</span>
+      </div>
+      <div class="metric-pill dev-reserve-pill" title="0.1% (10 bps) of earnings reserved for future development under Max / Tessellate Army">
+        <span class="metric-label">0.1% DEV RESERVE (<code id="topDevAddrShort">poa12XVY...rQ5U</code>)</span>
+        <div class="dev-pill-row">
+          <span id="topDevAccrued" class="metric-value highlight-amber">0.000000 POA</span>
+          <button id="btnSweepDev" class="btn-xs btn-amber" title="Sweep accrued 0.1% dev reserve to poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U">Sweep</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="topbar-wallet">
+      <div class="wallet-box">
+        <div class="wallet-header">
+          <span class="metric-label">SELF-CUSTODY SIGNER</span>
+          <span id="walletVipBadge" class="badge badge-vip">Standard (1.00% Edge)</span>
+        </div>
+        <div class="wallet-addr-row">
+          <code id="activeWalletAddr" class="wallet-addr">Generating Ed25519 key...</code>
+          <button id="btnNewWallet" class="btn-xs" title="Generate a fresh client-side Ed25519 POA keypair">New Key</button>
+          <button id="btnToggleOfflineMode" class="btn-xs btn-outline" title="Inspect Website-Down / Pure On-Chain Memo Mode">Offline Mode</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Website-Down / Hack-Resilient Banner (Collapsible) -->
+  <section id="offlineBanner" class="offline-banner hidden">
+    <div class="offline-banner-inner">
+      <div>
+        <strong>🛡️ 100% Website-Independent &amp; Hack-Resilient Architecture:</strong>
+        Even if this website goes offline or its frontend is compromised, every action (<code>BET</code>, <code>LP_ADD</code>, <code>LP_WITHDRAW</code>, <code>CHAT</code>, <code>CLAIM</code>) works directly on the Proof of Agent ledger by sending a standard transfer to Bank Address <code id="bannerBankAddr">poa1...</code> with a <code>DICE1:*</code> memo, or via <code>node bin/poa-dice-cli.mjs</code> / <code>python bin/poa-dice-cli.py</code> / Stdio MCP (<code>node src/mcp-server.mjs --stdio</code>). All payouts and LP withdrawals are cryptographically pinned to <code>tx.from</code>.
+      </div>
+      <div class="offline-cmd-box">
+        <label class="metric-label">LIVE ON-CHAIN MEMO COMMAND (WORKS WITHOUT WEBSITE):</label>
+        <div class="cmd-copy-row">
+          <code id="liveOfflineCommand">node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to poa1... --amount 10.000000 --memo "DICE1:BET:under:4950:client-seed"</code>
+          <button id="btnCopyOfflineCmd" class="btn-xs btn-emerald">Copy Command</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main Responsive 3-Column Grid -->
+  <main class="workspace-grid">
+    <!-- COLUMN 1: Interactive Crypto Dice Slider & Auto-Bet -->
+    <section class="panel panel-dice" aria-label="Provably Fair Dice Slider">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">🎯 Provably Fair Dice Slider</h2>
+          <p class="panel-desc">Drag slider to set target &amp; win probability. Ed25519-signed transactions settle with HMAC-SHA256 verification.</p>
+        </div>
+        <div class="seed-pill">
+          <span class="metric-label">SERVER SEED SHA-256</span>
+          <code id="seedHashShort" title="Current committed Server Seed SHA-256 hash">loading...</code>
+        </div>
+      </div>
+
+      <!-- Animated Roll Display Drum -->
+      <div class="roll-stage" id="rollStage">
+        <div class="roll-drum-wrapper">
+          <div class="roll-label" id="rollStatusLabel">READY TO ROLL (00.00 – 99.99)</div>
+          <div class="roll-digits" id="rollDigits">49.50</div>
+          <div class="roll-subinfo" id="rollSubinfo">
+            Commit-Reveal HMAC-SHA256 &bull; Kelly-Safe Bankroll Backed
+          </div>
+        </div>
+        <div class="roll-threshold-marker">
+          <span id="thresholdBadge" class="badge badge-threshold">ROLL UNDER 49.50 TO WIN</span>
+        </div>
+      </div>
+
+      <!-- Dual-Zone Interactive Slider -->
+      <div class="slider-container">
+        <div class="slider-scale">
+          <span>0.00</span>
+          <span>25.00</span>
+          <span>50.00</span>
+          <span>75.00</span>
+          <span>99.99</span>
+        </div>
+        <div class="slider-track-wrap">
+          <div id="sliderTrackVisual" class="slider-track-visual"></div>
+          <div id="lastRollPin" class="last-roll-pin hidden" title="Last Roll Outcome">
+            <span id="lastRollPinText">49.50</span>
+          </div>
+          <input
+            type="range"
+            id="diceSlider"
+            class="dice-slider-input"
+            min="100"
+            max="9800"
+            step="25"
+            value="4950"
+            aria-label="Dice Target Threshold"
+          />
+        </div>
+      </div>
+
+      <!-- 4 Synchronized Game Metric Cards -->
+      <div class="dice-stats-grid">
+        <div class="stat-box">
+          <div class="stat-box-header">
+            <label for="targetInput">TARGET</label>
+            <button id="btnFlipDirection" class="btn-xs btn-cyan" type="button" title="Toggle Roll Under vs Roll Over">
+              <span id="directionText">Roll Under</span> ⇄
+            </button>
+          </div>
+          <input type="number" id="targetInput" class="stat-input" min="1.00" max="98.99" step="0.25" value="49.50" />
+        </div>
+
+        <div class="stat-box">
+          <div class="stat-box-header">
+            <label for="winChanceInput">WIN CHANCE (%)</label>
+            <span class="stat-hint">1% – 98%</span>
+          </div>
+          <input type="number" id="winChanceInput" class="stat-input" min="1.00" max="98.00" step="0.25" value="49.50" />
+        </div>
+
+        <div class="stat-box">
+          <div class="stat-box-header">
+            <label>MULTIPLIER</label>
+            <span id="edgeHintBadge" class="stat-hint highlight-emerald">1.00% Edge</span>
+          </div>
+          <div id="multiplierDisplay" class="stat-readout highlight-cyan">2.0000x</div>
+        </div>
+
+        <div class="stat-box">
+          <div class="stat-box-header">
+            <label>PROFIT ON WIN</label>
+            <span id="maxWagerHint" class="stat-hint">Max: 2500 POA</span>
+          </div>
+          <div id="profitOnWinDisplay" class="stat-readout highlight-emerald">+10.000000 POA</div>
+        </div>
+      </div>
+
+      <!-- Wager & Client Seed Controls -->
+      <div class="wager-controls-grid">
+        <div class="control-group">
+          <div class="control-label-row">
+            <label for="wagerInput">WAGER AMOUNT (POA)</label>
+            <span id="payoutPreviewText" class="control-sub">Total Payout: 20.000000 POA (0.1% Dev Fee: 0.010000 POA)</span>
+          </div>
+          <div class="wager-input-row">
+            <input type="number" id="wagerInput" class="wager-input" min="1" step="1" value="10.000000" />
+            <div class="quick-btns">
+              <button type="button" id="btnBetMin" class="btn-quick">MIN</button>
+              <button type="button" id="btnBetHalf" class="btn-quick">1/2</button>
+              <button type="button" id="btnBetDouble" class="btn-quick">2X</button>
+              <button type="button" id="btnBetMax" class="btn-quick btn-quick-max" title="Set wager to Kelly Criterion Safe Maximum">MAX</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <div class="control-label-row">
+            <label for="clientSeedInput">CLIENT SEED (PROVABLY FAIR)</label>
+            <button type="button" id="btnRandomSeed" class="btn-link">Randomize</button>
+          </div>
+          <input type="text" id="clientSeedInput" class="seed-input" value="tessellate-agent-seed-01" maxlength="64" />
+        </div>
+      </div>
+
+      <!-- Primary Roll Action & Agent Auto-Strategy -->
+      <div class="roll-actions-row">
+        <button type="button" id="btnRollDice" class="btn-primary-roll">
+          <span>🎲 SIGN &amp; ROLL DICE</span>
+          <small id="btnRollSubtext">Ed25519 Signed POA Tx &bull; Instant Provably Fair Roll</small>
+        </button>
+        <button type="button" id="btnAgentAutoBurst" class="btn-secondary-roll" title="Run 5 Autonomous Agent Kelly-Safe Rolls">
+          🤖 Agent 5-Roll Burst
+        </button>
+      </div>
+
+      <div id="betErrorAlert" class="alert-box alert-error hidden"></div>
+      <div id="lastTxReceiptBox" class="tx-receipt-strip">
+        <span class="metric-label">LATEST SIGNED TX / MEMO:</span>
+        <code id="lastSignedMemoText">DICE1:BET:under:4950:tessellate-agent-seed-01</code>
+      </div>
+    </section>
+
+    <!-- COLUMN 2: Shared Bankroll Vault & Agent Staking Incentives -->
+    <section class="panel panel-bank" aria-label="Shared Bankroll Liquidity Pool & Staking">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">🏦 Shared Bankroll Vault (Be The House)</h2>
+          <p class="panel-desc">Anyone (human or AI agent) can add POA to the bank, own a proportional share of the bank, and earn house-edge yield + conviction boosts.</p>
+        </div>
+        <span class="badge badge-emerald">ERC-4626 Virtual-Offset Protected</span>
+      </div>
+
+      <!-- User's Current LP Position Summary -->
+      <div class="lp-position-card">
+        <div class="lp-pos-header">
+          <span class="metric-label">YOUR ACTIVE BANKROLL POSITION</span>
+          <span id="userConvictionBadge" class="badge badge-cyan">Conviction: 1.00x</span>
+        </div>
+        <div class="lp-pos-grid">
+          <div>
+            <div class="lp-pos-label">Share of Bank Owned</div>
+            <div id="userSharePct" class="lp-pos-val highlight-cyan">0.0000%</div>
+          </div>
+          <div>
+            <div class="lp-pos-label">Redeemable Value</div>
+            <div id="userRedeemablePoa" class="lp-pos-val highlight-emerald">0.000000 POA</div>
+          </div>
+          <div>
+            <div class="lp-pos-label">Net PnL + Incentives</div>
+            <div id="userNetPnlPoa" class="lp-pos-val">0.000000 POA</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Deposit & Withdraw Tabs -->
+      <div class="tab-bar">
+        <button type="button" class="tab-btn active" data-bank-tab="deposit">➕ Add Funds to Bank (Stake)</button>
+        <button type="button" class="tab-btn" data-bank-tab="withdraw">📤 Withdraw Share &amp; Profit</button>
+        <button type="button" class="tab-btn" data-bank-tab="incentives">⚡ Agent Staking Incentives</button>
+      </div>
+
+      <!-- TAB 1: DEPOSIT CALCULATOR -->
+      <div id="bankTabDeposit" class="bank-tab-body">
+        <div class="control-group">
+          <div class="control-label-row">
+            <label for="depositAmountInput">DEPOSIT AMOUNT (POA)</label>
+            <span class="control-sub">Min: 10.000000 POA &bull; Max Cap: 500M POA</span>
+          </div>
+          <div class="wager-input-row">
+            <input type="number" id="depositAmountInput" class="wager-input" min="10" step="100" value="5000.000000" />
+            <div class="quick-btns">
+              <button type="button" class="btn-quick" data-set-deposit="1000.000000">1K</button>
+              <button type="button" class="btn-quick" data-set-deposit="10000.000000">10K</button>
+              <button type="button" class="btn-quick" data-set-deposit="100000.000000">100K</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <div class="control-label-row">
+            <label for="lockEpochsInput">CONVICTION LOCK (6H POA EPOCHS)</label>
+            <span id="convictionBoostPreview" class="control-sub highlight-cyan">4 Epochs = 1.20x Yield Weight</span>
+          </div>
+          <input type="range" id="lockEpochsInput" class="epoch-slider" min="0" max="10" step="1" value="4" />
+        </div>
+
+        <!-- Exact Deposit -> Ownership % -> Return Breakdown -->
+        <div class="quote-preview-card">
+          <div class="quote-row">
+            <span>New LP Shares Minted:</span>
+            <code id="quoteSharesMinted">--</code>
+          </div>
+          <div class="quote-row">
+            <span>Your New Ownership % of Bank:</span>
+            <strong id="quoteBankPercent" class="highlight-cyan">--%</strong>
+          </div>
+          <div class="quote-row">
+            <span>VIP House-Edge Rebate Unlocked:</span>
+            <strong id="quoteVipUnlocked" class="highlight-emerald">--</strong>
+          </div>
+          <div class="quote-row">
+            <span>Exit Fee Policy:</span>
+            <span>0.00% after 1 epoch (0.10% anti-JIT if &lt;1 epoch)</span>
+          </div>
+
+          <div class="projections-title">HOW MUCH YOU GET BACK AS BANKROLL GROWS:</div>
+          <table class="projections-table">
+            <thead>
+              <tr>
+                <th>Bank Growth</th>
+                <th>Your Redeemable Value</th>
+                <th>Your Net Profit</th>
+              </tr>
+            </thead>
+            <tbody id="depositProjectionsBody"></tbody>
+          </table>
+        </div>
+
+        <button type="button" id="btnSubmitDeposit" class="btn-action-emerald">
+          🔒 Sign &amp; Add POA to Bankroll Vault
+        </button>
+      </div>
+
+      <!-- TAB 2: WITHDRAWAL CALCULATOR -->
+      <div id="bankTabWithdraw" class="bank-tab-body hidden">
+        <div class="control-group">
+          <div class="control-label-row">
+            <label>PERCENTAGE OF YOUR BANK SHARES TO WITHDRAW</label>
+            <span id="withdrawBpsLabel" class="control-sub highlight-cyan">100% (ALL SHARES)</span>
+          </div>
+          <div class="quick-btns withdraw-pct-btns">
+            <button type="button" class="btn-quick" data-withdraw-bps="2500">25%</button>
+            <button type="button" class="btn-quick" data-withdraw-bps="5000">50%</button>
+            <button type="button" class="btn-quick" data-withdraw-bps="7500">75%</button>
+            <button type="button" class="btn-quick active" data-withdraw-bps="10000">100% (ALL)</button>
+          </div>
+        </div>
+
+        <div class="quote-preview-card">
+          <div class="quote-row">
+            <span>Shares to Redeem:</span>
+            <code id="withdrawQuoteShares">0</code>
+          </div>
+          <div class="quote-row">
+            <span>Gross Bank Value:</span>
+            <strong id="withdrawQuoteGross">0.000000 POA</strong>
+          </div>
+          <div class="quote-row">
+            <span>Early-Exit Fee (Retained by Pool):</span>
+            <span id="withdrawQuoteFee">0.000000 POA (0 bps)</span>
+          </div>
+          <div class="quote-row">
+            <span>Net POA Returned to Your Address:</span>
+            <strong id="withdrawQuoteNet" class="highlight-emerald">0.000000 POA</strong>
+          </div>
+          <div class="quote-row">
+            <span>Settlement Queue Status:</span>
+            <span id="withdrawQuoteStatus" class="badge badge-emerald">INSTANT</span>
+          </div>
+        </div>
+
+        <button type="button" id="btnSubmitWithdraw" class="btn-action-amber">
+          📤 Sign &amp; Withdraw POA to My Address
+        </button>
+      </div>
+
+      <!-- TAB 3: AGENT STAKING INCENTIVE STRATEGY -->
+      <div id="bankTabIncentives" class="bank-tab-body hidden">
+        <div class="incentives-list">
+          <div class="incentive-item">
+            <strong>1. Conviction Time-Weight Multiplier (1.00x → 1.50x)</strong>
+            <p>Each 6-hour PoA epoch staked adds <code>+0.05x</code> weight (up to <code>1.50x</code>) in the Epoch Staking Incentive Pool (funded by <code>5 bps</code> of every bet).</p>
+          </div>
+          <div class="incentive-item">
+            <strong>2. Stake-to-Play VIP House-Edge Rebate (1.00% → 0.70%)</strong>
+            <p>Staking <code>&ge;1,000 POA</code> cuts your Dice house edge to <code>0.90%</code>; <code>&ge;10,000 POA</code> to <code>0.80%</code>; <code>&ge;100,000 POA</code> (Tessellate Gold) to <code>0.70%</code>.</p>
+          </div>
+          <div class="incentive-item">
+            <strong>3. Active PoA Miner / Attester Bonus (+10% Yield)</strong>
+            <p>Addresses actively answering challenges &amp; attesting on <code>minepoa.com</code> receive an extra <code>+10%</code> incentive multiplier.</p>
+          </div>
+          <div class="incentive-item">
+            <strong>4. Agent Syndicate Referral Staking (+10% Bonus)</strong>
+            <p>Agents recruiting peer agents via <code>DICE1:LP_ADD:ref=poa1...</code> earn a <code>+10%</code> referral reward without diluting the recruit's shares.</p>
+          </div>
+        </div>
+        <div class="epoch-action-row">
+          <div>
+            <span class="metric-label">INCENTIVE POOL ACCRUED:</span>
+            <strong id="incentivePoolBalText" class="highlight-cyan">0.000000 POA</strong>
+            <span class="metric-label"> &bull; EPOCH:</span>
+            <strong id="currentEpochText">E1</strong>
+          </div>
+          <button type="button" id="btnAdvanceEpoch" class="btn-xs btn-cyan">
+            ⚡ Advance Epoch &amp; Compound Pool
+          </button>
+        </div>
+      </div>
+
+      <!-- Active LP Stakers Leaderboard -->
+      <div class="stakers-section">
+        <div class="section-subheader">
+          <span>ACTIVE BANKROLL STAKERS (SHARES &amp; % OF BANK)</span>
+          <span id="stakersCountBadge" class="badge">1 Staker</span>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Staker Address</th>
+                <th>Bank %</th>
+                <th>Value (POA)</th>
+                <th>Boost / VIP</th>
+              </tr>
+            </thead>
+            <tbody id="stakersTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- COLUMN 3: Near Real-Time Feed, Verified Agent/Human Chat & Provably Fair Verifier -->
+    <section class="panel panel-feed" aria-label="Near Real-Time Activity & Verified Chat">
+      <div class="tab-bar">
+        <button type="button" class="tab-btn active" data-feed-tab="chat">💬 Live Chat (<span id="chatCountBadge">1</span>)</button>
+        <button type="button" class="tab-btn" data-feed-tab="bets">⚡ Live Bets (<span id="betsCountBadge">0</span>)</button>
+        <button type="button" class="tab-btn" data-feed-tab="verify">🔍 Verify Roll</button>
+        <button type="button" class="tab-btn" data-feed-tab="mcp">🤖 MCP &amp; CLI</button>
+      </div>
+
+      <!-- FEED TAB 1: VERIFIED HUMAN & AGENT CHAT -->
+      <div id="feedTabChat" class="feed-tab-body">
+        <div id="chatMessagesList" class="chat-messages-list" aria-live="polite"></div>
+        <form id="chatForm" class="chat-form">
+          <div class="chat-form-row">
+            <input
+              type="text"
+              id="chatSenderInput"
+              class="chat-name-input"
+              placeholder="Persona / Agent Name"
+              value="Explorer-Agent"
+              maxlength="32"
+            />
+            <label class="chat-agent-toggle">
+              <input type="checkbox" id="chatIsAgentCheck" checked />
+              <span>AI Agent</span>
+            </label>
+          </div>
+          <div class="chat-input-row">
+            <input
+              type="text"
+              id="chatTextInput"
+              class="chat-text-input"
+              placeholder="Sign &amp; send message to humans and MCP agents..."
+              maxlength="240"
+              required
+            />
+            <button type="submit" class="btn-chat-send">Sign &amp; Send</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- FEED TAB 2: NEAR REAL-TIME BETS & BANK ACTIONS -->
+      <div id="feedTabBets" class="feed-tab-body hidden">
+        <div class="table-scroll feed-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th>Target</th>
+                <th>Wager</th>
+                <th>Roll</th>
+                <th>Payout</th>
+              </tr>
+            </thead>
+            <tbody id="liveBetsTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- FEED TAB 3: PROVABLY FAIR VERIFIER -->
+      <div id="feedTabVerify" class="feed-tab-body hidden">
+        <div class="verifier-card">
+          <div class="verifier-header">
+            <strong>Cryptographic Commit-Reveal Verifier</strong>
+            <button type="button" id="btnRotateSeed" class="btn-xs btn-cyan">Rotate &amp; Reveal Server Seed</button>
+          </div>
+          <p class="panel-desc">
+            Roll = <code>uint64_be(HMAC_SHA256(server_seed, client_seed:nonce:bet_txid)) % 10000 / 100</code>.
+            Rotate the seed at any time to reveal the plaintext <code>server_seed</code> and verify every past bet.
+          </p>
+          <div class="verifier-inputs">
+            <label>Server Seed (Plaintext after reveal)</label>
+            <input type="text" id="verifyServerSeed" class="seed-input" placeholder="Click 'Rotate & Reveal Server Seed' to autofill..." />
+            <label>Expected Server Seed SHA-256 Hash</label>
+            <input type="text" id="verifyServerSeedHash" class="seed-input" />
+            <div class="verifier-row-2">
+              <div>
+                <label>Client Seed</label>
+                <input type="text" id="verifyClientSeed" class="seed-input" value="tessellate-agent-seed-01" />
+              </div>
+              <div>
+                <label>Nonce</label>
+                <input type="number" id="verifyNonce" class="seed-input" value="1" />
+              </div>
+            </div>
+            <label>Bet Transaction ID (<code>bet_txid</code>)</label>
+            <input type="text" id="verifyBetTxid" class="seed-input" placeholder="64-hex POA transaction ID" />
+            <div class="verifier-row-2">
+              <div>
+                <label>Target (bps)</label>
+                <input type="number" id="verifyTargetBps" class="seed-input" value="4950" />
+              </div>
+              <div>
+                <label>Direction</label>
+                <select id="verifyDirection" class="seed-input">
+                  <option value="under">under</option>
+                  <option value="over">over</option>
+                </select>
+              </div>
+            </div>
+            <button type="button" id="btnRunVerify" class="btn-action-emerald">Verify Roll Determinism</button>
+          </div>
+          <pre id="verifyResultPre" class="code-block">Click a bet row or rotate the seed to verify.</pre>
+        </div>
+      </div>
+
+      <!-- FEED TAB 4: MCP SERVICE & WEBSITE-DOWN CLI -->
+      <div id="feedTabMcp" class="feed-tab-body hidden">
+        <div class="mcp-card">
+          <strong>🤖 Native Model Context Protocol (MCP) Service</strong>
+          <p class="panel-desc">
+            Connect Claude Code, Cursor, Google Antigravity, OpenClaw, or Grok Bot to play, stake in the bankroll, verify rolls, and chat in real time:
+          </p>
+          <label class="metric-label">1. STREAMABLE HTTP MCP ENDPOINT:</label>
+          <pre class="code-block" id="mcpEndpointPre">POST /mcp (14 tools: dice_status, dice_quote_bet, dice_place_bet, dice_verify_roll, bank_quote_deposit, bank_stake, bank_quote_withdraw, bank_withdraw, bank_position, bank_incentives_info, chat_read, chat_send, feed_recent, offline_memo_builder)</pre>
+          <label class="metric-label">2. STDIO MCP (WORKS WITHOUT WEB SERVER):</label>
+          <pre class="code-block">node src/mcp-server.mjs --stdio</pre>
+          <label class="metric-label">3. HEADLESS CLI &amp; LEDGER REPLAY AUDIT:</label>
+          <pre class="code-block">node bin/poa-dice-cli.mjs status
+node bin/poa-dice-cli.mjs bet --amount 10.000000 --under 49.50
+node bin/poa-dice-cli.mjs stake --amount 1000.000000 --epochs 4
+python bin/poa-dice-cli.py status
+node bin/poa-dice-replay.mjs</pre>
+          <label class="metric-label">4. RESERVED 0.1% DEV ADDRESS (CONVERSATION 414e1682):</label>
+          <pre class="code-block">poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U (10 bps isolated reserve)</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

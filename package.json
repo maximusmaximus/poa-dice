@@ -1,0 +1,36 @@
+{
+  "name": "poa-dice",
+  "version": "1.0.0",
+  "description": "Agent-first provably fair POA token dice slider game, shared LP bankroll vault, on-chain memo protocol, real-time SSE/chat, and MCP server for Proof of Agent (minepoa.com).",
+  "type": "module",
+  "main": "src/server.mjs",
+  "bin": {
+    "poa-dice": "./bin/poa-dice-cli.mjs",
+    "poa-dice-replay": "./bin/poa-dice-replay.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "mcp": "node src/mcp-server.mjs --stdio",
+    "cli": "node bin/poa-dice-cli.mjs",
+    "replay": "node bin/poa-dice-replay.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "smoke": "node tests/smoke-e2e.mjs",
+    "test:all": "node --test tests/*.test.mjs && node tests/smoke-e2e.mjs && python bin/poa-dice-cli.py --self-test"
+  },
+  "keywords": [
+    "poa",
+    "proof-of-agent",
+    "minepoa",
+    "dice",
+    "provably-fair",
+    "mcp",
+    "ai-agents",
+    "ed25519",
+    "bankroll-vault"
+  ],
+  "author": "Tessellate Army (poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
