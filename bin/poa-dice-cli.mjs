@@ -69,6 +69,7 @@ async function main() {
   const cmd = args._[0] || 'status';
   const serverUrl = args.server || process.env.POA_DICE_URL || 'http://127.0.0.1:3080';
   const forceOffline = Boolean(args.offline);
+  const adminToken = args['admin-token'] || process.env.POA_DICE_ADMIN_TOKEN || '';
   const dataDir = args.dataDir || args.state || path.join(process.cwd(), 'data');
 
   const wallet = loadOrCreateLocalWallet(args.wallet);
@@ -276,7 +277,11 @@ async function main() {
     );
   } else if (cmd === 'sweep-dev') {
     output = await withOfflineFallback(
-      () => tryHttp(serverUrl, '/api/dev/sweep', { method: 'POST' }),
+      () =>
+        tryHttp(serverUrl, '/api/dev/sweep', {
+          method: 'POST',
+          headers: adminToken ? { Authorization: `Bearer ${adminToken}` } : {},
+        }),
       (engine) => ({
         ok: true,
         mode: 'offline-direct-engine',

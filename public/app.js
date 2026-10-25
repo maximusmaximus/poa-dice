@@ -1,33 +1,37 @@
 // @ts-nocheck
 /**
- * POA Dice — Interactive Frontend Controller (public/app.js)
+ * POA Dice — browser controller (public/app.js)
  *
- * Features:
- *  - Bidirectional Dice Slider (Target <-> Win Chance <-> Multiplier <-> Profit <-> Kelly Max)
- *  - Client-side Ed25519 self-custody wallet persistence in sessionStorage + signed transaction execution
- *  - Shared Bankroll Vault Deposit & Withdrawal calculators with exact LP share math & growth projections
- *  - 0.1% Reserved Dev Earnings telemetry & instant sweep to poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U
- *  - Near Real-Time SSE stream (/api/stream) updating bets, stakers, bankroll NAV, and verified chat
- *  - Offline / Website-Down pure DICE1:* memo command generator
+ * The browser never signs and never holds a private key. Every action button builds a
+ * ready-to-paste prompt for the user's own AI agent, which calls this site's MCP server
+ * (/mcp) with exact arguments and a spend cap. Availability comes from the server
+ * (/api/quote/batch, /api/quote/actions); buttons are disabled only when an action is
+ * genuinely unavailable, with the reason shown inline. Results arrive live over SSE
+ * (/api/stream) with reconnect + polling fallback.
  */
 
+const BATCH_COUNTS = [1, 5, 100, 1000];
+const SEED_RE = /^[A-Za-z0-9._-]{1,48}$/;
+const AMOUNT_RE = /^\d+(?:\.\d{1,6})?$/;
+const ADDR_RE = /^poa1[1-9A-HJ-NP-Za-km-z]{30,60}$/;
+const POLL_MS = 4000;
+const POLL_MS_DISCONNECTED = 2000;
+
 const state = {
-  direction: 'under', // 'under' | 'over'
-  targetBps: 4950,    // 100..9899
-  wagerPoa: '10.000000',
-  clientSeed: 'tessellate-agent-seed-01',
+  direction: 'under',
+  targetBps: 4950,
+  rollCount: 1,
   withdrawBps: 10000,
-  wallet: null,       // { address, pubkey }
-  _demoPrivkey: null,
+  playerAddress: '',
   summary: null,
   lastBetQuote: null,
+  batchQuotes: null,
+  actionQuotes: null,
   recentBets: [],
   chatMessages: [],
   stakers: [],
   sseConnected: false,
-  rollAnimating: false,
-  hasRolled: false,
-  rollAnimFrame: 0,
+  batch: null,
 };
 
 const $ = (id) => document.getElementById(id) || document.createElement('div');
@@ -41,6 +45,10 @@ function api(path) {
   return match ? match[0] + path : path;
 }
 
+function mcpUrl() {
+  return `${window.location.origin}${api('/mcp')}`;
+}
+
 function shortAddr(addr) {
   if (!addr || addr.length < 18) return addr || 'poa1...';
   return `${addr.slice(0, 9)}...${addr.slice(-5)}`;
@@ -49,150 +57,368 @@ function shortAddr(addr) {
 function formatNum(poaStr, decimals = 4) {
   const num = Number(poaStr || 0);
   if (!Number.isFinite(num)) return '0.0000';
-  return num.toLocaleString('en-US', {
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  });
+  return num.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
 function escapeHtml(str) {
-  return String(str ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// ─── Wallet Management ───────────────────────────────────────────────────────
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
 
-async function initWallet(forceNew = false) {
-  const cacheKey = 'poa_dice_dev_wallet';
-  try {
-    const res = await fetch(api('/api/wallet/dev'), {
-      method: forceNew ? 'POST' : 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      body: forceNew ? JSON.stringify({ rotate: true }) : undefined,
+function wagerValue() {
+  return String($('wagerInput').value || '').trim();
+}
+function seedValue() {
+  return String($('clientSeedInput').value || '').trim();
+}
+
+// ─── Prompt builder (shared by every action button) ─────────────────────────
+
+export function buildAgentPrompt({ title, tool, args, quoteTool, quoteArgs, spendCapPoa, stop, report }) {
+  const lines = [
+    `Please run this POA Dice action for me through the POA Dice MCP server.`,
+    ``,
+    `MCP server: ${mcpUrl()} (Streamable HTTP, JSON-RPC 2.0). If you cannot add MCP servers, POST JSON-RPC "tools/call" requests to that URL.`,
+    `Action: ${title}`,
+    ``,
+  ];
+  let step = 1;
+  if (quoteTool) {
+    lines.push(`${step++}. First call the read-only tool \`${quoteTool}\` with:`, JSON.stringify(quoteArgs, null, 2), `   If it is not valid, stop and tell me the reason.`);
+  }
+  lines.push(`${step++}. Then call \`${tool}\` with exactly these arguments:`, JSON.stringify(args, null, 2));
+  lines.push(
+    `${step++}. Sign with my own PoA wallet. Prefer building signed_tx / signed_txs locally; only add "privkey" if I confirm I accept sending it to this server. Never print a private key in chat.`,
+    `Spend cap: never send more than ${spendCapPoa} POA in total for this action. Do not change any amount, count, target or cap.`,
+    `Stop condition: ${stop}`,
+    `${step++}. Report back: ${report}`,
+    ``,
+    `(Generated by the POA Dice page at ${window.location.origin}${window.location.pathname}. Governance-token utility only; no monetary value is exchanged.)`
+  );
+  return lines.join('\n');
+}
+
+function rollArgs() {
+  const count = state.rollCount;
+  const wager = wagerValue();
+  const total = AMOUNT_RE.test(wager) ? (Number(wager) * count).toFixed(6) : '0';
+  return {
+    count,
+    amount_poa: AMOUNT_RE.test(wager) ? Number(wager).toFixed(6) : wager,
+    target_bps: state.targetBps,
+    direction: state.direction,
+    client_seed: seedValue(),
+    max_total_spend_poa: total,
+  };
+}
+
+function rollPrompt() {
+  const args = rollArgs();
+  const { max_total_spend_poa: cap } = args;
+  const quoteArgs = { count: args.count, amount_poa: args.amount_poa, target_bps: args.target_bps, direction: args.direction, client_seed: args.client_seed, max_total_spend_poa: cap };
+  if (state.playerAddress) quoteArgs.address = state.playerAddress;
+  const cmp = state.direction === 'under' ? 'under' : 'over';
+  return buildAgentPrompt({
+    title: `${args.count} dice roll${args.count === 1 ? '' : 's'} · roll ${cmp} ${(state.targetBps / 100).toFixed(2)} · ${args.amount_poa} POA each`,
+    tool: 'dice_batch_roll',
+    args,
+    quoteTool: 'dice_quote_batch',
+    quoteArgs,
+    spendCapPoa: cap,
+    stop: `stop after ${args.count} roll${args.count === 1 ? '' : 's'}, or immediately if the server rejects the batch or reports the bank cannot cover it. Do not retry with different numbers.`,
+    report: 'wins, losses, net POA, each bet_txid with its roll, and the server seed hash.',
+  });
+}
+
+function actionPrompt(kind) {
+  const addr = state.playerAddress;
+  if (kind === 'stake') {
+    const amount = Number($('depositAmountInput').value || 0).toFixed(6);
+    const lock = Number($('lockEpochsInput').value || 0);
+    const ref = String($('referrerInput').value || '').trim();
+    const args = { amount_poa: amount, lock_epochs: lock, max_total_spend_poa: amount };
+    if (ref) args.referrer = ref;
+    return buildAgentPrompt({
+      title: `Stake ${amount} POA into the bankroll vault${lock ? ` (locked ${lock} epoch${lock === 1 ? '' : 's'})` : ''}${ref ? ' with a referrer' : ''}`,
+      tool: 'bank_stake',
+      args,
+      quoteTool: 'bank_quote_deposit',
+      quoteArgs: { amount_poa: amount, lock_epochs: lock, ...(addr ? { address: addr } : {}) },
+      spendCapPoa: amount,
+      stop: 'one deposit only. Stop if the quote or deposit is rejected.',
+      report: 'shares minted, % of bank owned, lock-until epoch and the deposit txid.',
     });
-    const data = await res.json();
-    if (data && data.address && data.privkey) {
-      state.wallet = { address: data.address, pubkey: data.pubkey };
-      state._demoPrivkey = data.privkey;
-      try {
-        localStorage.setItem(
-          cacheKey,
-          JSON.stringify({
-            address: data.address,
-            pubkey: data.pubkey,
-            _priv: data.privkey,
-            source: data.source || 'dev-store',
-          })
-        );
-      } catch {
-        // Ignore storage error
-      }
-      renderWalletHeader(data.source || 'dev-store');
-      return;
-    }
-  } catch {
-    // Fall through to the last key this browser already pulled from dev.
   }
+  if (kind === 'withdraw') {
+    const bps = state.withdrawBps;
+    const args = bps === 10000 ? { mode: 'ALL' } : { mode: 'BPS', bps };
+    return buildAgentPrompt({
+      title: `Withdraw ${(bps / 100).toFixed(0)}% of my bankroll shares`,
+      tool: 'bank_withdraw',
+      args,
+      quoteTool: 'bank_quote_withdraw',
+      quoteArgs: { address: addr || '<my poa1 address>', ...args },
+      spendCapPoa: '0.000001',
+      stop: 'one withdrawal only. Stop if I hold no shares, the position is locked, or the quote is rejected.',
+      report: 'shares redeemed, exit fee, net POA returned and the payout txid.',
+    });
+  }
+  if (kind === 'claim') {
+    return buildAgentPrompt({
+      title: 'Claim my bankroll yield (keep principal staked)',
+      tool: 'bank_claim_yield',
+      args: {},
+      quoteTool: 'bank_claim_yield',
+      quoteArgs: { dry_run: true, address: addr || '<my poa1 address>' },
+      spendCapPoa: '0.000001',
+      stop: 'one claim only. Stop if there is no position or no yield.',
+      report: 'yield claimed in POA, shares redeemed and the payout txid.',
+    });
+  }
+  if (kind === 'autoBet') {
+    const wager = AMOUNT_RE.test(wagerValue()) ? Number(wagerValue()).toFixed(6) : wagerValue();
+    const strategy = $('autoStrategySelect').value || 'flat';
+    const rolls = Number($('autoRollsInput').value || 5);
+    const cap = state.actionQuotes?.autoBet?.maxTotalSpendPoa || (Number(wager) * rolls).toFixed(6);
+    return buildAgentPrompt({
+      title: `Auto-bet: ${rolls} rolls, ${strategy} strategy from ${wager} POA, roll ${state.direction} ${(state.targetBps / 100).toFixed(2)}`,
+      tool: 'dice_auto_strategy',
+      args: { strategy, base_wager_poa: wager, target_bps: state.targetBps, direction: state.direction, rolls, client_seed: seedValue(), max_total_spend_poa: cap },
+      quoteTool: 'dice_quote_bet',
+      quoteArgs: { amount_poa: wager, target_bps: state.targetBps, direction: state.direction, ...(addr ? { address: addr } : {}) },
+      spendCapPoa: cap,
+      stop: `after ${rolls} rolls, when the spend cap is reached, or if any roll is rejected.`,
+      report: 'rolls executed, wins/losses, net POA, stopped reason and each bet_txid.',
+    });
+  }
+  if (kind === 'chat') {
+    const text = String($('chatTextInput').value || '').trim();
+    return buildAgentPrompt({
+      title: 'Post a signed chat message in the POA Dice room',
+      tool: 'chat_send',
+      args: { text, sender_name: String($('chatSenderInput').value || 'Agent').trim() },
+      quoteTool: null,
+      spendCapPoa: '0',
+      stop: 'post once.',
+      report: 'the posted message id and whether the signature verified.',
+    });
+  }
+  return '';
+}
 
+// ─── Availability (server is the source of truth) ───────────────────────────
+
+function localRollProblem() {
+  const w = wagerValue();
+  if (!AMOUNT_RE.test(w) || Number(w) <= 0) return 'Wager must be a positive number with up to 6 decimals';
+  if (!SEED_RE.test(seedValue())) return 'Client seed must be 1–48 characters: letters, digits, dot, dash or underscore';
+  const min = state.direction === 'under' ? 100 : 199;
+  const max = state.direction === 'under' ? 9800 : 9899;
+  if (!Number.isInteger(state.targetBps) || state.targetBps < min || state.targetBps > max) return 'Target is out of range';
+  const a = String($('playerAddressInput').value || '').trim();
+  if (a && !ADDR_RE.test(a)) return 'Agent address must be a valid poa1… address (or leave it empty)';
+  return null;
+}
+
+function setReason(id, text) {
+  const el = $(id);
+  if (text) {
+    el.textContent = text;
+    el.classList.remove('hidden');
+  } else {
+    el.textContent = '';
+    el.classList.add('hidden');
+  }
+}
+
+function renderRollAvailability() {
+  const local = localRollProblem();
+  const quotes = state.batchQuotes;
+  document.querySelectorAll('[data-roll-count]').forEach((btn) => {
+    const n = Number(btn.getAttribute('data-roll-count'));
+    const q = quotes?.find((x) => x.count === n);
+    const ok = !local && q && q.valid;
+    btn.disabled = !ok;
+    btn.title = ok ? `${n} roll(s): bank can cover every win` : local || q?.reason || 'Checking bank…';
+    btn.classList.toggle('active', n === state.rollCount);
+    btn.setAttribute('aria-checked', n === state.rollCount ? 'true' : 'false');
+  });
+  const sel = quotes?.find((x) => x.count === state.rollCount);
+  $('batchTotalWager').textContent = sel ? `${formatNum(sel.totalWagerPoa, 2)} POA` : '—';
+  $('batchExposure').textContent = sel ? `${formatNum(sel.maxBankExposurePoa, 2)} POA` : '—';
+  $('batchBankAvail').textContent = sel ? `${formatNum(sel.availableBankrollPoa, 2)} POA` : '—';
+  let reason = local;
+  if (!reason && !quotes) reason = 'Waiting for the bank quote…';
+  if (!reason && sel && !sel.valid) reason = sel.reason;
+  if (!reason && quotes && !quotes.some((q) => q.valid)) reason = quotes[0]?.reason;
+  const btn = $('btnCopyPrompt');
+  btn.disabled = Boolean(reason);
+  setReason('promptBlockReason', reason);
+  $('promptPreview').textContent = rollPrompt();
+  if (sel?.maxWagerForCountPoa) $('maxWagerHint').textContent = `Max for ${state.rollCount}: ${formatNum(sel.maxWagerForCountPoa, 2)} POA`;
+}
+
+async function fetchBatchQuotes() {
+  const local = localRollProblem();
+  if (local && local.startsWith('Wager')) {
+    state.batchQuotes = null;
+    renderRollAvailability();
+    return;
+  }
   try {
-    const saved = localStorage.getItem(cacheKey) || sessionStorage.getItem('poa_dice_session_wallet');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      if (parsed && parsed.address && parsed._priv) {
-        state.wallet = { address: parsed.address, pubkey: parsed.pubkey };
-        state._demoPrivkey = parsed._priv;
-        renderWalletHeader(parsed.source || 'local-cache');
-        return;
-      }
-    }
+    const qs = new URLSearchParams({
+      amountPoa: wagerValue(),
+      targetBps: String(state.targetBps),
+      direction: state.direction,
+      clientSeed: seedValue(),
+      address: state.playerAddress,
+    });
+    const res = await fetch(api(`/api/quote/batch?${qs}`));
+    const data = await res.json();
+    state.batchQuotes = Array.isArray(data.counts) ? data.counts : null;
   } catch {
-    // Ignore storage error
+    state.batchQuotes = BATCH_COUNTS.map((count) => ({ count, valid: false, reason: 'Server unreachable, so the bank cannot be checked' }));
   }
-  if ($('activeWalletAddr')) {
-    $('activeWalletAddr').textContent = 'Offline Mode (Use Local ~/.poa/key CLI)';
+  renderRollAvailability();
+}
+
+const ACTIONS = [
+  { kind: 'stake', btn: 'btnSubmitDeposit', reason: 'stakeReason', label: 'Copy stake prompt' },
+  { kind: 'withdraw', btn: 'btnSubmitWithdraw', reason: 'withdrawReason', label: 'Copy withdraw prompt' },
+  { kind: 'claim', btn: 'btnCopyClaim', reason: 'claimReason', label: 'Copy claim-yield prompt' },
+  { kind: 'autoBet', btn: 'btnCopyAutoPrompt', reason: 'autoBetReason', label: 'Copy auto-bet prompt' },
+  { kind: 'chat', btn: 'btnCopyChatPrompt', reason: 'chatReason', label: 'Copy agent chat prompt (signed)' },
+];
+
+function renderActionAvailability() {
+  const q = state.actionQuotes;
+  for (const a of ACTIONS) {
+    const aq = q?.[a.kind];
+    let reason = null;
+    if (!q) reason = 'Checking availability…';
+    else if (q.addressError && a.kind !== 'chat') reason = q.addressError;
+    else if (!aq?.valid) reason = aq?.reason || 'Unavailable';
+    if (a.kind === 'autoBet' && !reason) {
+      const local = localRollProblem();
+      if (local) reason = local;
+    }
+    $(a.btn).disabled = Boolean(reason);
+    $(a.btn).dataset.prompt = reason ? '' : actionPrompt(a.kind);
+    let note = reason;
+    if (!reason && aq?.needsPositionCheck) note = 'Add your agent address above to check your position here; otherwise your agent checks it first.';
+    setReason(a.reason, note);
+    $(a.reason).classList.toggle('is-note', !reason && Boolean(note));
   }
 }
 
-function renderWalletHeader(source) {
-  if (!state.wallet) return;
-  const el = document.getElementById('activeWalletAddr');
-  if (!el) return;
-  el.textContent = shortAddr(state.wallet.address);
-  const label =
-    source === 'env'
-      ? 'loaded from dev env'
-      : source === 'dev-store'
-        ? 'loaded from dev key store'
-        : source === 'generated'
-          ? 'new key saved to dev store'
-          : 'cached signer';
-  el.title = `Ed25519 self-custody address (${label}): ${state.wallet.address}`;
-  const header = document.querySelector('.wallet-header .metric-label');
-  if (header) {
-    header.textContent =
-      source === 'env' ? 'DEV ENV SIGNER' : source === 'generated' ? 'NEW DEV SIGNER' : 'DEV STORE SIGNER';
+async function fetchActionQuotes() {
+  try {
+    const qs = new URLSearchParams({
+      address: String($('playerAddressInput').value || '').trim(),
+      depositPoa: String($('depositAmountInput').value || ''),
+      lockEpochs: String($('lockEpochsInput').value || 0),
+      referrer: String($('referrerInput').value || '').trim(),
+      withdrawBps: String(state.withdrawBps),
+      amountPoa: wagerValue(),
+      targetBps: String(state.targetBps),
+      direction: state.direction,
+      strategy: $('autoStrategySelect').value || 'flat',
+      autoRolls: String($('autoRollsInput').value || 5),
+      clientSeed: seedValue(),
+      chatText: String($('chatTextInput').value || ''),
+    });
+    const res = await fetch(api(`/api/quote/actions?${qs}`));
+    state.actionQuotes = await res.json();
+  } catch {
+    const down = { valid: false, reason: 'Server unreachable' };
+    state.actionQuotes = { stake: down, withdraw: down, claim: down, autoBet: down, chat: down };
+  }
+  renderActionAvailability();
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    ta.remove();
+    return ok;
   }
 }
 
-// ─── Slider & Visual Track Sync ──────────────────────────────────────────────
+function flashCopied(btn, labelEl, label) {
+  const target = labelEl || btn;
+  target.textContent = 'Copied ✓';
+  btn.dataset.state = 'copied';
+  setTimeout(() => {
+    target.textContent = label;
+    delete btn.dataset.state;
+  }, 2000);
+}
+
+// ─── Slider, quotes, state ──────────────────────────────────────────────────
 
 function updateSliderVisuals() {
   const pct = (state.targetBps / 100).toFixed(2);
   const track = $('sliderTrackVisual');
-  if (state.direction === 'under') {
-    track.style.background = `linear-gradient(90deg, rgba(16, 185, 129, 0.88) 0%, rgba(16, 185, 129, 0.88) ${pct}%, rgba(244, 63, 94, 0.78) ${pct}%, rgba(244, 63, 94, 0.78) 100%)`;
-  } else {
-    track.style.background = `linear-gradient(90deg, rgba(244, 63, 94, 0.78) 0%, rgba(244, 63, 94, 0.78) ${pct}%, rgba(16, 185, 129, 0.88) ${pct}%, rgba(16, 185, 129, 0.88) 100%)`;
-  }
-
-  $('directionText').textContent = state.direction === 'under' ? 'Roll Under' : 'Roll Over';
-  $('thresholdBadge').textContent =
+  const win = 'rgba(16, 185, 129, 0.88)';
+  const lose = 'rgba(244, 63, 94, 0.78)';
+  track.style.background =
     state.direction === 'under'
-      ? `ROLL UNDER ${pct} TO WIN`
-      : `ROLL OVER ${pct} TO WIN`;
-
-  if (!state.rollAnimating && !state.hasRolled) {
-    const digits = $('rollDigits');
-    digits.textContent = pct;
-    digits.className = 'roll-digits';
-    $('rollStatusLabel').textContent = 'TARGET SET — SIGN & ROLL';
-  }
-
+      ? `linear-gradient(90deg, ${win} 0%, ${win} ${pct}%, ${lose} ${pct}%, ${lose} 100%)`
+      : `linear-gradient(90deg, ${lose} 0%, ${lose} ${pct}%, ${win} ${pct}%, ${win} 100%)`;
+  $('directionText').textContent = state.direction === 'under' ? 'Roll Under' : 'Roll Over';
+  $('thresholdBadge').textContent = `ROLL ${state.direction === 'under' ? 'UNDER' : 'OVER'} ${pct} TO WIN`;
   const winBps = state.direction === 'under' ? state.targetBps : 9999 - state.targetBps;
-  $('targetInput').value = (state.targetBps / 100).toFixed(2);
+  $('targetInput').value = pct;
   $('winChanceInput').value = (winBps / 100).toFixed(2);
   $('diceSlider').value = String(state.targetBps);
-
   updateOfflineCommandPreview();
 }
 
 function updateOfflineCommandPreview() {
   const bankAddr = state.summary?.bankAddress || 'poa1...';
   $('bannerBankAddr').textContent = bankAddr;
-  const clientSeed = ($('clientSeedInput').value || 'client-seed-1').replace(/[^a-zA-Z0-9._-]/g, '');
-  const wager = $('wagerInput').value || '10.000000';
+  const clientSeed = seedValue().replace(/[^a-zA-Z0-9._-]/g, '') || 'client-seed-1';
   const memo = `DICE1:BET:${state.direction}:${state.targetBps}:${clientSeed}`;
   $('lastSignedMemoText').textContent = memo;
-  $('liveOfflineCommand').textContent =
-    `node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to ${bankAddr} --amount ${wager} --memo "${memo}"`;
+  $('liveOfflineCommand').textContent = `node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to ${bankAddr} --amount ${wagerValue() || '1.000000'} --memo "${memo}"`;
 }
-
-// ─── Quotes & Bankroll Telemetry ─────────────────────────────────────────────
 
 async function fetchState() {
   try {
-    const addr = state.wallet?.address || '';
-    const res = await fetch(api(`/api/state?address=${encodeURIComponent(addr)}`));
+    const res = await fetch(api(`/api/state?address=${encodeURIComponent(state.playerAddress)}`));
     const data = await res.json();
-    if (data && data.bankroll) {
-      applyStateSnapshot(data);
-    }
+    if (data && data.bankroll) applyStateSnapshot(data);
   } catch {
-    // Offline fallback handled gracefully
+    const label = document.getElementById('sseStatusText');
+    if (label && !state.sseConnected) label.textContent = 'OFFLINE';
   }
+}
+
+function setStatus(text, st) {
+  $('sseStatusText').textContent = text;
+  $('sseStatusBadge').dataset.state = st;
 }
 
 function applyStateSnapshot(data) {
@@ -201,183 +427,125 @@ function applyStateSnapshot(data) {
   if (b) {
     $('topBankNav').textContent = `${formatNum(b.bankNavPoa, 4)} POA`;
     $('topBankAvail').textContent = `${formatNum(b.availableBankrollPoa, 4)} POA`;
-    $('topKellyMax').textContent = `${formatNum(b.kellyMaxProfitPoa, 4)} POA`;
+    $('topKellyMax').textContent = `Kelly cap ${formatNum(b.kellyMaxProfitPoa, 2)} POA profit / roll`;
+  }
+  if (data.stats) {
+    $('statTotalBets').textContent = String(data.stats.totalBetsCount);
+    $('statHouseNet').textContent = `House net ${formatNum(data.stats.netHouseProfitPoa, 4)} POA`;
   }
   const chain = data.chain;
-  $('topBankChain').textContent = chain?.bank?.balance ? `Chain ${chain.bank.balance} POA` : 'Chain unavailable';
+  $('topBankChain').textContent = chain ? (chain.bank?.balance ? `Chain ${chain.bank.balance} POA` : 'Chain unavailable') : 'Local ledger';
   if (chain?.dev?.balance) {
     $('topDevChain').textContent = `Chain ${chain.dev.balance} POA`;
     $('topDevChain').title = `Live minepoa.com balance of ${chain.dev.address}. This is not vault fee accrual.`;
-  } else if ($('topDevChain')) {
-    $('topDevChain').textContent = 'Chain unavailable';
+  } else {
+    $('topDevChain').textContent = chain ? 'Chain unavailable' : 'Local ledger';
   }
-  if ($('chainBalanceText')) {
-    $('chainBalanceText').textContent = chain?.player?.spendable
-      ? `Spendable ${chain.player.spendable} POA`
-      : 'Chain balance unavailable';
+  if (state.playerAddress) {
+    $('chainBalanceText').textContent = chain?.player?.spendable != null ? `Spendable ${chain.player.spendable} POA` : chain && !chain.ok ? 'Chain balance unavailable' : 'Balance check needs a chain-backed server';
+  } else {
+    $('chainBalanceText').textContent = 'Add it to check your balance and LP position.';
   }
-  const sse = $('sseStatusText');
-  if (sse && chain) {
-    sse.textContent = chain.ok ? (state.sseConnected ? 'CHAIN LIVE' : 'CHAIN') : 'CHAIN DOWN';
-  }
+  if (chain && !chain.ok) setStatus('CHAIN DOWN', 'down');
+  else if (state.sseConnected) setStatus(chain ? 'CHAIN LIVE' : 'LIVE', 'live');
 
   if (data.devReserve) {
-    const devAddr = data.devReserve.address;
-    $('topDevAddrShort').textContent = shortAddr(devAddr);
-    $('topDevAddrShort').title = `${devAddr} (0.1% / 10 bps reserved earnings)`;
+    $('topDevAddrShort').textContent = shortAddr(data.devReserve.address);
+    $('topDevAddrShort').title = `${data.devReserve.address} (0.1% / 10 bps reserved earnings)`;
     $('topDevAccrued').textContent = `${formatNum(data.devReserve.accruedUnpaidPoa, 6)} POA`;
   }
-
   if (data.incentives) {
     $('incentivePoolBalText').textContent = `${formatNum(data.incentives.poolBalancePoa, 6)} POA`;
     $('currentEpochText').textContent = `E${data.currentEpoch}`;
   }
-
-  if (data.provablyFair) {
-    const h = data.provablyFair.serverSeedHash;
-    if (h) {
-      $('seedHashShort').textContent = `${h.slice(0, 10)}...${h.slice(-8)}`;
-      $('seedHashShort').title = `Committed Server Seed SHA-256: ${h}`;
-      if (!$('verifyServerSeedHash').value) {
-        $('verifyServerSeedHash').value = h;
-      }
-    }
+  const h = data.provablyFair?.serverSeedHash;
+  if (h) {
+    $('seedHashShort').textContent = `${h.slice(0, 10)}...${h.slice(-8)}`;
+    $('seedHashShort').title = `Committed Server Seed SHA-256: ${h}`;
+    if (!$('verifyServerSeedHash').value) $('verifyServerSeedHash').value = h;
   }
-
   if (Array.isArray(data.stakersLeaderboard)) {
     state.stakers = data.stakersLeaderboard;
     renderStakersTable();
   }
   renderUserLpPosition(data.userPosition);
-
   if (Array.isArray(data.recentBets)) {
-    state.recentBets = data.recentBets;
-    renderLiveBetsTable();
+    mergeBets(data.recentBets);
+    renderBetsSoon();
   }
   if (Array.isArray(data.recentChat)) {
     state.chatMessages = [...data.recentChat].reverse();
     renderChatMessages();
   }
-
   updateOfflineCommandPreview();
 }
 
 async function fetchBetQuote() {
-  const amountPoa = $('wagerInput').value || '10.000000';
-  const address = state.wallet?.address || '';
-  const alertEl = $('betErrorAlert');
-
+  const amountPoa = AMOUNT_RE.test(wagerValue()) ? wagerValue() : '1.000000';
   try {
-    const qs = new URLSearchParams({
-      amountPoa,
-      targetBps: String(state.targetBps),
-      direction: state.direction,
-      address,
-    });
-    const res = await fetch(api(`/api/quote/bet?${qs.toString()}`));
-    const q = await res.json();
+    const qs = new URLSearchParams({ amountPoa, targetBps: String(state.targetBps), direction: state.direction, address: state.playerAddress });
+    const q = await (await fetch(api(`/api/quote/bet?${qs}`))).json();
     state.lastBetQuote = q;
-
-    $('multiplierDisplay').textContent = q.multiplierDisplay || '--';
-    $('profitOnWinDisplay').textContent = `+${formatNum(q.profitOnWinPoa, 6)} POA`;
-    $('maxWagerHint').textContent = `Max: ${formatNum(q.maxAllowedWagerPoa, 2)} POA`;
-    $('edgeHintBadge').textContent = `${q.houseEdgePercent}% Edge`;
-    $('walletVipBadge').textContent = `${q.vipTierName} (${q.houseEdgePercent}% Edge)`;
-    const qKelly = q.kellySizing?.quarterKellyPoa ? ` • 1/4 Kelly: ${formatNum(q.kellySizing.quarterKellyPoa, 2)} POA` : '';
-    $('payoutPreviewText').textContent =
-      `Payout: ${formatNum(q.payoutOnWinPoa, 4)} POA • EV: ${q.expectedValuePoa || '-0.100000'} POA • 0.1% Dev: ${q.devReserveFeePoa} POA${qKelly}`;
-
-    if (!q.valid) {
-      alertEl.textContent = `⚠️ ${q.error}`;
-      alertEl.classList.remove('hidden');
-    } else if (state.summary?.chain?.ok && state.summary.chain.player?.spendable != null && Number(state.summary.chain.player.spendable) < Number(amountPoa)) {
-      alertEl.textContent = `On-chain spendable is ${state.summary.chain.player.spendable} POA. This key cannot cover ${amountPoa} POA.`;
-      alertEl.classList.remove('hidden');
+    if (q.multiplierDisplay) {
+      $('multiplierDisplay').textContent = q.multiplierDisplay;
+      $('profitOnWinDisplay').textContent = `+${formatNum(q.profitOnWinPoa, 6)} POA`;
+      $('edgeHintBadge').textContent = `${q.houseEdgePercent}% Edge`;
+      $('walletVipBadge').textContent = `${q.vipTierName} (${q.houseEdgePercent}% Edge)`;
+      $('payoutPreviewText').textContent = `Payout ${formatNum(q.payoutOnWinPoa, 4)} POA · EV ${q.expectedValuePoa} POA · 0.1% dev ${q.devReserveFeePoa} POA`;
     } else {
-      alertEl.classList.add('hidden');
+      $('multiplierDisplay').textContent = '—';
+      $('profitOnWinDisplay').textContent = '—';
     }
   } catch {
-    // Offline fallback math
-    const winBps = state.direction === 'under' ? state.targetBps : 9999 - state.targetBps;
-    const mult = (9900 / winBps).toFixed(4);
-    const wager = Number(amountPoa) || 0;
-    const payout = wager * Number(mult);
-    const profit = Math.max(0, payout - wager);
-    $('multiplierDisplay').textContent = `${mult}x`;
-    $('profitOnWinDisplay').textContent = `+${profit.toFixed(6)} POA`;
+    $('payoutPreviewText').textContent = 'Quote unavailable (server unreachable).';
   }
 }
 
 async function fetchDepositQuote() {
-  const amountPoa = $('depositAmountInput').value || '1000.000000';
   const lockEpochs = Number($('lockEpochsInput').value || 0);
-  const boost = (1 + Math.min(lockEpochs, 10) * 0.05).toFixed(2);
-  $('convictionBoostPreview').textContent = `${lockEpochs} Epochs = ${boost}x Yield Weight`;
-
+  $('convictionBoostPreview').textContent = `${lockEpochs} Epochs = ${(1 + Math.min(lockEpochs, 10) * 0.05).toFixed(2)}x Yield Weight`;
+  const amountPoa = String($('depositAmountInput').value || '');
+  if (!AMOUNT_RE.test(amountPoa)) return;
   try {
-    const qs = new URLSearchParams({
-      amountPoa,
-      lockEpochs: String(lockEpochs),
-      address: state.wallet?.address || '',
-    });
-    const res = await fetch(api(`/api/quote/deposit?${qs.toString()}`));
-    const q = await res.json();
+    const qs = new URLSearchParams({ amountPoa, lockEpochs: String(lockEpochs), address: state.playerAddress });
+    const q = await (await fetch(api(`/api/quote/deposit?${qs}`))).json();
     if (!q.valid) return;
     $('quoteSharesMinted').textContent = Number(q.sharesMinted).toLocaleString('en-US');
     $('quoteBankPercent').textContent = `${q.shareOfLpPoolPercent}% of Bank`;
     $('quoteVipUnlocked').textContent = `${q.unlockedVipTier.name} (${q.unlockedVipTier.houseEdgePercent}% Dice Edge)`;
-
-    const tbody = $('depositProjectionsBody');
-    tbody.innerHTML = (q.projections || [])
-      .map(
-        (p) => `
-        <tr>
-          <td>+${p.bankrollGrowthPercent}% Bank Growth</td>
-          <td class="highlight-cyan">${formatNum(p.projectedPositionValuePoa, 4)} POA</td>
-          <td class="highlight-emerald">+${formatNum(p.projectedNetProfitPoa, 4)} POA</td>
-        </tr>
-      `
-      )
+    $('depositProjectionsBody').innerHTML = (q.projections || [])
+      .map((p) => `<tr><td>+${p.bankrollGrowthPercent}% Bank Growth</td><td class="highlight-cyan">${formatNum(p.projectedPositionValuePoa, 4)} POA</td><td class="highlight-emerald">+${formatNum(p.projectedNetProfitPoa, 4)} POA</td></tr>`)
       .join('');
   } catch {
-    // Ignore when offline
+    // offline
   }
 }
 
 async function fetchWithdrawQuote() {
-  if (!state.wallet?.address) return;
+  if (!state.playerAddress) return;
   try {
-    const qs = new URLSearchParams({
-      address: state.wallet.address,
-      mode: state.withdrawBps === 10000 ? 'ALL' : 'BPS',
-      bpsToRedeem: String(state.withdrawBps),
-    });
-    const res = await fetch(api(`/api/quote/withdraw?${qs.toString()}`));
-    const q = await res.json();
+    const qs = new URLSearchParams({ address: state.playerAddress, mode: state.withdrawBps === 10000 ? 'ALL' : 'BPS', bpsToRedeem: String(state.withdrawBps) });
+    const q = await (await fetch(api(`/api/quote/withdraw?${qs}`))).json();
     if (!q.valid) {
       $('withdrawQuoteShares').textContent = '0 (No Active Position)';
-      $('withdrawQuoteGross').textContent = '0.000000 POA';
-      $('withdrawQuoteFee').textContent = '0.000000 POA (0 bps)';
-      $('withdrawQuoteNet').textContent = '0.000000 POA';
       return;
     }
     $('withdrawQuoteShares').textContent = Number(q.sharesRedeemed).toLocaleString('en-US');
     $('withdrawQuoteGross').textContent = `${formatNum(q.grossValuePoa, 6)} POA`;
     $('withdrawQuoteFee').textContent = `${formatNum(q.earlyExitFeePoa, 6)} POA (${q.earlyExitFeeBps} bps)`;
     $('withdrawQuoteNet').textContent = `${formatNum(q.netPayoutPoa, 6)} POA`;
-    const statusEl = $('withdrawQuoteStatus');
-    statusEl.textContent = q.instant ? 'INSTANT' : 'QUEUED (FIFO)';
-    statusEl.className = `badge ${q.instant ? 'badge-emerald' : 'badge-vip'}`;
+    $('withdrawQuoteStatus').textContent = q.instant ? 'INSTANT' : 'QUEUED (FIFO)';
   } catch {
-    // Ignore offline
+    // offline
   }
 }
 
-async function refreshAllQuotes() {
-  await Promise.all([fetchBetQuote(), fetchDepositQuote(), fetchWithdrawQuote()]);
+async function refreshQuotes() {
+  await Promise.all([fetchBetQuote(), fetchBatchQuotes(), fetchActionQuotes(), fetchDepositQuote(), fetchWithdrawQuote()]);
 }
+const refreshQuotesSoon = debounce(refreshQuotes, 200);
 
-// ─── Render Tables & Lists ───────────────────────────────────────────────────
+// ─── Rendering ──────────────────────────────────────────────────────────────
 
 function renderUserLpPosition(pos) {
   if (!pos || !pos.hasPosition) {
@@ -389,9 +557,8 @@ function renderUserLpPosition(pos) {
   }
   $('userSharePct').textContent = `${pos.shareOfLpPoolPercent}%`;
   $('userRedeemablePoa').textContent = `${formatNum(pos.currentValuePoa, 6)} POA`;
-  const pnlNum = Number(pos.netPnlPoa || 0);
-  $('userNetPnlPoa').textContent = `${pnlNum >= 0 ? '+' : ''}${formatNum(pos.netPnlPoa, 6)} POA`;
-  $('userNetPnlPoa').className = `lp-pos-val ${pnlNum >= 0 ? 'highlight-emerald' : 'highlight-crimson'}`;
+  const pnl = Number(pos.netPnlPoa || 0);
+  $('userNetPnlPoa').textContent = `${pnl >= 0 ? '+' : ''}${formatNum(pos.netPnlPoa, 6)} POA`;
   $('userConvictionBadge').textContent = `Conviction: ${pos.convictionMultiplier} (${pos.vipTier?.tierName || 'Standard'})`;
 }
 
@@ -403,27 +570,14 @@ function renderStakersTable() {
     return;
   }
   tbody.innerHTML = state.stakers
-    .map((s) => {
-      const isMe = s.address === state.wallet?.address;
-      return `
-        <tr>
-          <td title="${escapeHtml(s.address)}">
-            <code>${escapeHtml(shortAddr(s.address))}</code>
-            ${isMe ? '<span class="badge badge-cyan">YOU</span>' : ''}
-          </td>
-          <td class="highlight-cyan"><strong>${escapeHtml(s.shareOfLpPoolPercent)}%</strong></td>
-          <td class="highlight-emerald">${formatNum(s.currentValuePoa, 4)} POA</td>
-          <td>${escapeHtml(s.convictionMultiplier)} &bull; ${escapeHtml(s.vipTier?.tierName || 'Standard')}</td>
-        </tr>
-      `;
-    })
+    .map((s) => `<tr><td title="${escapeHtml(s.address)}"><code>${escapeHtml(shortAddr(s.address))}</code>${s.address === state.playerAddress ? ' <span class="badge badge-cyan">YOU</span>' : ''}</td><td class="highlight-cyan"><strong>${escapeHtml(s.shareOfLpPoolPercent)}%</strong></td><td class="highlight-emerald">${formatNum(s.currentValuePoa, 4)} POA</td><td>${escapeHtml(s.convictionMultiplier)} &bull; ${escapeHtml(s.vipTier?.tierName || 'Standard')}</td></tr>`)
     .join('');
 }
 
-function sigShort(sig) {
-  if (!sig || typeof sig !== 'string') return '';
-  if (sig.length <= 16) return sig;
-  return `${sig.slice(0, 8)}…${sig.slice(-6)}`;
+function mergeBets(bets) {
+  for (const bet of [...bets].reverse()) upsertBet(bet);
+  state.recentBets.sort((a, b) => (b.ts || 0) - (a.ts || 0) || 0);
+  if (state.recentBets.length > 200) state.recentBets.length = 200;
 }
 
 function upsertBet(bet) {
@@ -433,32 +587,32 @@ function upsertBet(bet) {
   else state.recentBets[idx] = { ...state.recentBets[idx], ...bet };
 }
 
+let renderQueued = false;
+function renderBetsSoon() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    renderLiveBetsTable();
+    renderInlineHistory();
+    const latest = state.recentBets[0];
+    if (latest) paintSettledRoll(latest);
+  });
+}
+
 function renderInlineHistory() {
   const list = $('inlineRollHistory');
-  const count = $('inlineHistoryCount');
-  if (!list) return;
-  const bets = state.recentBets.filter((b) => b && b.rollDisplay).slice(0, 8);
-  if (count) count.textContent = String(state.recentBets.filter((b) => b && b.rollDisplay).length);
-  if (state.rollAnimating) return;
+  const bets = state.recentBets.filter((b) => b && b.rollDisplay);
+  $('inlineHistoryCount').textContent = String(bets.length);
   if (bets.length === 0) {
-    list.innerHTML = '<li class="roll-card roll-card-empty">Signed rolls show up here as they land.</li>';
+    list.innerHTML = '<li class="roll-card roll-card-empty">Rolls your agent signs show up here live.</li>';
     return;
   }
   list.innerHTML = bets
+    .slice(0, 8)
     .map((b) => {
-      const sig = b.playerSig || '';
       const cond = `${b.direction === 'under' ? 'Under' : 'Over'} ${b.targetDisplay || (b.targetBps / 100).toFixed(2)}`;
-      return `
-        <li class="roll-card ${b.won ? 'is-win' : 'is-loss'}" data-bet-txid="${escapeHtml(b.betTxid)}">
-          <div class="roll-card-num">${escapeHtml(b.rollDisplay)}</div>
-          <div class="roll-card-meta">
-            <strong>${b.won ? 'Win' : 'Loss'}</strong>
-            <span>${escapeHtml(cond)} · ${formatNum(b.wagerPoa, 2)} POA</span>
-            <span>${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</span>
-            <code class="roll-card-sig" title="${escapeHtml(sig || 'Signature missing')}">${sig ? 'Ed25519 ' + escapeHtml(sigShort(sig)) : 'Unsigned'}</code>
-          </div>
-        </li>
-      `;
+      return `<li class="roll-card ${b.won ? 'is-win' : 'is-loss'}" data-bet-txid="${escapeHtml(b.betTxid)}"><div class="roll-card-num">${escapeHtml(b.rollDisplay)}</div><div class="roll-card-meta"><strong>${b.won ? 'Win' : 'Loss'}</strong><span>${escapeHtml(cond)} · ${formatNum(b.wagerPoa, 2)} POA</span><span>${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</span><code class="roll-card-sig">${escapeHtml(shortAddr(b.address))}</code></div></li>`;
     })
     .join('');
 }
@@ -467,349 +621,60 @@ function renderLiveBetsTable() {
   $('betsCountBadge').textContent = String(state.recentBets.length);
   const tbody = $('liveBetsTableBody');
   if (state.recentBets.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#8fa3c7;">No bets yet — click Sign &amp; Roll Dice to place the first provably fair roll!</td></tr>`;
-    renderInlineHistory();
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#8fa3c7;">No bets yet. Copy a roll prompt into your agent to place the first one.</td></tr>';
     return;
   }
-
   tbody.innerHTML = state.recentBets
     .slice(0, 35)
     .map((b) => {
       const cond = `${b.direction === 'under' ? '<' : '>'} ${b.targetDisplay || (b.targetBps / 100).toFixed(2)}`;
-      return `
-        <tr data-bet-txid="${escapeHtml(b.betTxid)}" style="cursor:pointer;" title="Click to load into Provably Fair Verifier">
-          <td><code>${escapeHtml(shortAddr(b.address))}</code></td>
-          <td>${escapeHtml(cond)} (${escapeHtml(b.multiplierDisplay)})</td>
-          <td>${formatNum(b.wagerPoa, 4)} POA</td>
-          <td class="${b.won ? 'bet-win-pill' : 'bet-loss-pill'}">
-            ${escapeHtml(b.rollDisplay)}
-            <code class="sig-mini" title="${escapeHtml(b.playerSig || '')}">${b.playerSig ? escapeHtml(sigShort(b.playerSig)) : '—'}</code>
-          </td>
-          <td class="${b.won ? 'bet-win-pill' : ''}">${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</td>
-        </tr>
-      `;
+      return `<tr data-bet-txid="${escapeHtml(b.betTxid)}" style="cursor:pointer;" title="Click to load into the verifier"><td><code>${escapeHtml(shortAddr(b.address))}</code></td><td>${escapeHtml(cond)} (${escapeHtml(b.multiplierDisplay)})</td><td>${formatNum(b.wagerPoa, 4)} POA</td><td class="${b.won ? 'bet-win-pill' : 'bet-loss-pill'}">${escapeHtml(b.rollDisplay)}</td><td class="${b.won ? 'bet-win-pill' : ''}">${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</td></tr>`;
     })
     .join('');
+}
 
-  renderInlineHistory();
+function paintSettledRoll(bet) {
+  if (!bet || typeof bet.rollBps !== 'number') return;
+  $('rollDigits').textContent = bet.rollDisplay;
+  $('rollDigits').className = `roll-digits ${bet.won ? 'win-text' : 'loss-text'}`;
+  $('rollStage').className = `roll-stage ${bet.won ? 'win-glow' : 'loss-glow'}`;
+  $('rollStatusLabel').textContent = bet.won
+    ? `WON +${formatNum(bet.netPlayerDeltaPoa, 4)} POA (${bet.multiplierDisplay})`
+    : `ROLLED ${bet.rollDisplay} — HOUSE COLLECTS ${formatNum(bet.wagerPoa, 4)} POA`;
+  const pin = $('lastRollPin');
+  pin.style.left = `${Math.min(99, Math.max(1, bet.rollBps / 100))}%`;
+  $('lastRollPinText').textContent = bet.rollDisplay;
+  pin.classList.remove('hidden');
+}
 
-  tbody.querySelectorAll('tr[data-bet-txid]').forEach((row) => {
-    row.addEventListener('click', () => {
-      const txid = row.getAttribute('data-bet-txid');
-      const bet = state.recentBets.find((x) => x.betTxid === txid);
-      if (bet) {
-        $('verifyServerSeedHash').value = bet.provablyFair?.serverSeedHash || '';
-        $('verifyClientSeed').value = bet.provablyFair?.clientSeed || '';
-        $('verifyNonce').value = String(bet.provablyFair?.nonce || 1);
-        $('verifyBetTxid').value = bet.betTxid || '';
-        $('verifyTargetBps').value = String(bet.targetBps || 4950);
-        $('verifyDirection').value = bet.direction || 'under';
-        switchFeedTab('verify');
-      }
-    });
-  });
+function renderBatchProgress() {
+  const b = state.batch;
+  const el = $('batchProgress');
+  if (!b) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.classList.remove('hidden');
+  el.dataset.state = b.done >= b.count || b.completed ? 'done' : 'running';
+  const pct = Math.round((100 * (b.done || 0)) / Math.max(1, b.count));
+  el.innerHTML = `<div class="batch-bar"><span style="width:${pct}%"></span></div><span id="batchProgressText">${b.completed ? 'Batch finished' : 'Agent batch running'}: ${b.done || 0}/${b.count} rolls · ${b.wins || 0} wins · net ${formatNum(b.netPoa || 0, 4)} POA${b.stoppedReason && b.stoppedReason !== 'completed_all_rolls' ? ` · stopped: ${escapeHtml(b.stoppedReason)}` : ''}</span>`;
 }
 
 function renderChatMessages() {
   $('chatCountBadge').textContent = String(state.chatMessages.length);
   const list = $('chatMessagesList');
   if (state.chatMessages.length === 0) {
-    list.innerHTML = '<div class="chat-msg"><div class="chat-text">No signed messages yet.</div></div>';
+    list.innerHTML = '<div class="chat-msg"><div class="chat-text">No messages yet.</div></div>';
     return;
   }
   list.innerHTML = state.chatMessages
     .slice(-50)
     .map((m) => {
       const time = m.ts ? new Date(m.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
-      return `
-        <div class="chat-msg">
-          <div class="chat-msg-header">
-            <div>
-              <span class="chat-sender">${escapeHtml(m.senderName || shortAddr(m.address))}</span>
-              ${m.isAgent ? '<span class="badge badge-cyan">AGENT</span>' : '<span class="badge">HUMAN</span>'}
-              ${m.verified ? '<span class="badge badge-emerald" title="Ed25519 Signature Verified">✓ SIG</span>' : ''}
-            </div>
-            <span>${escapeHtml(time)}</span>
-          </div>
-          <div class="chat-text">${escapeHtml(m.text)}</div>
-        </div>
-      `;
+      return `<div class="chat-msg"><div class="chat-msg-header"><div><span class="chat-sender">${escapeHtml(m.senderName || shortAddr(m.address))}</span>${m.isAgent ? ' <span class="badge badge-cyan">AGENT</span>' : ' <span class="badge">HUMAN</span>'}${m.verified ? ' <span class="badge badge-emerald" title="Ed25519 Signature Verified">✓ SIG</span>' : ''}</div><span>${escapeHtml(time)}</span></div><div class="chat-text">${escapeHtml(m.text)}</div></div>`;
     })
     .join('');
   list.scrollTop = list.scrollHeight;
-}
-
-// ─── Actions: Sign & Submit Bet, Deposit, Withdraw, Sweep, Chat ──────────────
-
-async function signAndRollSingle() {
-  if (!state._demoPrivkey) {
-    await initWallet(true);
-  }
-  const btn = $('btnRollDice');
-  const alertEl = $('betErrorAlert');
-  alertEl.classList.add('hidden');
-  btn.disabled = true;
-
-  try {
-    const clientSeed = ($('clientSeedInput').value || 'agent-seed-01').trim();
-    const amountPoa = $('wagerInput').value || '10.000000';
-    const memo = `DICE1:BET:${state.direction}:${state.targetBps}:${clientSeed}`;
-    $('lastSignedMemoText').textContent = memo;
-
-    const res = await fetch(api('/api/action/sign-and-submit'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        privkey: state._demoPrivkey,
-        action: 'BET',
-        amountPoa,
-        direction: state.direction,
-        targetBps: state.targetBps,
-        clientSeed,
-      }),
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      alertEl.textContent = `⚠️ ${data.error || 'Bet failed'}`;
-      alertEl.classList.remove('hidden');
-      return null;
-    }
-
-    const receipt = data.receipt;
-    if (receipt.action === 'REFUND_QUEUED') {
-      alertEl.textContent = `🛡️ Safe Auto-Refund Queued: ${receipt.reason}`;
-      alertEl.classList.remove('hidden');
-      return receipt;
-    }
-
-    if (data.signedTx?.body?.sig) receipt.playerSig = data.signedTx.body.sig;
-    await animateRollResult(receipt);
-    await fetchState();
-    await refreshAllQuotes();
-    return receipt;
-  } catch (err) {
-    alertEl.textContent = `⚠️ Network error: ${err.message}`;
-    alertEl.classList.remove('hidden');
-    return null;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-function paintSettledRoll(bet) {
-  const stage = $('rollStage');
-  const digits = $('rollDigits');
-  const statusLbl = $('rollStatusLabel');
-  const pin = $('lastRollPin');
-  const pinText = $('lastRollPinText');
-  digits.textContent = bet.rollDisplay;
-  digits.className = `roll-digits ${bet.won ? 'win-text' : 'loss-text'}`;
-  stage.className = `roll-stage ${bet.won ? 'win-glow' : 'loss-glow'}`;
-  statusLbl.textContent = bet.won
-    ? `YOU WON +${formatNum(bet.netPlayerDeltaPoa, 4)} POA (${bet.multiplierDisplay})`
-    : `ROLLED ${bet.rollDisplay} — HOUSE COLLECTS ${formatNum(bet.wagerPoa, 4)} POA`;
-  const pct = Math.min(99, Math.max(1, bet.rollBps / 100));
-  pin.style.left = `${pct}%`;
-  pinText.textContent = bet.rollDisplay;
-  pin.classList.remove('hidden');
-}
-
-function showLiveHistoryCard() {
-  const list = $('inlineRollHistory');
-  if (!list) return;
-  const empty = list.querySelector('.roll-card-empty');
-  if (empty) empty.remove();
-  const existing = document.getElementById('inlineLiveCard');
-  if (existing) existing.remove();
-  const card = document.createElement('li');
-  card.id = 'inlineLiveCard';
-  card.className = 'roll-card is-rolling';
-  card.innerHTML = `
-    <div class="roll-card-num" id="inlineLiveDigits">00.00</div>
-    <div class="roll-card-meta">
-      <strong>Rolling</strong>
-      <span>Signing the roll…</span>
-      <code class="roll-card-sig">Ed25519 …</code>
-    </div>
-  `;
-  list.prepend(card);
-}
-
-function animateRollResult(bet) {
-  return new Promise((resolve) => {
-    if (!bet || typeof bet.rollBps !== 'number') {
-      resolve();
-      return;
-    }
-    if (state.rollAnimFrame) cancelAnimationFrame(state.rollAnimFrame);
-    state.rollAnimating = true;
-    state.hasRolled = true;
-    showLiveHistoryCard();
-    const digits = $('rollDigits');
-    const liveDigits = () => document.getElementById('inlineLiveDigits');
-    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const finish = () => {
-      state.rollAnimating = false;
-      state.rollAnimFrame = 0;
-      paintSettledRoll(bet);
-      const live = liveDigits();
-      if (live) live.textContent = bet.rollDisplay;
-      upsertBet(bet);
-      renderInlineHistory();
-      renderLiveBetsTable();
-      resolve();
-    };
-    if (reduce) {
-      finish();
-      return;
-    }
-    $('rollStatusLabel').textContent = 'ROLLING…';
-    $('rollStage').className = 'roll-stage is-rolling';
-    const start = performance.now();
-    const step = (now) => {
-      if (!document.getElementById('rollDigits')) {
-        state.rollAnimating = false;
-        resolve();
-        return;
-      }
-      if (now - start < 1100) {
-        const spinning = (Math.floor(Math.random() * 10000) / 100).toFixed(2);
-        digits.textContent = spinning;
-        digits.className = 'roll-digits is-spinning';
-        const live = liveDigits();
-        if (live) live.textContent = spinning;
-        state.rollAnimFrame = requestAnimationFrame(step);
-      } else {
-        finish();
-      }
-    };
-    state.rollAnimFrame = requestAnimationFrame(step);
-  });
-}
-
-async function playRollSequence(receipts) {
-  for (const receipt of receipts) {
-    if (!receipt || typeof receipt.rollBps !== 'number') continue;
-    await animateRollResult(receipt);
-  }
-}
-
-async function runAgentBurst() {
-  if (!state._demoPrivkey) await initWallet(true);
-  const btn = $('btnAgentAutoBurst');
-  btn.disabled = true;
-  const origText = btn.textContent;
-  try {
-    btn.textContent = '🤖 Running 5-Roll Kelly Strategy...';
-    const res = await fetch(api('/api/action/auto-bet'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        privkey: state._demoPrivkey,
-        strategy: 'flat',
-        baseWagerPoa: $('wagerInput').value || '10.000000',
-        targetBps: state.targetBps,
-        direction: state.direction,
-        rolls: 5,
-        clientSeed: ($('clientSeedInput').value || 'agent-seed-01').trim(),
-      }),
-    });
-    const data = await res.json();
-    if (data.ok && Array.isArray(data.receipts) && data.receipts.length > 0) {
-      await playRollSequence(data.receipts);
-      await fetchState();
-      await refreshAllQuotes();
-    }
-  } finally {
-    btn.textContent = origText;
-    btn.disabled = false;
-  }
-}
-
-async function submitBankDeposit() {
-  if (!state._demoPrivkey) await initWallet(true);
-  const amountPoa = $('depositAmountInput').value || '1000.000000';
-  const lockEpochs = Number($('lockEpochsInput').value || 0);
-  const memo = `DICE1:LP_ADD:epochs=${lockEpochs}`;
-  $('lastSignedMemoText').textContent = memo;
-
-  const res = await fetch(api('/api/action/sign-and-submit'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      privkey: state._demoPrivkey,
-      action: 'LP_ADD',
-      amountPoa,
-      lockEpochs,
-    }),
-  });
-  const data = await res.json();
-  if (data.ok) {
-    await fetchState();
-    await refreshAllQuotes();
-  }
-}
-
-async function submitBankWithdraw() {
-  if (!state._demoPrivkey) await initWallet(true);
-  const memo = state.withdrawBps === 10000 ? 'DICE1:LP_WITHDRAW:ALL' : `DICE1:LP_WITHDRAW:BPS=${state.withdrawBps}`;
-  $('lastSignedMemoText').textContent = memo;
-
-  const res = await fetch(api('/api/action/sign-and-submit'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      privkey: state._demoPrivkey,
-      action: 'LP_WITHDRAW',
-      bps: state.withdrawBps,
-      mode: state.withdrawBps === 10000 ? 'ALL' : 'BPS',
-    }),
-  });
-  const data = await res.json();
-  if (data.ok) {
-    await fetchState();
-    await refreshAllQuotes();
-  }
-}
-
-async function sweepDevReserve() {
-  const res = await fetch(api('/api/dev/sweep'), { method: 'POST' });
-  const data = await res.json();
-  if (data.ok) {
-    await fetchState();
-  }
-}
-
-async function advanceEpoch() {
-  const res = await fetch(api('/api/epoch/advance'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ distributeIncentives: true }),
-  });
-  const data = await res.json();
-  if (data.ok) {
-    await fetchState();
-    await refreshAllQuotes();
-  }
-}
-
-async function rotateAndRevealSeed() {
-  const res = await fetch(api('/api/seed/rotate'), { method: 'POST' });
-  const data = await res.json();
-  if (data.ok && data.revealed) {
-    $('verifyServerSeed').value = data.revealed.serverSeed;
-    $('verifyServerSeedHash').value = data.revealed.serverSeedHash;
-    if (state.recentBets.length > 0) {
-      const b = state.recentBets[0];
-      $('verifyClientSeed').value = b.provablyFair?.clientSeed || 'tessellate-agent-seed-01';
-      $('verifyNonce').value = String(b.provablyFair?.nonce || 1);
-      $('verifyBetTxid').value = b.betTxid || '';
-      $('verifyTargetBps').value = String(b.targetBps || 4950);
-      $('verifyDirection').value = b.direction || 'under';
-    }
-    await runVerifyRoll();
-    await fetchState();
-  }
 }
 
 async function runVerifyRoll() {
@@ -823,299 +688,273 @@ async function runVerifyRoll() {
     direction: $('verifyDirection').value,
   };
   if (!payload.serverSeed) {
-    $('verifyResultPre').textContent = 'Click "Rotate & Reveal Server Seed" first to reveal the plaintext server_seed.';
+    $('verifyResultPre').textContent = 'Paste the revealed server_seed first. Seeds are revealed when the house rotates them.';
     return;
   }
-  const res = await fetch(api('/api/verify'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  $('verifyResultPre').textContent = JSON.stringify(data, null, 2);
+  const res = await fetch(api('/api/verify'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  $('verifyResultPre').textContent = JSON.stringify(await res.json(), null, 2);
 }
 
-// ─── Near Real-Time SSE Stream ───────────────────────────────────────────────
+// ─── Live updates: SSE with reconnect + polling fallback ────────────────────
 
 let bootGeneration = 0;
 let eventSource = null;
 let pollTimer = null;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+const refreshStateSoon = debounce(() => fetchState(), 120);
 
 export function stopPoaDice() {
   bootGeneration += 1;
-  if (state.rollAnimFrame) {
-    cancelAnimationFrame(state.rollAnimFrame);
-    state.rollAnimFrame = 0;
-  }
-  state.rollAnimating = false;
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
-  }
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
+  if (eventSource) eventSource.close();
+  eventSource = null;
+  clearTimeout(pollTimer);
+  clearTimeout(reconnectTimer);
 }
 
 export function bootPoaDice() {
   const myGen = ++bootGeneration;
-  const alive = () => myGen === bootGeneration && !!document.getElementById('btnRollDice');
+  const alive = () => myGen === bootGeneration && !!document.getElementById('btnCopyPrompt');
   bindEvents();
   updateSliderVisuals();
+  renderRollAvailability();
   void (async () => {
-    if (!alive()) return;
-    await initWallet(false);
-    if (!alive()) return;
     await fetchState();
     if (!alive()) return;
-    await refreshAllQuotes();
+    await refreshQuotes();
     if (!alive()) return;
     connectRealtimeStream(alive);
+    schedulePoll(alive);
   })();
 }
 
+function schedulePoll(alive) {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    if (!alive()) return;
+    await fetchState();
+    if (!state.sseConnected) await Promise.all([fetchBatchQuotes(), fetchActionQuotes()]);
+    schedulePoll(alive);
+  }, state.sseConnected ? POLL_MS : POLL_MS_DISCONNECTED);
+}
+
 function connectRealtimeStream(alive) {
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
-  }
+  if (eventSource) eventSource.close();
   try {
     eventSource = new EventSource(api('/api/stream'));
-    eventSource.onopen = () => {
-      state.sseConnected = true;
-      const label = document.getElementById('sseStatusText');
-      if (label) label.textContent = 'LIVE SSE';
-    };
-    eventSource.onmessage = (ev) => {
-      if (!alive()) return;
-      try {
-        const msg = JSON.parse(ev.data);
-        handleRealtimeEvent(msg);
-      } catch {
-        // Ignore malformed event
-      }
-    };
-    eventSource.onerror = () => {
-      state.sseConnected = false;
-      const label = document.getElementById('sseStatusText');
-      if (label) label.textContent = 'RECONNECTING';
-    };
   } catch {
-    const label = document.getElementById('sseStatusText');
-    if (label) label.textContent = 'OFFLINE CLI';
+    setStatus('POLLING', 'down');
+    return;
   }
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => {
-    if (!alive()) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-      return;
+  eventSource.onopen = () => {
+    state.sseConnected = true;
+    reconnectDelay = 1000;
+    setStatus(state.summary?.chain ? (state.summary.chain.ok ? 'CHAIN LIVE' : 'CHAIN DOWN') : 'LIVE', state.summary?.chain && !state.summary.chain.ok ? 'down' : 'live');
+  };
+  eventSource.onmessage = (ev) => {
+    if (!alive()) return;
+    try {
+      handleRealtimeEvent(JSON.parse(ev.data));
+    } catch {
+      // ignore malformed
     }
-    void fetchState();
-  }, 4000);
+  };
+  eventSource.onerror = () => {
+    state.sseConnected = false;
+    setStatus('RECONNECTING', 'down');
+    if (eventSource && eventSource.readyState === 2) {
+      eventSource.close();
+      eventSource = null;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => alive() && connectRealtimeStream(alive), reconnectDelay);
+      reconnectDelay = Math.min(15000, reconnectDelay * 2);
+    }
+  };
 }
 
 function handleRealtimeEvent(msg) {
   if (!msg || !msg.type) return;
-  if (msg.type === 'bet.settled' && msg.payload) {
-    const bet = msg.payload;
-    const exists = state.recentBets.some((b) => b.betTxid === bet.betTxid);
-    if (!exists) {
-      state.recentBets.unshift(bet);
-      renderLiveBetsTable();
-    }
-    fetchState();
-  } else if (msg.type === 'chat.message' && msg.payload) {
-    const chat = msg.payload;
-    const exists = state.chatMessages.some((c) => c.id === chat.id);
-    if (!exists) {
-      state.chatMessages.push(chat);
-      renderChatMessages();
-    }
-  } else if (
-    msg.type === 'bank.deposit' ||
-    msg.type === 'bank.withdraw' ||
-    msg.type === 'dev.swept' ||
-    msg.type === 'epoch.advanced'
-  ) {
-    fetchState();
-    refreshAllQuotes();
+  const p = msg.payload || {};
+  switch (msg.type) {
+    case 'bet.settled':
+      upsertBet(p);
+      if (state.batch && !state.batch.completed && p.address === state.batch.address) state.batch.done = Math.max(state.batch.done || 0, (state.batch.done || 0) + 1);
+      renderBetsSoon();
+      renderBatchProgress();
+      refreshStateSoon();
+      refreshQuotesSoon();
+      break;
+    case 'batch.started':
+      state.batch = { ...p, done: 0, wins: 0, netPoa: '0', completed: false };
+      renderBatchProgress();
+      break;
+    case 'batch.progress':
+      state.batch = { ...(state.batch || {}), ...p };
+      renderBatchProgress();
+      break;
+    case 'batch.completed':
+      state.batch = { ...(state.batch || {}), ...p, completed: true };
+      renderBatchProgress();
+      refreshStateSoon();
+      refreshQuotesSoon();
+      break;
+    case 'chat.message':
+      if (!state.chatMessages.some((c) => c.id === p.id)) {
+        state.chatMessages.push(p);
+        renderChatMessages();
+      }
+      break;
+    default:
+      // bank.deposit / bank.withdraw / seed.rotated / dev.swept / epoch.advanced / refunds …
+      refreshStateSoon();
+      refreshQuotesSoon();
   }
 }
 
-// ─── Tab Switching & Event Listeners ─────────────────────────────────────────
+// ─── Events ─────────────────────────────────────────────────────────────────
 
-function switchBankTab(tabName) {
-  document.querySelectorAll('[data-bank-tab]').forEach((btn) => {
-    btn.classList.toggle('active', btn.getAttribute('data-bank-tab') === tabName);
-  });
-  $('bankTabDeposit').classList.toggle('hidden', tabName !== 'deposit');
-  $('bankTabWithdraw').classList.toggle('hidden', tabName !== 'withdraw');
-  $('bankTabIncentives').classList.toggle('hidden', tabName !== 'incentives');
-}
-
-function switchFeedTab(tabName) {
-  document.querySelectorAll('[data-feed-tab]').forEach((btn) => {
-    btn.classList.toggle('active', btn.getAttribute('data-feed-tab') === tabName);
-  });
-  $('feedTabChat').classList.toggle('hidden', tabName !== 'chat');
-  $('feedTabBets').classList.toggle('hidden', tabName !== 'bets');
-  $('feedTabVerify').classList.toggle('hidden', tabName !== 'verify');
-  $('feedTabMcp').classList.toggle('hidden', tabName !== 'mcp');
+function switchTab(attr, prefix, names, tabName) {
+  document.querySelectorAll(`[${attr}]`).forEach((btn) => btn.classList.toggle('active', btn.getAttribute(attr) === tabName));
+  for (const n of names) $(`${prefix}${n[0].toUpperCase()}${n.slice(1)}`).classList.toggle('hidden', n !== tabName);
 }
 
 function bindEvents() {
-  const slider = $('diceSlider');
-  slider.addEventListener('input', () => {
-    state.targetBps = Number(slider.value);
+  const onRollInput = () => {
+    updateOfflineCommandPreview();
+    renderRollAvailability();
+    refreshQuotesSoon();
+  };
+  $('diceSlider').addEventListener('input', () => {
+    state.targetBps = Number($('diceSlider').value);
     updateSliderVisuals();
-    fetchBetQuote();
+    onRollInput();
   });
-
   $('targetInput').addEventListener('change', (e) => {
-    const val = Math.round(Number(e.target.value) * 100);
     const min = state.direction === 'under' ? 100 : 199;
     const max = state.direction === 'under' ? 9800 : 9899;
-    state.targetBps = Math.max(min, Math.min(max, val || 4950));
+    state.targetBps = Math.max(min, Math.min(max, Math.round(Number(e.target.value) * 100) || 4950));
     updateSliderVisuals();
-    fetchBetQuote();
+    onRollInput();
   });
-
   $('winChanceInput').addEventListener('change', (e) => {
     const winBps = Math.max(100, Math.min(9800, Math.round(Number(e.target.value) * 100) || 4950));
     state.targetBps = state.direction === 'under' ? winBps : 9999 - winBps;
     updateSliderVisuals();
-    fetchBetQuote();
+    onRollInput();
   });
-
   $('btnFlipDirection').addEventListener('click', () => {
     state.direction = state.direction === 'under' ? 'over' : 'under';
-    state.targetBps = 9999 - state.targetBps;
-    state.targetBps = Math.max(100, Math.min(9899, state.targetBps));
+    state.targetBps = Math.max(state.direction === 'under' ? 100 : 199, Math.min(state.direction === 'under' ? 9800 : 9899, 9999 - state.targetBps));
     updateSliderVisuals();
-    fetchBetQuote();
+    onRollInput();
   });
-
-  $('wagerInput').addEventListener('input', () => {
-    updateOfflineCommandPreview();
-    fetchBetQuote();
-  });
-
-  $('btnBetMin').addEventListener('click', () => {
-    $('wagerInput').value = '1.000000';
-    updateOfflineCommandPreview();
-    fetchBetQuote();
-  });
-  $('btnBetHalf').addEventListener('click', () => {
-    const cur = Math.max(1, (Number($('wagerInput').value) || 10) / 2);
-    $('wagerInput').value = cur.toFixed(6);
-    updateOfflineCommandPreview();
-    fetchBetQuote();
-  });
-  $('btnBetDouble').addEventListener('click', () => {
-    const maxW = Number(state.lastBetQuote?.maxAllowedWagerPoa || 2500);
-    const cur = Math.min(maxW, (Number($('wagerInput').value) || 10) * 2);
-    $('wagerInput').value = cur.toFixed(6);
-    updateOfflineCommandPreview();
-    fetchBetQuote();
-  });
+  $('wagerInput').addEventListener('input', onRollInput);
+  $('clientSeedInput').addEventListener('input', onRollInput);
+  const setWager = (v) => {
+    $('wagerInput').value = Math.max(1, v).toFixed(6);
+    onRollInput();
+  };
+  $('btnBetMin').addEventListener('click', () => setWager(1));
+  $('btnBetHalf').addEventListener('click', () => setWager((Number(wagerValue()) || 2) / 2));
+  $('btnBetDouble').addEventListener('click', () => setWager((Number(wagerValue()) || 1) * 2));
   $('btnBetMax').addEventListener('click', () => {
-    const maxW = state.lastBetQuote?.maxAllowedWagerPoa || '100.000000';
-    $('wagerInput').value = maxW;
-    updateOfflineCommandPreview();
-    fetchBetQuote();
+    const sel = state.batchQuotes?.find((q) => q.count === state.rollCount);
+    setWager(Math.floor(Number(sel?.maxWagerForCountPoa || 1) * 100) / 100);
   });
-
   $('btnRandomSeed').addEventListener('click', () => {
-    const rand = Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
-    $('clientSeedInput').value = `poa-seed-${rand}`;
-    updateOfflineCommandPreview();
+    $('clientSeedInput').value = `poa-seed-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    onRollInput();
   });
-
-  $('clientSeedInput').addEventListener('input', updateOfflineCommandPreview);
-
-  $('btnRollDice').addEventListener('click', signAndRollSingle);
-  $('btnAgentAutoBurst').addEventListener('click', runAgentBurst);
-
-  $('btnNewWallet').addEventListener('click', async () => {
-    await initWallet(true);
-    await fetchState();
-    await refreshAllQuotes();
+  $('playerAddressInput').addEventListener('input', () => {
+    const a = String($('playerAddressInput').value || '').trim();
+    state.playerAddress = ADDR_RE.test(a) ? a : '';
+    onRollInput();
+    refreshStateSoon();
   });
-  $('btnToggleOfflineMode').addEventListener('click', () => {
-    $('offlineBanner').classList.toggle('hidden');
-  });
-
-  $('btnCopyOfflineCmd').addEventListener('click', async () => {
-    const txt = $('liveOfflineCommand').textContent;
-    try {
-      await navigator.clipboard.writeText(txt);
-      $('btnCopyOfflineCmd').textContent = 'Copied!';
-      setTimeout(() => {
-        $('btnCopyOfflineCmd').textContent = 'Copy Command';
-      }, 1500);
-    } catch {
-      // Ignore clipboard permission error
-    }
-  });
-
-  // Bankroll Tabs & Controls
-  document.querySelectorAll('[data-bank-tab]').forEach((btn) => {
-    btn.addEventListener('click', () => switchBankTab(btn.getAttribute('data-bank-tab')));
-  });
-  document.querySelectorAll('[data-set-deposit]').forEach((btn) => {
+  document.querySelectorAll('[data-roll-count]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      $('depositAmountInput').value = btn.getAttribute('data-set-deposit');
-      fetchDepositQuote();
+      if (btn.disabled) return;
+      state.rollCount = Number(btn.getAttribute('data-roll-count'));
+      renderRollAvailability();
     });
   });
-  $('depositAmountInput').addEventListener('input', fetchDepositQuote);
-  $('lockEpochsInput').addEventListener('input', fetchDepositQuote);
-  $('btnSubmitDeposit').addEventListener('click', submitBankDeposit);
-
-  document.querySelectorAll('[data-withdraw-bps]').forEach((btn) => {
+  $('btnCopyPrompt').addEventListener('click', async () => {
+    if ($('btnCopyPrompt').disabled) return;
+    const text = rollPrompt();
+    $('promptPreview').textContent = text;
+    if (await copyText(text)) flashCopied($('btnCopyPrompt'), $('btnCopyPromptText'), 'Copy prompt');
+  });
+  for (const a of ACTIONS) {
+    $(a.btn).addEventListener('click', async (e) => {
+      if (e.currentTarget.tagName === 'BUTTON' && e.currentTarget.form) e.preventDefault();
+      if ($(a.btn).disabled) return;
+      const text = actionPrompt(a.kind);
+      $(a.btn).dataset.prompt = text;
+      if (await copyText(text)) flashCopied($(a.btn), null, a.label);
+    });
+  }
+  const onActionInput = debounce(() => {
+    fetchActionQuotes();
+    fetchDepositQuote();
+  }, 150);
+  ['depositAmountInput', 'lockEpochsInput', 'referrerInput', 'autoStrategySelect', 'autoRollsInput', 'chatTextInput', 'chatSenderInput'].forEach((id) => {
+    $(id).addEventListener('input', onActionInput);
+    $(id).addEventListener('change', onActionInput);
+  });
+  document.querySelectorAll('[data-set-deposit]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      $('depositAmountInput').value = btn.getAttribute('data-set-deposit');
+      onActionInput();
+    })
+  );
+  document.querySelectorAll('[data-withdraw-bps]').forEach((btn) =>
     btn.addEventListener('click', () => {
       document.querySelectorAll('[data-withdraw-bps]').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       state.withdrawBps = Number(btn.getAttribute('data-withdraw-bps'));
       $('withdrawBpsLabel').textContent = `${(state.withdrawBps / 100).toFixed(0)}% OF YOUR BANK SHARES`;
       fetchWithdrawQuote();
-    });
+      fetchActionQuotes();
+    })
+  );
+  document.querySelectorAll('[data-bank-tab]').forEach((btn) =>
+    btn.addEventListener('click', () => switchTab('data-bank-tab', 'bankTab', ['deposit', 'withdraw', 'incentives'], btn.getAttribute('data-bank-tab')))
+  );
+  document.querySelectorAll('[data-feed-tab]').forEach((btn) =>
+    btn.addEventListener('click', () => switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify', 'mcp'], btn.getAttribute('data-feed-tab')))
+  );
+  $('liveBetsTableBody').addEventListener('click', (e) => {
+    const row = e.target.closest('tr[data-bet-txid]');
+    const bet = row && state.recentBets.find((x) => x.betTxid === row.getAttribute('data-bet-txid'));
+    if (!bet) return;
+    $('verifyServerSeedHash').value = bet.provablyFair?.serverSeedHash || '';
+    $('verifyClientSeed').value = bet.provablyFair?.clientSeed || '';
+    $('verifyNonce').value = String(bet.provablyFair?.nonce || 1);
+    $('verifyBetTxid').value = bet.betTxid || '';
+    $('verifyTargetBps').value = String(bet.targetBps || 4950);
+    $('verifyDirection').value = bet.direction || 'under';
+    switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify', 'mcp'], 'verify');
   });
-  $('btnSubmitWithdraw').addEventListener('click', submitBankWithdraw);
-
-  $('btnSweepDev').addEventListener('click', sweepDevReserve);
-  $('btnAdvanceEpoch').addEventListener('click', advanceEpoch);
-
-  // Feed Tabs & Chat
-  document.querySelectorAll('[data-feed-tab]').forEach((btn) => {
-    btn.addEventListener('click', () => switchFeedTab(btn.getAttribute('data-feed-tab')));
+  $('btnCopyOfflineCmd').addEventListener('click', async () => {
+    if (await copyText($('liveOfflineCommand').textContent)) flashCopied($('btnCopyOfflineCmd'), null, 'Copy Command');
   });
-
+  // Plain human chat (unsigned, no key). Signed agent chat goes through the copy-prompt button.
   $('chatForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const textInput = $('chatTextInput');
-    const text = textInput.value.trim();
+    const text = $('chatTextInput').value.trim();
     if (!text) return;
-    const senderName = $('chatSenderInput').value.trim() || 'POA-Player';
-    const isAgent = $('chatIsAgentCheck').checked;
-
-    textInput.value = '';
+    $('chatTextInput').value = '';
     await fetch(api('/api/chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        privkey: state._demoPrivkey,
-        address: state.wallet?.address || 'guest',
-        senderName,
-        text,
-        isAgent,
-      }),
+      body: JSON.stringify({ senderName: $('chatSenderInput').value.trim() || 'Guest', text, isAgent: false }),
     });
-    await fetchState();
+    fetchActionQuotes();
   });
-
-  $('btnRotateSeed').addEventListener('click', rotateAndRevealSeed);
   $('btnRunVerify').addEventListener('click', runVerifyRoll);
+}
+
+if (typeof document !== 'undefined' && document.body?.dataset.autoboot === 'true') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => bootPoaDice());
+  else bootPoaDice();
 }

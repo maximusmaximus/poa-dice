@@ -17,12 +17,31 @@ import {
   isValidPoaAddress,
   redactSecrets,
   signRaw,
+  toMicros,
   verifyRaw,
   walletFromPrivkey
 } from './crypto-poa.mjs';
 import { verifyRoll } from './provably-fair.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
+import { BATCH_COUNTS, executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
+import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake, WITHDRAW_TRIGGER_POA } from './actions.mjs';
+
+export const ROLL_FORMULA =
+  'w = first 8-byte big-endian window of HMAC_SHA256(key=server_seed, msg="client_seed:nonce:bet_txid") at offsets 0,8,16,24 with w < 18446744073709550000 (else offset 0); roll = (w mod 10000) / 100';
+
+export const MCP_INSTRUCTIONS = [
+  'POA Dice MCP server. Intended entry point: a prompt the user copied from a POA Dice web page button',
+  '("Copy prompt" on Roll, Auto-bet, Stake, Withdraw, Claim yield or Chat). That prompt names exactly one tool,',
+  'its exact arguments and a max_total_spend_poa cap. Do this:',
+  '1) Call the matching quote tool first (dice_quote_batch, bank_quote_deposit, bank_quote_withdraw, dice_quote_bet) and STOP',
+  'if it is not valid; tell the user the reason. 2) Call the action tool with the same arguments. Never raise amounts,',
+  'counts or caps beyond what the prompt states. 3) Sign with your own PoA key: prefer signed_tx/signed_txs built locally;',
+  'pass privkey only if the user explicitly accepts sending it to this server. Never paste a private key into chat.',
+  '4) Report results (rolls, payouts, bet_txids, server seed hash) back to the user. The web page updates live by itself.',
+  'The server re-validates everything (bank coverage, Kelly cap, balances, chain status) and rejects what it cannot cover.',
+  'Admin actions (seed rotate, epoch advance, dev sweep) are not available to agents.'
+].join(' ');
 
 export const MCP_TOOLS = [
   {
@@ -77,7 +96,7 @@ export const MCP_TOOLS = [
   {
     name: 'dice_verify_roll',
     description:
-      'Independently verify any Dice roll using HMAC-SHA256(server_seed, client_seed:nonce:bet_txid) and confirm the SHA-256 server seed commitment.',
+      `Independently verify any Dice roll after the server seed is revealed and confirm the SHA-256 server seed commitment. Formula: ${ROLL_FORMULA}.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -109,13 +128,14 @@ export const MCP_TOOLS = [
   {
     name: 'bank_stake',
     description:
-      'Add POA liquidity to the shared Bankroll Vault via a signed Ed25519 POA transfer to receive proportional LP shares and earn house-edge yield + staking incentives.',
+      'Stake POA into the shared Bankroll Vault (optional conviction lock 0..10 epochs and referrer) via a signed Ed25519 POA transfer. Validated server-side (min 10 POA, cap, chain balance). Entry point: the "Copy stake prompt" button. Sign with signed_tx or privkey (required when the server is chain-backed).',
     inputSchema: {
       type: 'object',
       properties: {
         amount_poa: { type: 'string', description: 'Deposit amount in POA (e.g. "500.000000")' },
-        lock_epochs: { type: 'integer', description: 'Optional conviction lock epochs (0..100)' },
+        lock_epochs: { type: 'integer', description: 'Optional conviction lock epochs (0..10)' },
         referrer: { type: 'string', description: 'Optional referrer poa1... address for syndicate bonus' },
+        max_total_spend_poa: { type: 'string', description: 'Hard cap; must be >= amount_poa or the call is rejected' },
         signed_tx: { type: 'object', description: 'Optional pre-signed POA transfer tx body' },
         privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key to sign locally' }
       },
@@ -140,7 +160,7 @@ export const MCP_TOOLS = [
   {
     name: 'bank_withdraw',
     description:
-      'Redeem LP shares from the Bankroll Vault and send the POA principal + profit payout strictly to the staker poa1... address.',
+      'Withdraw (unstake) LP shares from the Bankroll Vault; payout goes strictly to the staker poa1... address. Validated server-side (position, lock, chain). Entry point: the "Copy withdraw prompt" button. Costs a 0.000001 POA trigger transfer.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -173,8 +193,9 @@ export const MCP_TOOLS = [
       properties: {
         compound_now: {
           type: 'boolean',
-          description: 'If true, triggers epoch advancement and compounds accumulated incentivePool into LP shares'
-        }
+          description: 'Admin only: advance the epoch and compound the incentive pool. Requires admin_token.'
+        },
+        admin_token: { type: 'string', description: 'House admin token (not available to players)' }
       }
     }
   },
@@ -239,7 +260,7 @@ export const MCP_TOOLS = [
   {
     name: 'dice_auto_strategy',
     description:
-      'Execute a bounded (1..25 rolls) Ed25519-signed autonomous agent betting strategy (flat, quarter_kelly, martingale_capped, or paroli) with automatic Kelly cap clamping and stop-loss / take-profit circuit breakers.',
+      'Execute a bounded (1..25 rolls) Ed25519-signed autonomous agent betting strategy (flat, quarter_kelly, martingale_capped, or paroli) with Kelly cap clamping, a max_total_spend_poa hard cap and stop-loss / take-profit circuit breakers. Entry point: the "Copy auto-bet prompt" button.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -252,10 +273,65 @@ export const MCP_TOOLS = [
         target_bps: { type: 'integer', description: 'Slider target in basis points (100..9899, default 4950)' },
         direction: { type: 'string', enum: ['under', 'over'], description: 'Roll under or over target' },
         rolls: { type: 'integer', description: 'Number of rolls to execute (1..25, default 5)' },
+        max_total_spend_poa: { type: 'string', description: 'Hard cap on total POA wagered; the run stops before exceeding it' },
         stop_on_profit_poa: { type: 'string', description: 'Optional take-profit threshold in POA' },
         stop_on_loss_poa: { type: 'string', description: 'Optional stop-loss threshold in POA' },
         client_seed: { type: 'string', description: 'Base client seed prefix' },
         privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key to sign locally' }
+      }
+    }
+  },
+  {
+    name: 'dice_quote_batch',
+    description:
+      'Read-only. Check whether a batch of 1, 5, 100 or 1000 flat dice rolls can be covered by the bank right now (worst case: every roll wins). Returns valid, reason, total wager, max bank exposure, Kelly cap. Omit count to quote all four counts. Call this before dice_batch_roll.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        count: { type: 'integer', enum: [...BATCH_COUNTS] },
+        amount_poa: { type: 'string', description: 'Wager per roll in POA (e.g. "1.000000")' },
+        target_bps: { type: 'integer', description: 'Target in basis points (100..9800 under, 199..9899 over)' },
+        direction: { type: 'string', enum: ['under', 'over'] },
+        client_seed: { type: 'string', description: '1-48 chars [A-Za-z0-9._-]' },
+        max_total_spend_poa: { type: 'string' },
+        address: { type: 'string', description: 'Optional player poa1... address (VIP edge + balance check)' }
+      },
+      required: ['amount_poa', 'target_bps', 'direction']
+    }
+  },
+  {
+    name: 'dice_batch_roll',
+    description:
+      'Place a batch of exactly 1, 5, 100 or 1000 flat dice rolls in one call. Entry point: the prompt copied from the POA Dice "Copy prompt" roll button. The server validates the whole batch upfront (bank must cover every roll winning, per-roll Kelly cap, max_total_spend_poa, chain/player balance), reserves that exposure so concurrent batches cannot oversubscribe the bank, then rolls and returns per-roll verify data (bet_txid, nonce, client seed, server seed hash). Rejects (isError) when the bank cannot cover it. Sign with signed_txs (preferred; exactly count pre-signed BET transfers) or privkey; with neither a throwaway key is used (demo only, rejected on a chain-backed server).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        count: { type: 'integer', enum: [...BATCH_COUNTS] },
+        amount_poa: { type: 'string', description: 'Wager per roll in POA' },
+        target_bps: { type: 'integer' },
+        direction: { type: 'string', enum: ['under', 'over'] },
+        client_seed: { type: 'string', description: '1-48 chars [A-Za-z0-9._-]; same seed for every roll (nonce increments)' },
+        max_total_spend_poa: { type: 'string', description: 'Required hard cap on total POA wagered (count x amount_poa or more)' },
+        stop_on_loss_poa: { type: 'string', description: 'Optional: stop once net loss reaches this' },
+        stop_on_profit_poa: { type: 'string', description: 'Optional: stop once net profit reaches this' },
+        include_all_rolls: { type: 'boolean', description: 'Return every roll (default: all when <=100, else first/last 25)' },
+        signed_txs: { type: 'array', items: { type: 'object' }, description: 'Optional pre-signed BET transfers (self-custody)' },
+        privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key (sent to this server; only with user consent)' }
+      },
+      required: ['count', 'amount_poa', 'target_bps', 'direction', 'client_seed', 'max_total_spend_poa']
+    }
+  },
+  {
+    name: 'bank_claim_yield',
+    description:
+      'Claim yield from your bankroll LP position: redeems only the shares worth your gain above principal (house-edge profit + incentives); principal stays staked. Entry point: the "Copy claim prompt" button. Rejects when there is no position or no yield. Sign with signed_tx or privkey.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dry_run: { type: 'boolean', description: 'Only quote; do not sign' },
+        address: { type: 'string', description: 'Staker poa1... address (for dry_run without a key)' },
+        signed_tx: { type: 'object', description: 'Optional pre-signed DICE1:LP_WITHDRAW:<shares> trigger tx' },
+        privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key (only with user consent)' }
       }
     }
   },
@@ -271,17 +347,36 @@ export const MCP_TOOLS = [
 ];
 
 export class McpHandler {
-  constructor({ engine, watcher }) {
+  /**
+   * hooks (all optional; the stdio runner uses none):
+   *   chainRequired: boolean — server is backed by live minepoa.com balances
+   *   chainContext(address) -> Promise<{ required, ok, bankMicros, playerSpendableMicros }>
+   *   reserveSpend(address, micros) / releaseSpend(address, micros) / noteDebit(address, txid, amountPoa)
+   *   adminToken: string — enables admin-only compound_now
+   */
+  constructor({ engine, watcher, hooks = {} }) {
     this.engine = engine;
     this.watcher = watcher;
+    this.hooks = hooks;
     this._ephemeralAgentWallet = genKeypair();
   }
 
-  _resolveWallet(args = {}) {
+  _resolveWallet(args = {}, { needOwnKey = false } = {}) {
     if (args.privkey) {
       return walletFromPrivkey(args.privkey);
     }
+    if (needOwnKey && this.hooks.chainRequired) {
+      throw new Error('This server is chain-backed: pass signed_tx (preferred) or privkey for your own PoA wallet.');
+    }
     return this._ephemeralAgentWallet;
+  }
+
+  async _chain(address) {
+    return this.hooks.chainContext ? this.hooks.chainContext(address) : null;
+  }
+
+  _rejected(quote) {
+    return { valid: false, rejected: true, error: quote.reason || quote.error, code: quote.code, quote };
   }
 
   async handleRpc(request) {
@@ -303,7 +398,8 @@ export class McpHandler {
             },
             capabilities: {
               tools: {}
-            }
+            },
+            instructions: MCP_INSTRUCTIONS
           }
         };
       }
@@ -340,7 +436,7 @@ export class McpHandler {
                 text: JSON.stringify(out, null, 2)
               }
             ],
-            isError: Boolean(out?.error && out?.valid === false)
+            isError: Boolean(out?.rejected || (out?.error && out?.valid === false))
           }
         };
       }
@@ -384,8 +480,18 @@ export class McpHandler {
 
       case 'dice_place_bet': {
         let txEnvelope = args.signed_tx;
+        const from = txEnvelope ? (txEnvelope.body || txEnvelope).from : this._resolveWallet(args, { needOwnKey: true }).address;
+        const single = quoteBatch(this.engine, {
+          address: from,
+          amountPoa: txEnvelope ? (txEnvelope.body || txEnvelope).amount : args.amount_poa,
+          targetBps: args.target_bps,
+          direction: args.direction,
+          count: 1,
+          chain: await this._chain(from)
+        });
+        if (!single.valid) return this._rejected(single);
         if (!txEnvelope) {
-          const wallet = this._resolveWallet(args);
+          const wallet = this._resolveWallet(args, { needOwnKey: true });
           const memo = formatDiceMemo({
             action: 'BET',
             direction: args.direction,
@@ -400,7 +506,57 @@ export class McpHandler {
             nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
           });
         }
-        return this.watcher.processSignedTransaction(txEnvelope);
+        const betReceipt = this.watcher.processSignedTransaction(txEnvelope);
+        if (betReceipt?.action === 'BET_SETTLED' && this.hooks.noteDebit) this.hooks.noteDebit(from, betReceipt.betTxid, betReceipt.wagerPoa);
+        return betReceipt;
+      }
+
+      case 'dice_quote_batch': {
+        const chain = await this._chain(args.address || '');
+        const params = {
+          address: args.address || '',
+          amountPoa: args.amount_poa,
+          targetBps: args.target_bps,
+          direction: args.direction,
+          clientSeed: args.client_seed ?? null,
+          maxTotalSpendPoa: args.max_total_spend_poa ?? null,
+          chain
+        };
+        if (args.count === undefined || args.count === null) return { counts: quoteAllCounts(this.engine, params) };
+        return quoteBatch(this.engine, { ...params, count: args.count });
+      }
+
+      case 'dice_batch_roll': {
+        if (this.hooks.chainRequired && !args.privkey && !Array.isArray(args.signed_txs)) {
+          return { valid: false, rejected: true, error: 'This server is chain-backed: pass signed_txs (preferred) or privkey for your own PoA wallet.' };
+        }
+        try {
+          return await executeBatch({ engine: this.engine, watcher: this.watcher, hooks: this.hooks, args });
+        } catch (err) {
+          if (err.quote) return this._rejected(err.quote);
+          throw err;
+        }
+      }
+
+      case 'bank_claim_yield': {
+        const env = args.signed_tx;
+        const address = env ? (env.body || env).from : args.privkey ? walletFromPrivkey(args.privkey).address : args.address || '';
+        const q = quoteClaimYield(this.engine, { address, chain: await this._chain(address) });
+        if (args.dry_run) return q;
+        if (!q.valid || q.needsPositionCheck) return this._rejected(q.valid ? { ...q, reason: 'Pass privkey or signed_tx so the server knows whose yield to claim' } : q);
+        let tx = env;
+        if (!tx) {
+          const wallet = this._resolveWallet(args, { needOwnKey: true });
+          tx = buildSignedTransfer({
+            wallet,
+            to: this.engine.bankAddress,
+            amount: WITHDRAW_TRIGGER_POA,
+            memo: q.memo,
+            nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
+          });
+        }
+        const r = this.watcher.processSignedTransaction(tx);
+        return { ...r, claimedYieldPoa: q.yieldPoa };
       }
 
       case 'dice_verify_roll': {
@@ -425,8 +581,20 @@ export class McpHandler {
 
       case 'bank_stake': {
         let txEnvelope = args.signed_tx;
+        const stakeFrom = txEnvelope ? (txEnvelope.body || txEnvelope).from : this._resolveWallet(args, { needOwnKey: true }).address;
+        const sq = quoteStake(this.engine, {
+          address: stakeFrom,
+          amountPoa: txEnvelope ? (txEnvelope.body || txEnvelope).amount : args.amount_poa,
+          lockEpochs: Number(args.lock_epochs || 0),
+          referrer: args.referrer || '',
+          chain: await this._chain(stakeFrom)
+        });
+        if (!sq.valid) return this._rejected(sq);
+        if (args.max_total_spend_poa && Number(sq.amountPoa) > Number(args.max_total_spend_poa)) {
+          return this._rejected({ code: 'over_cap', reason: `Deposit ${sq.amountPoa} POA exceeds max_total_spend_poa ${args.max_total_spend_poa}` });
+        }
         if (!txEnvelope) {
-          const wallet = this._resolveWallet(args);
+          const wallet = this._resolveWallet(args, { needOwnKey: true });
           const memo = formatDiceMemo({
             action: 'LP_ADD',
             lockEpochs: Number(args.lock_epochs || 0),
@@ -440,7 +608,9 @@ export class McpHandler {
             nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
           });
         }
-        return this.watcher.processSignedTransaction(txEnvelope);
+        const stakeReceipt = this.watcher.processSignedTransaction(txEnvelope);
+        if (stakeReceipt?.action === 'LP_DEPOSIT' && this.hooks.noteDebit) this.hooks.noteDebit(stakeFrom, txEnvelope.id, sq.amountPoa);
+        return stakeReceipt;
       }
 
       case 'bank_quote_withdraw': {
@@ -454,8 +624,15 @@ export class McpHandler {
 
       case 'bank_withdraw': {
         let txEnvelope = args.signed_tx;
+        const wFrom = txEnvelope ? (txEnvelope.body || txEnvelope).from : this._resolveWallet(args, { needOwnKey: true }).address;
+        const wq = quoteUnstake(this.engine, {
+          address: wFrom,
+          bps: args.mode === 'ALL' || (!args.bps && !args.shares) ? 10000 : Number(args.bps || 10000),
+          chain: await this._chain(wFrom)
+        });
+        if (!args.shares && !wq.valid) return this._rejected(wq);
         if (!txEnvelope) {
-          const wallet = this._resolveWallet(args);
+          const wallet = this._resolveWallet(args, { needOwnKey: true });
           const memo = formatDiceMemo({
             action: 'LP_WITHDRAW',
             shares: args.shares || null,
@@ -479,6 +656,9 @@ export class McpHandler {
       case 'bank_incentives_info': {
         let compoundResult = null;
         if (args.compound_now) {
+          if (!this.hooks.adminToken || args.admin_token !== this.hooks.adminToken) {
+            return { valid: false, rejected: true, error: 'compound_now is an admin-only house action' };
+          }
           compoundResult = this.engine.advanceEpoch({ distributeIncentives: true });
         }
         const state = this.engine.getStateSummary();
@@ -506,6 +686,8 @@ export class McpHandler {
       }
 
       case 'chat_send': {
+        const cq = quoteChat({ text: args.text });
+        if (!cq.valid) return this._rejected(cq);
         let addr = args.address || '';
         let sig = args.signature || null;
         if (args.privkey) {
@@ -567,7 +749,22 @@ export class McpHandler {
       }
 
       case 'dice_auto_strategy': {
-        const wallet = this._resolveWallet(args);
+        const wallet = this._resolveWallet(args, { needOwnKey: true });
+        const aq = quoteAutoBet(this.engine, {
+          address: wallet.address,
+          strategy: args.strategy || 'quarter_kelly',
+          baseWagerPoa: args.base_wager_poa || '10.000000',
+          targetBps: Number(args.target_bps || 4950),
+          direction: args.direction || 'under',
+          rolls: Number(args.rolls || 5),
+          clientSeed: args.client_seed || 'mcp-auto-strategy',
+          maxTotalSpendPoa: args.max_total_spend_poa || null,
+          chain: await this._chain(wallet.address)
+        });
+        if (!aq.valid) return this._rejected(aq);
+        const capMicros = toMicros(aq.maxTotalSpendPoa);
+        if (this.hooks.reserveSpend) this.hooks.reserveSpend(wallet.address, capMicros);
+        try {
         return this.watcher.executeAutoStrategy({
           wallet,
           strategy: args.strategy || 'quarter_kelly',
@@ -577,8 +774,15 @@ export class McpHandler {
           rolls: Number(args.rolls || 5),
           clientSeed: args.client_seed || 'mcp-auto-strategy',
           stopOnProfitPoa: args.stop_on_profit_poa || null,
-          stopOnLossPoa: args.stop_on_loss_poa || null
+          stopOnLossPoa: args.stop_on_loss_poa || null,
+          maxTotalSpendPoa: aq.maxTotalSpendPoa,
+          onRoll: (r) => {
+            if (r?.action === 'BET_SETTLED' && this.hooks.noteDebit) this.hooks.noteDebit(wallet.address, r.betTxid, r.wagerPoa);
+          }
         });
+        } finally {
+          if (this.hooks.releaseSpend) this.hooks.releaseSpend(wallet.address, capMicros);
+        }
       }
 
       case 'dice_audit_solvency': {
