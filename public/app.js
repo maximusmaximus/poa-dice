@@ -773,8 +773,16 @@ function connectRealtimeStream(alive) {
   };
 }
 
+const seenEventIds = new Set();
+const seenEventOrder = [];
 function handleRealtimeEvent(msg) {
   if (!msg || !msg.type) return;
+  if (msg.id) {
+    if (seenEventIds.has(msg.id)) return; // dedupe: same event delivered twice
+    seenEventIds.add(msg.id);
+    seenEventOrder.push(msg.id);
+    if (seenEventOrder.length > 1000) seenEventIds.delete(seenEventOrder.shift());
+  }
   const p = msg.payload || {};
   switch (msg.type) {
     case 'bet.settled':

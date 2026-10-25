@@ -33,6 +33,17 @@
  *     explorer's `balance` alone lags until the next checkpoint).
  *   - State (this queue + the engine snapshot) is ONE document in the store, written in order;
  *     a payout is broadcast only after its signed body is durable.
+ *
+ * Settle exactly once across instances (fix/settle-once-lp-nav)
+ *   - Serverless hosts run several instances, each with its own in-memory copy of the document.
+ *     Previously each one rolled a bet it booked with ITS OWN nonce/seed, so two instances could
+ *     settle the same bet differently (live: stored roll 76.96, payout note roll=93.96).
+ *   - Now the seed pair of each epoch is claimed in the store (`seed:<epoch>`, first writer wins,
+ *     every instance adopts it), and before a bet is rolled its settlement ticket (nonce, seed epoch,
+ *     roll, outcome) is claimed atomically (`bet:<txid>`). Losers adopt the stored ticket, so every
+ *     instance books the same result and builds the same payout note from it.
+ *   - A payout body is claimed per order + re-sign generation (`payout:<orderId>:<n>`) before it is
+ *     broadcast, so two instances can never sign two different transfers for one order.
  */
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
 import { PersistQueue } from './settlement-store.mjs';
@@ -374,11 +385,59 @@ export class ChainSettlement {
         rec.ledger = { atts: tx.atts, final: tx.final };
         continue;
       }
-      this._book(rec, tx);
+      const booked = await this._book(rec, tx);
+      if (booked === false) return; // store unreachable: retry next tick, in order
     }
   }
 
-  _book(rec, tx) {
+  /** Make every instance use the same committed seed pair for the active epoch. */
+  async _syncSeed() {
+    const epoch = this.engine.seedManager.epochId;
+    if (this._seedSyncedEpoch === epoch && this._seedSyncedSeed === this.engine.seedManager.currentSeed) return true;
+    let res;
+    try {
+      res = await this._persist.claim(`seed:${epoch}`, this.engine.seedRecord());
+    } catch (err) {
+      this._tickErrors.push(`store claim (seed): ${err.message}`);
+      return false;
+    }
+    if (!res.claimed && this.engine.adoptSeedRecord(res.value)) {
+      if (this.logger) this.logger(`adopted committed seed for epoch ${epoch} from the shared store`);
+      this._save();
+    }
+    this._seedSyncedEpoch = epoch;
+    this._seedSyncedSeed = this.engine.seedManager.currentSeed;
+    return true;
+  }
+
+  /**
+   * Claim the settlement ticket for a ledger-confirmed bet. Returns the authoritative ticket
+   * (ours or the one another instance claimed first), or null when the store is unreachable.
+   */
+  async _claimBetTicket(rec, b) {
+    const parsed = parseDiceMemo(b.memo || '');
+    if (!parsed.valid || parsed.action !== 'BET') return undefined; // refund path: no roll
+    if (!(await this._syncSeed())) return null;
+    const mine = this.engine.prepareBetTicket({
+      betTxid: rec.txid,
+      address: b.from,
+      clientSeed: parsed.clientSeed,
+      targetBps: parsed.targetBps,
+      direction: parsed.direction
+    });
+    try {
+      const res = await this._persist.claim(`bet:${rec.txid}`, mine);
+      if (!res.claimed && res.value && res.value.rollBps !== mine.rollBps && this.logger) {
+        this.logger(`bet ${rec.txid.slice(0, 16)} already settled by another instance; adopting its roll ${res.value.rollDisplay}`);
+      }
+      return res.value;
+    } catch (err) {
+      this._tickErrors.push(`store claim (bet): ${err.message}`);
+      return null;
+    }
+  }
+
+  async _book(rec, tx) {
     const b = tx.body && tx.body.from ? tx.body : { from: tx.from, to: tx.to, amount: tx.amount, memo: tx.memo, ts: tx.ts, type: 'transfer' };
     const mismatch =
       (b.type && b.type !== 'transfer') ||
@@ -410,6 +469,13 @@ export class ChainSettlement {
     if (this.engine.processedTxids.has(rec.txid)) {
       result = this.engine.processedTxids.get(rec.txid);
     } else {
+      const ticket = await this._claimBetTicket(rec, b);
+      if (ticket === null) return false;
+      if (this.engine.processedTxids.has(rec.txid)) {
+        result = this.engine.processedTxids.get(rec.txid);
+      } else {
+      if (ticket) this.engine.settlementTickets.set(rec.txid, ticket);
+      try {
       result = this.watcher.executeMemoAction({
         txid: rec.txid,
         from: b.from,
@@ -419,6 +485,10 @@ export class ChainSettlement {
         ts: b.ts || Math.floor(now() / 1000),
         playerSig: b.sig || null
       });
+      } finally {
+        this.engine.settlementTickets.delete(rec.txid);
+      }
+      }
     }
     rec.status = 'BOOKED';
     rec.bookedAt = now();
@@ -805,7 +875,27 @@ export class ChainSettlement {
         this._save();
         return;
       }
-      const tx = buildSignedTransfer({ wallet: this.bankWallet, to: rec.to, amount: rec.amountPoa, memo: rec.memo, nonce, parents, cid: this.client.chainId });
+      const signed = buildSignedTransfer({ wallet: this.bankWallet, to: rec.to, amount: rec.amountPoa, memo: rec.memo, nonce, parents, cid: this.client.chainId });
+      let tx = signed;
+      try {
+        // One signed body per order (and re-sign generation) across all instances.
+        const res = await this._persist.claim(`payout:${rec.orderId}:${rec.resigns || 0}`, { txid: signed.id, body: signed.body, nonce });
+        if (!res.claimed) {
+          const v = res.value || {};
+          if (!v.body || txidOf(v.body) !== v.txid || v.body.to !== rec.to || toMicros(v.body.amount) !== toMicros(rec.amountPoa) || !verifyBody(v.body, this.bankAddress)) {
+            throw new Error(`stored payout claim for ${rec.orderId} does not match the order`);
+          }
+          tx = { id: v.txid, body: v.body };
+          nonce = Number(v.nonce ?? v.body.nonce);
+          if (this.logger) this.logger(`payout ${rec.orderId} already signed by another instance; adopting ${v.txid.slice(0, 16)}`);
+        }
+      } catch (err) {
+        rec.lastError = `store claim (payout): ${err.message}`;
+        this._tickErrors.push(rec.lastError);
+        rec.nextAttemptAt = now() + this._backoff(++rec.attempts);
+        this._save();
+        return;
+      }
       rec.txid = tx.id;
       rec.body = tx.body;
       rec.nonce = nonce;
@@ -850,6 +940,7 @@ export class ChainSettlement {
       this._tickErrors = [];
       try {
         await this.ready();
+        await this._syncSeed();
         const row = await this._scanBank();
         await this._confirmInbound();
         this._adoptOutbound();
