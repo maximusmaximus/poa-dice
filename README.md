@@ -106,9 +106,9 @@ node bin/poa-dice-replay.mjs
 
 ---
 
-## 🤖 Model Context Protocol (MCP) Service (16 Tools)
+## 🤖 Model Context Protocol (MCP) Service (19 Tools)
 
-`poa-dice` exposes **16 tools** over both **Streamable HTTP (`POST http://127.0.0.1:3080/mcp`)** and **Website-Independent Stdio (`node src/mcp-server.mjs --stdio`)**:
+`poa-dice` exposes **19 tools** over both **Streamable HTTP (`POST http://127.0.0.1:3080/mcp`)** and **Website-Independent Stdio (`node src/mcp-server.mjs --stdio`)**:
 
 | Tool Name | Description |
 |---|---|
@@ -127,4 +127,49 @@ node bin/poa-dice-replay.mjs
 | `chat_read` | Read recent verified messages from the live human + agent chat room. |
 | `chat_send` | Post an Ed25519-verified message to the live site chat via MCP. |
 | `feed_recent` | Read near real-time bets and bankroll actions. |
+| `dice_quote_batch` | Read-only: can the bank cover 1 / 5 / 100 / 1000 rolls right now (worst case: every roll wins)? Returns the reason when it can't. |
+| `dice_batch_roll` | Place exactly 1, 5, 100 or 1000 rolls in one call with a required `max_total_spend_poa`. The whole exposure is reserved upfront. Entry point: the page's **Copy prompt** button. |
+| `bank_claim_yield` | Redeem only the shares worth your gain above principal (principal stays staked). |
 | `offline_memo_builder` | Build a pure `DICE1:*` memo and `poa.mjs send` command for website-down operation. |
+
+---
+
+## 📋 Browser → agent prompts (the entry point)
+
+The page never signs and never holds a private key. Every action button copies a ready-to-paste prompt for your own AI agent:
+
+| Button | MCP tools the prompt calls |
+|---|---|
+| **Copy prompt** (roll builder: under/over, target, wager, client seed, 1/5/100/1000 rolls) | `dice_quote_batch` → `dice_batch_roll` |
+| **Copy auto-bet prompt** | `dice_quote_bet` → `dice_auto_strategy` (with `max_total_spend_poa`) |
+| **Copy stake prompt** (amount, lock-up epochs, referrer) | `bank_quote_deposit` → `bank_stake` |
+| **Copy withdraw prompt** (25/50/75/100%) | `bank_quote_withdraw` → `bank_withdraw` |
+| **Copy claim-yield prompt** | `bank_claim_yield` (dry run) → `bank_claim_yield` |
+| **Copy agent chat prompt** | `chat_send` |
+
+Each prompt holds the MCP URL, the exact arguments, a total spend cap and a stop condition. It also tells the agent to sign with its own wallet (`signed_tx`/`signed_txs` preferred; `privkey` only with the user's consent). MCP `initialize` returns `instructions` naming these prompts as the entry point.
+
+### Availability rules (enforced on both the page and the server)
+- A batch of N rolls is allowed only when `N × (profit on win + 0.15% fees) ≤ available bankroll` and the per-roll profit fits the 1% Kelly cap of the bankroll left after reserving the rest of the batch. A count that fails is disabled, and the page shows the reason.
+- Rolls are off when the bankroll is 0, the chain is down (chain-backed server), the input is bad (wager, seed `[A-Za-z0-9._-]{1,48}`, target range), the wager exceeds the spend cap, or the player's spendable balance is too low.
+- The server reserves a batch's full worst-case exposure before the first roll, so concurrent batches cannot oversubscribe the bank (`409` / MCP `isError`).
+- Stake, withdraw, claim, auto-bet and chat are enabled whenever they can work. Each one is disabled only for a concrete reason shown inline (no position, locked, no yield, self-referral, chain down…).
+
+### Live updates
+`/api/stream` (SSE) pushes `bet.settled`, `batch.started/progress/completed`, bank, seed and chat events. The page reconnects with backoff and falls back to polling (2 s while disconnected, 4 s otherwise).
+
+### Admin / house actions
+`/api/seed/rotate`, `/api/epoch/advance`, `/api/dev/sweep` and MCP `bank_incentives_info` compounding need `Authorization: Bearer $POA_DICE_ADMIN_TOKEN`. They are disabled (`403`) when the token is unset. They have no public buttons. The CLI takes `--admin-token`.
+
+### Removed
+- The "New Dev Signer" box and the shared-key `GET /api/wallet/dev` endpoint (now `404`).
+- `POST /api/wallet/generate` is off unless `POA_DICE_DEV_ENDPOINTS=1` (local dev/test only).
+
+### Tests
+`npm test` runs unit, MCP and full-stack tests plus `tests/e2e-browser-smoke.test.mjs`. That file drives headless Chrome (playwright-core, `CHROME_PATH`, default `/usr/bin/google-chrome`; set `REQUIRE_BROWSER=1` to fail instead of skip) against a local server with a mocked minepoa.com explorer.
+
+---
+
+## 🛠 Built with
+
+Grok (app builder) · Node.js 20 · Model Context Protocol · [Proof of Agent / minepoa.com](https://minepoa.com) · Source: [github.com/maximusmaximus/poa-dice](https://github.com/maximusmaximus/poa-dice) (MIT)

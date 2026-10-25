@@ -38,6 +38,7 @@ async function main() {
   const app = createDiceServer({
     dataDir,
     initialBootstrapPoa: '250000.000000',
+    adminToken: 'smoke-admin-token',
   });
   const srv = await app.listen(0, '127.0.0.1');
 
@@ -101,8 +102,17 @@ async function main() {
       srv.url,
       '--wallet',
       walletDir,
+      '--admin-token',
+      'smoke-admin-token',
     ]);
     assert.equal(sweepOut.ok, true);
+    assert.notEqual(sweepOut.mode, 'offline-direct-engine', 'admin sweep should succeed over HTTP with the token');
+    const deniedSweep = await fetch(`${srv.url}/api/dev/sweep`, { method: 'POST' });
+    assert.equal(deniedSweep.status, 401, 'dev sweep must require the admin token');
+    const deniedRotate = await fetch(`${srv.url}/api/seed/rotate`, { method: 'POST' });
+    assert.equal(deniedRotate.status, 401, 'seed rotate must require the admin token');
+    const deniedEpoch = await fetch(`${srv.url}/api/epoch/advance`, { method: 'POST' });
+    assert.equal(deniedEpoch.status, 401, 'epoch advance must require the admin token');
     assert.equal(sweepOut.devReserveAddress, DEV_RESERVE_ADDRESS);
 
     const autoOut = await runCliJson([

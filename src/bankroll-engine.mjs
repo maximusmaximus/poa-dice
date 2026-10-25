@@ -97,6 +97,8 @@ export class BankrollEngine {
     this.betHistory = []; // Recent settled bets
     this.bankHistory = []; // Recent LP deposits/withdrawals/incentives
     this.chatMessages = []; // Verified human + agent chat messages
+    this.batchReservations = new Map(); // batchId -> reserved bank exposure (micros), transient
+    this._deferSave = false; // batch execution writes state once at the end
 
     this.seedManager = new SeedCommitManager(options.seedState || null);
     this.eventListeners = new Set();
@@ -1399,8 +1401,49 @@ export class BankrollEngine {
   // -------------------------------------------------------------------------
   // Atomic Disk Persistence
   // -------------------------------------------------------------------------
+  /**
+   * Reserve worst-case bank exposure for a whole multi-roll batch before the first roll.
+   * Reserved micros count as locked collateral, so a concurrent batch or single bet can
+   * never be quoted against POA that this batch may still need to pay out.
+   */
+  reserveExposure(batchId, micros) {
+    const amount = BigInt(micros);
+    if (amount <= 0n) throw new Error('Reservation must be positive');
+    if (this.batchReservations.has(batchId)) throw new Error(`Batch ${batchId} already reserved`);
+    if (amount > this.availableBankrollMicros) {
+      const error = new Error(
+        `Bank cannot cover this batch: worst-case exposure ${fromMicros(amount)} POA exceeds available ${fromMicros(this.availableBankrollMicros)} POA`
+      );
+      error.status = 409;
+      throw error;
+    }
+    this.batchReservations.set(batchId, amount);
+    this.lockedCollateralMicros += amount;
+    return amount;
+  }
+
+  /** Release part (or all, when micros is null) of a batch reservation. Returns micros released. */
+  releaseExposure(batchId, micros = null) {
+    const held = this.batchReservations.get(batchId);
+    if (held === undefined) return 0n;
+    let amount = micros === null ? held : BigInt(micros);
+    if (amount > held) amount = held;
+    const left = held - amount;
+    if (left > 0n) this.batchReservations.set(batchId, left);
+    else this.batchReservations.delete(batchId);
+    this.lockedCollateralMicros -= amount;
+    if (this.lockedCollateralMicros < 0n) this.lockedCollateralMicros = 0n;
+    return amount;
+  }
+
+  get reservedExposureMicros() {
+    let sum = 0n;
+    for (const v of this.batchReservations.values()) sum += v;
+    return sum;
+  }
+
   _saveToDisk() {
-    if (!this.dataDir) return;
+    if (!this.dataDir || this._deferSave) return;
     try {
       fs.mkdirSync(this.dataDir, { recursive: true });
       const file = path.join(this.dataDir, 'bankroll-state.json');
@@ -1410,7 +1453,7 @@ export class BankrollEngine {
         currentEpoch: this.currentEpoch,
         devFeeMode: this.devFeeMode,
         bankNavMicros: this.bankNavMicros.toString(),
-        lockedCollateralMicros: this.lockedCollateralMicros.toString(),
+        lockedCollateralMicros: (this.lockedCollateralMicros - this.reservedExposureMicros).toString(),
         totalShares: this.totalShares.toString(),
         devReserveMicros: this.devReserveMicros.toString(),
         totalDevEarnedMicros: this.totalDevEarnedMicros.toString(),

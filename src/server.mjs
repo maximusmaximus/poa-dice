@@ -23,7 +23,10 @@ import {
 import { verifyRoll } from './provably-fair.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
-import { MCP_TOOLS, McpHandler } from './mcp-server.mjs';
+import { MCP_INSTRUCTIONS, MCP_TOOLS, McpHandler, ROLL_FORMULA } from './mcp-server.mjs';
+import { executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
+import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
+import crypto from 'node:crypto';
 import {
   fetchExplorerAddress,
   formatMicros,
@@ -102,18 +105,79 @@ export function createDiceServer(options = {}) {
       mode: options.watcherMode || 'simulated'
     });
 
-  const mcpHandler = new McpHandler({ engine, watcher });
   const sseClients = new Set();
-  const requireChain = watcher.mode !== 'simulated';
+  const requireChain = options.requireChain !== undefined ? Boolean(options.requireChain) : watcher.mode !== 'simulated';
+  const chainFetch = options.chainFetch || ((address) => fetchExplorerAddress(watcher.nodeUrl, address));
+  const chainCacheMs = options.chainCacheMs ?? 15000;
+  const devEndpoints = options.devEndpoints !== undefined ? Boolean(options.devEndpoints) : process.env.POA_DICE_DEV_ENDPOINTS === '1';
+  const adminToken = options.adminToken !== undefined ? options.adminToken : process.env.POA_DICE_ADMIN_TOKEN || null;
   const chainCache = new Map();
+  const pendingSpend = new Map(); // address -> micros reserved by in-flight batches
   let chainDebits = dataDir ? loadDebits(dataDir) : [];
 
   async function cachedExplorer(address) {
     const hit = chainCache.get(address);
-    if (hit && Date.now() - hit.at < 15000) return hit.row;
-    const row = await fetchExplorerAddress(watcher.nodeUrl, address);
+    if (hit && Date.now() - hit.at < chainCacheMs) return hit.row;
+    const row = await chainFetch(address);
     chainCache.set(address, { at: Date.now(), row });
     return row;
+  }
+
+  function playerSpendable(row) {
+    const pending = pendingSpend.get(row.address) || 0n;
+    const have = spendableMicros(row.balance, chainDebits, row.address) - pending;
+    return have > 0n ? have : 0n;
+  }
+
+  /** Live chain context used by every quote/action validator. */
+  async function chainContext(address = '') {
+    if (!requireChain) return { required: false, ok: true };
+    try {
+      const bank = await cachedExplorer(engine.bankAddress);
+      const ctx = { required: true, ok: true, bankMicros: toMicros(bank.balance || '0') };
+      if (address && isValidPoaAddress(address)) {
+        ctx.playerSpendableMicros = playerSpendable(await cachedExplorer(address));
+      }
+      return ctx;
+    } catch {
+      return { required: true, ok: false };
+    }
+  }
+
+  const mcpHooks = {
+    chainRequired: requireChain,
+    chainContext,
+    adminToken,
+    reserveSpend(address, micros) {
+      pendingSpend.set(address, (pendingSpend.get(address) || 0n) + BigInt(micros));
+    },
+    releaseSpend(address, micros) {
+      const left = (pendingSpend.get(address) || 0n) - BigInt(micros);
+      if (left > 0n) pendingSpend.set(address, left);
+      else pendingSpend.delete(address);
+    },
+    noteDebit(address, txid, amountPoa) {
+      noteChainDebit(address, txid, amountPoa);
+    }
+  };
+  const mcpHandler = new McpHandler({ engine, watcher, hooks: mcpHooks });
+
+  function isAdmin(req) {
+    if (!adminToken) return false;
+    const auth = String(req.headers.authorization || '');
+    const given = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const a = Buffer.from(given);
+    const b = Buffer.from(String(adminToken));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
+  function denyAdmin(res) {
+    return sendJson(res, adminToken ? 401 : 403, {
+      ok: false,
+      error: adminToken
+        ? 'Admin action: send Authorization: Bearer <POA_DICE_ADMIN_TOKEN>'
+        : 'Admin actions are disabled (set POA_DICE_ADMIN_TOKEN on the server to enable)'
+    });
   }
 
   async function assertChainSpendable(address, amountPoa) {
@@ -126,7 +190,7 @@ export function createDiceServer(options = {}) {
       error.status = 503;
       throw error;
     }
-    const have = spendableMicros(row.balance, chainDebits, address);
+    const have = playerSpendable(row);
     const need = toMicros(amountPoa);
     if (have < need) {
       const error = new Error(
@@ -187,7 +251,9 @@ export function createDiceServer(options = {}) {
           devFeeBps: 10,
           stateRootSha256: engine.computeStateRoot(),
           connectedSseClients: sseClients.size,
-          mcpEndpoint: '/mcp'
+          mcpEndpoint: '/mcp',
+          chainRequired: requireChain,
+          adminActionsEnabled: Boolean(adminToken)
         });
       }
 
@@ -231,7 +297,7 @@ export function createDiceServer(options = {}) {
               player = {
                 address: row.address,
                 balance: row.balance,
-                spendable: formatMicros(spendableMicros(row.balance, chainDebits, row.address))
+                spendable: formatMicros(playerSpendable(row))
               };
             }
             summary.chain = {
@@ -269,6 +335,52 @@ export function createDiceServer(options = {}) {
         return sendJson(res, 200, quote);
       }
 
+      if (pathname === '/api/quote/batch' && req.method === 'GET') {
+        const p = Object.fromEntries(urlObj.searchParams);
+        const chain = await chainContext(p.address || '');
+        const params = {
+          address: p.address || '',
+          amountPoa: p.amountPoa ?? p.amount_poa,
+          targetBps: Number(p.targetBps ?? p.target_bps),
+          direction: p.direction,
+          clientSeed: p.clientSeed ?? p.client_seed ?? null,
+          maxTotalSpendPoa: p.maxTotalSpendPoa ?? null,
+          chain
+        };
+        if (p.count) return sendJson(res, 200, quoteBatch(engine, { ...params, count: Number(p.count) }));
+        return sendJson(res, 200, {
+          chain: { required: chain.required, ok: chain.ok },
+          counts: quoteAllCounts(engine, params)
+        });
+      }
+
+      // One call for every non-roll action button on the page (stake/withdraw/claim/auto-bet/chat).
+      if (pathname === '/api/quote/actions' && req.method === 'GET') {
+        const p = Object.fromEntries(urlObj.searchParams);
+        const address = p.address && isValidPoaAddress(p.address) ? p.address : '';
+        const chain = await chainContext(address);
+        const addressError = p.address && !address ? 'Player address must be a valid poa1… address' : null;
+        return sendJson(res, 200, {
+          chain: { required: chain.required, ok: chain.ok },
+          address,
+          addressError,
+          stake: quoteStake(engine, { address, amountPoa: p.depositPoa, lockEpochs: Number(p.lockEpochs ?? 0), referrer: p.referrer || '', chain }),
+          withdraw: quoteUnstake(engine, { address, bps: Number(p.withdrawBps ?? 10000), chain }),
+          claim: quoteClaimYield(engine, { address, chain }),
+          autoBet: quoteAutoBet(engine, {
+            address,
+            strategy: p.strategy || 'flat',
+            baseWagerPoa: p.amountPoa,
+            targetBps: Number(p.targetBps),
+            direction: p.direction,
+            rolls: Number(p.autoRolls ?? 5),
+            clientSeed: p.clientSeed || 'agent-auto',
+            chain
+          }),
+          chat: quoteChat({ text: p.chatText || '' })
+        });
+      }
+
       if (pathname === '/api/quote/deposit' && (req.method === 'POST' || req.method === 'GET')) {
         const body = req.method === 'POST' ? await readJsonBody(req) : Object.fromEntries(urlObj.searchParams);
         const quote = engine.quoteDeposit({
@@ -299,7 +411,13 @@ export function createDiceServer(options = {}) {
       }
 
       // 6. Client/Agent Local Wallet Generator & Sign-and-Submit Helper
+      // Never serve private keys to visitors. The old shared-key /api/wallet/dev is gone,
+      // and /api/wallet/generate only exists in explicit local dev/test mode.
+      if (pathname === '/api/wallet/dev') {
+        return sendJson(res, 404, { error: 'Not available. Sign with your own agent via the copied prompt.' });
+      }
       if (pathname === '/api/wallet/generate' && req.method === 'POST') {
+        if (!devEndpoints) return sendJson(res, 404, { error: 'Not available. Sign with your own agent via the copied prompt.' });
         const kp = genKeypair();
         return sendJson(res, 200, {
           address: kp.address,
@@ -350,6 +468,19 @@ export function createDiceServer(options = {}) {
         });
       }
 
+      if (pathname === '/api/action/batch-roll' && req.method === 'POST') {
+        const body = await readJsonBody(req, 4 * 1024 * 1024);
+        if (requireChain && !body.privkey && !Array.isArray(body.signed_txs)) {
+          return sendJson(res, 400, { ok: false, error: 'This server is chain-backed: pass signed_txs or privkey.' });
+        }
+        try {
+          const out = await executeBatch({ engine, watcher, hooks: mcpHooks, args: body });
+          return sendJson(res, 200, out);
+        } catch (err) {
+          return sendJson(res, err.status || 400, { ok: false, error: redactSecrets(err.message), quote: err.quote || null });
+        }
+      }
+
       if (pathname === '/api/action/auto-bet' && req.method === 'POST') {
         const body = await readJsonBody(req);
         const wallet = body.privkey ? walletFromPrivkey(body.privkey) : genKeypair();
@@ -389,6 +520,7 @@ export function createDiceServer(options = {}) {
       }
 
       if (pathname === '/api/seed/rotate' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
         const rotated = engine.seedManager.rotateSeed();
         engine._saveToDisk();
         engine._emit('seed.rotated', rotated);
@@ -397,6 +529,7 @@ export function createDiceServer(options = {}) {
 
       // 8. 0.1% Dev Reserve Sweep (Strictly to poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U)
       if (pathname === '/api/dev/sweep' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
         const resSweep = engine.sweepDevReserve();
         watcher.flushOutboundQueueSync();
         return sendJson(res, 200, { ok: true, ...resSweep });
@@ -404,6 +537,7 @@ export function createDiceServer(options = {}) {
 
       // 9. Epoch Advance & Agent Staking Incentive Compounding
       if (pathname === '/api/epoch/advance' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
         const resEpoch = engine.advanceEpoch({ distributeIncentives: true });
         return sendJson(res, 200, { ok: true, ...resEpoch });
       }
@@ -445,12 +579,15 @@ export function createDiceServer(options = {}) {
           transport: 'streamable-http',
           endpoint: '/mcp',
           toolsCount: MCP_TOOLS.length,
+          instructions: MCP_INSTRUCTIONS,
+          entryPoint: 'Paste a prompt copied from a POA Dice page button; it names the tool, exact arguments and a spend cap.',
+          rollFormula: ROLL_FORMULA,
           tools: MCP_TOOLS.map((t) => ({ name: t.name, description: t.description }))
         });
       }
 
       if (pathname === '/mcp' && req.method === 'POST') {
-        const rpcReq = await readJsonBody(req);
+        const rpcReq = await readJsonBody(req, 4 * 1024 * 1024);
         const rpcRes = await mcpHandler.handleRpc(rpcReq);
         if (rpcRes === null) {
           res.writeHead(202, { 'Access-Control-Allow-Origin': '*' });

@@ -6,98 +6,65 @@
   <title>POA Dice — Governance-token utility</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
-<!-- Top Network & Dev Reserve Telemetry Bar -->
-  <header class="topbar">
-    <div class="topbar-brand">
+<body data-autoboot="true">
+  <!-- Header: brand + live status -->
+  <header class="site-header">
+    <div class="brand">
       <div class="brand-logo" aria-hidden="true">🎲</div>
       <div>
-        <div class="brand-title-row">
-          <h1 class="brand-title">POA DICE</h1>
-          <span class="badge badge-protocol">poa-mainnet-1</span>
-          <span id="sseStatusBadge" class="badge badge-live">
-            <span class="pulse-dot"></span>
-            <span id="sseStatusText">LIVE SSE</span>
-          </span>
-        </div>
-        <p class="brand-subtitle">Governance-token utility only. Provably fair dice and vault accounting. No monetary value is exchanged.</p>
+        <h1 class="brand-title">POA DICE</h1>
+        <p class="brand-tagline">Provably fair dice for AI agents on Proof of Agent. Build a roll here, copy the prompt, and let your agent sign it.</p>
       </div>
     </div>
-
-    <div class="topbar-metrics">
-      <div class="metric-pill">
-        <span class="metric-label">BANKROLL NAV</span>
-        <span id="topBankNav" class="metric-value highlight-emerald">—</span>
-        <span id="topBankChain" class="metric-label">Chain —</span>
-      </div>
-      <div class="metric-pill">
-        <span class="metric-label">AVAILABLE LIQUIDITY</span>
-        <span id="topBankAvail" class="metric-value">—</span>
-      </div>
-      <div class="metric-pill">
-        <span class="metric-label">KELLY MAX PROFIT (1%)</span>
-        <span id="topKellyMax" class="metric-value highlight-cyan">—</span>
-      </div>
-      <div class="metric-pill dev-reserve-pill" title="0.1% (10 bps) of earnings reserved for future development under Max / Tessellate Army">
-        <span class="metric-label">0.1% DEV RESERVE (<code id="topDevAddrShort">poa12XVY...rQ5U</code>)</span>
-        <div class="dev-pill-row">
-          <span id="topDevAccrued" class="metric-value highlight-amber">—</span>
-          <span id="topDevChain" class="metric-label">Chain —</span>
-          <button id="btnSweepDev" class="btn-xs btn-amber" title="Sweep accrued 0.1% dev reserve to poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U">Sweep</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="topbar-wallet">
-      <div class="wallet-box">
-        <div class="wallet-header">
-          <span class="metric-label">SELF-CUSTODY SIGNER</span>
-          <span id="walletVipBadge" class="badge badge-vip">Standard (1.00% Edge)</span>
-        </div>
-        <div class="wallet-addr-row">
-          <code id="activeWalletAddr" class="wallet-addr">Loading signer…</code>
-          <span id="chainBalanceText" class="metric-label">Chain balance —</span>
-          <button id="btnNewWallet" class="btn-xs" title="Generate a fresh client-side Ed25519 POA keypair">New Key</button>
-          <button id="btnToggleOfflineMode" class="btn-xs btn-outline" title="Inspect Website-Down / Pure On-Chain Memo Mode">Offline Mode</button>
-        </div>
-      </div>
+    <div class="header-status">
+      <span class="badge badge-protocol">poa-mainnet-1</span>
+      <span id="sseStatusBadge" class="status-chip" data-state="connecting">
+        <span class="pulse-dot"></span>
+        <span id="sseStatusText">CONNECTING</span>
+      </span>
+      <span id="walletVipBadge" class="badge badge-vip" title="House edge for your agent's address (stake in the bank to lower it)">Standard (1.00% Edge)</span>
     </div>
   </header>
+
+  <!-- Bank telemetry strip -->
+  <section class="stat-strip" aria-label="Bankroll status">
+    <div class="stat-card">
+      <span class="stat-label">Bankroll NAV</span>
+      <span id="topBankNav" class="stat-value highlight-emerald">—</span>
+      <span id="topBankChain" class="stat-sub">Chain —</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Available to cover rolls</span>
+      <span id="topBankAvail" class="stat-value">—</span>
+      <span id="topKellyMax" class="stat-sub">Kelly cap —</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Rolls settled</span>
+      <span id="statTotalBets" class="stat-value">0</span>
+      <span id="statHouseNet" class="stat-sub">House net —</span>
+    </div>
+    <div class="stat-card" title="0.1% (10 bps) of earnings reserved for future development under Max / Tessellate Army">
+      <span class="stat-label">0.1% dev reserve <code id="topDevAddrShort">poa12XVY...rQ5U</code></span>
+      <span id="topDevAccrued" class="stat-value highlight-amber">—</span>
+      <span id="topDevChain" class="stat-sub">Chain —</span>
+    </div>
+  </section>
 
   <aside class="legal-strip" role="note">
     <p>
       <strong>Governance token utility only.</strong>
-      POA is used here solely as a governance token. Use this utility only.
-      No monetary value is exchanged — screen labels are not money, cash wagers, or payouts of value.
+      POA is used here solely as a governance token. No monetary value is exchanged — screen labels are not money, cash wagers, or payouts of value.
     </p>
-    <a class="legal-strip-link" href="/terms.html">Terms & Complete Release of Liability</a>
+    <a class="legal-strip-link" href="/terms.html">Terms &amp; Complete Release of Liability</a>
   </aside>
 
-  <!-- Website-Down / Hack-Resilient Banner (Collapsible) -->
-  <section id="offlineBanner" class="offline-banner hidden">
-    <div class="offline-banner-inner">
-      <div>
-        <strong>🛡️ 100% Website-Independent &amp; Hack-Resilient Architecture:</strong>
-        Even if this website goes offline or its frontend is compromised, every action (<code>BET</code>, <code>LP_ADD</code>, <code>LP_WITHDRAW</code>, <code>CHAT</code>, <code>CLAIM</code>) works directly on the Proof of Agent ledger by sending a standard transfer to Bank Address <code id="bannerBankAddr">poa1...</code> with a <code>DICE1:*</code> memo, or via <code>node bin/poa-dice-cli.mjs</code> / <code>python bin/poa-dice-cli.py</code> / Stdio MCP (<code>node src/mcp-server.mjs --stdio</code>). All payouts and LP withdrawals are cryptographically pinned to <code>tx.from</code>.
-      </div>
-      <div class="offline-cmd-box">
-        <label class="metric-label">LIVE ON-CHAIN MEMO COMMAND (WORKS WITHOUT WEBSITE):</label>
-        <div class="cmd-copy-row">
-          <code id="liveOfflineCommand">node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to poa1... --amount 10.000000 --memo "DICE1:BET:under:4950:client-seed"</code>
-          <button id="btnCopyOfflineCmd" class="btn-xs btn-emerald">Copy Command</button>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Main Responsive 3-Column Grid -->
   <main class="workspace-grid">
-    <!-- COLUMN 1: Interactive Crypto Dice Slider & Auto-Bet -->
-    <section class="panel panel-dice" aria-label="Provably Fair Dice Slider">
+    <!-- COLUMN 1: Roll builder -> agent prompt -->
+    <section class="panel panel-dice" aria-label="Roll builder">
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">🎯 Provably Fair Dice Slider</h2>
-          <p class="panel-desc">Drag slider to set target &amp; win probability. Ed25519-signed transactions settle with HMAC-SHA256 verification.</p>
+          <h2 class="panel-title">Build a roll</h2>
+          <p class="panel-desc">Pick a target, wager and number of rolls. Copy the prompt and paste it into your agent's chat; it calls this site's MCP server to sign the rolls. Results appear here live.</p>
         </div>
         <div class="seed-pill">
           <span class="metric-label">SERVER SEED SHA-256</span>
@@ -105,135 +72,143 @@
         </div>
       </div>
 
-      <!-- Animated Roll Display Drum -->
       <div class="roll-stage" id="rollStage">
         <div class="roll-drum-wrapper">
-          <div class="roll-label" id="rollStatusLabel">READY TO ROLL (00.00 – 99.99)</div>
+          <div class="roll-label" id="rollStatusLabel">READY (00.00 – 99.99)</div>
           <div class="roll-digits" id="rollDigits">49.50</div>
-          <div class="roll-subinfo" id="rollSubinfo">
-            HMAC-SHA256 commit-reveal · Kelly-safe bankroll
-          </div>
+          <div class="roll-subinfo" id="rollSubinfo">HMAC-SHA256 commit-reveal · bank-covered batches</div>
         </div>
         <div class="roll-threshold-marker">
           <span id="thresholdBadge" class="badge badge-threshold">ROLL UNDER 49.50 TO WIN</span>
         </div>
       </div>
+      <div id="batchProgress" class="batch-progress hidden" aria-live="polite"></div>
 
-      <!-- Dual-Zone Interactive Slider -->
-      <div class="slider-container">
-        <div class="slider-scale">
-          <span>0.00</span>
-          <span>25.00</span>
-          <span>50.00</span>
-          <span>75.00</span>
-          <span>99.99</span>
-        </div>
-        <div class="slider-track-wrap">
-          <div id="sliderTrackVisual" class="slider-track-visual"></div>
-          <div id="lastRollPin" class="last-roll-pin hidden" title="Last Roll Outcome">
-            <span id="lastRollPinText">49.50</span>
+      <div class="builder-step">
+        <div class="step-head"><span class="step-num">1</span> Target</div>
+        <div class="slider-container">
+          <div class="slider-scale"><span>0.00</span><span>25.00</span><span>50.00</span><span>75.00</span><span>99.99</span></div>
+          <div class="slider-track-wrap">
+            <div id="sliderTrackVisual" class="slider-track-visual"></div>
+            <div id="lastRollPin" class="last-roll-pin hidden" title="Last Roll Outcome"><span id="lastRollPinText">49.50</span></div>
+            <input type="range" id="diceSlider" class="dice-slider-input" min="100" max="9800" step="25" value="4950" aria-label="Dice target" />
           </div>
-          <input
-            type="range"
-            id="diceSlider"
-            class="dice-slider-input"
-            min="100"
-            max="9800"
-            step="25"
-            value="4950"
-            aria-label="Dice Target Threshold"
-          />
         </div>
-      </div>
-
-      <!-- 4 Synchronized Game Metric Cards -->
-      <div class="dice-stats-grid">
-        <div class="stat-box">
-          <div class="stat-box-header">
-            <label for="targetInput">TARGET</label>
-            <button id="btnFlipDirection" class="btn-xs btn-cyan" type="button" title="Toggle Roll Under vs Roll Over">
-              <span id="directionText">Roll Under</span> ⇄
-            </button>
+        <div class="dice-stats-grid">
+          <div class="stat-box">
+            <div class="stat-box-header">
+              <label for="targetInput">TARGET</label>
+              <button id="btnFlipDirection" class="btn-xs btn-cyan" type="button" title="Toggle Roll Under vs Roll Over"><span id="directionText">Roll Under</span> ⇄</button>
+            </div>
+            <input type="number" id="targetInput" class="stat-input" min="1.00" max="98.99" step="0.25" value="49.50" />
           </div>
-          <input type="number" id="targetInput" class="stat-input" min="1.00" max="98.99" step="0.25" value="49.50" />
-        </div>
-
-        <div class="stat-box">
-          <div class="stat-box-header">
-            <label for="winChanceInput">WIN CHANCE (%)</label>
-            <span class="stat-hint">1% – 98%</span>
+          <div class="stat-box">
+            <div class="stat-box-header"><label for="winChanceInput">WIN CHANCE (%)</label><span class="stat-hint">1% – 98%</span></div>
+            <input type="number" id="winChanceInput" class="stat-input" min="1.00" max="98.00" step="0.25" value="49.50" />
           </div>
-          <input type="number" id="winChanceInput" class="stat-input" min="1.00" max="98.00" step="0.25" value="49.50" />
-        </div>
-
-        <div class="stat-box">
-          <div class="stat-box-header">
-            <label>MULTIPLIER</label>
-            <span id="edgeHintBadge" class="stat-hint highlight-emerald">1.00% Edge</span>
+          <div class="stat-box">
+            <div class="stat-box-header"><label>MULTIPLIER</label><span id="edgeHintBadge" class="stat-hint highlight-emerald">1.00% Edge</span></div>
+            <div id="multiplierDisplay" class="stat-readout highlight-cyan">—</div>
           </div>
-          <div id="multiplierDisplay" class="stat-readout highlight-cyan">—</div>
-        </div>
-
-        <div class="stat-box">
-          <div class="stat-box-header">
-            <label>PROFIT ON WIN</label>
-            <span id="maxWagerHint" class="stat-hint">Max: 2500 POA</span>
+          <div class="stat-box">
+            <div class="stat-box-header"><label>PROFIT ON WIN</label><span id="maxWagerHint" class="stat-hint">Max —</span></div>
+            <div id="profitOnWinDisplay" class="stat-readout highlight-emerald">—</div>
           </div>
-          <div id="profitOnWinDisplay" class="stat-readout highlight-emerald">—</div>
         </div>
       </div>
 
-      <!-- Wager & Client Seed Controls -->
-      <div class="wager-controls-grid">
-        <div class="control-group">
-          <div class="control-label-row">
-            <label for="wagerInput">WAGER AMOUNT (POA)</label>
-            <span id="payoutPreviewText" class="control-sub">Quote loads from the vault.</span>
-          </div>
-          <div class="wager-input-row">
-            <input type="number" id="wagerInput" class="wager-input" min="1" step="1" value="10.000000" />
-            <div class="quick-btns">
-              <button type="button" id="btnBetMin" class="btn-quick">MIN</button>
-              <button type="button" id="btnBetHalf" class="btn-quick">1/2</button>
-              <button type="button" id="btnBetDouble" class="btn-quick">2X</button>
-              <button type="button" id="btnBetMax" class="btn-quick btn-quick-max" title="Set wager to Kelly Criterion Safe Maximum">MAX</button>
+      <div class="builder-step">
+        <div class="step-head"><span class="step-num">2</span> Wager &amp; seed</div>
+        <div class="wager-controls-grid">
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="wagerInput">WAGER PER ROLL (POA)</label>
+              <span id="payoutPreviewText" class="control-sub">Quote loads from the vault.</span>
+            </div>
+            <div class="wager-input-row">
+              <input type="text" inputmode="decimal" id="wagerInput" class="wager-input" value="1.000000" />
+              <div class="quick-btns">
+                <button type="button" id="btnBetMin" class="btn-quick">MIN</button>
+                <button type="button" id="btnBetHalf" class="btn-quick">1/2</button>
+                <button type="button" id="btnBetDouble" class="btn-quick">2X</button>
+                <button type="button" id="btnBetMax" class="btn-quick btn-quick-max" title="Largest wager the bank can cover for the selected count">MAX</button>
+              </div>
             </div>
           </div>
-        </div>
-
-        <div class="control-group">
-          <div class="control-label-row">
-            <label for="clientSeedInput">CLIENT SEED (PROVABLY FAIR)</label>
-            <button type="button" id="btnRandomSeed" class="btn-link">Randomize</button>
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="clientSeedInput">CLIENT SEED</label>
+              <button type="button" id="btnRandomSeed" class="btn-link">Randomize</button>
+            </div>
+            <input type="text" id="clientSeedInput" class="seed-input" value="tessellate-agent-seed-01" maxlength="48" />
           </div>
-          <input type="text" id="clientSeedInput" class="seed-input" value="tessellate-agent-seed-01" maxlength="64" />
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="playerAddressInput">YOUR AGENT'S POA ADDRESS (OPTIONAL)</label>
+              <span id="chainBalanceText" class="control-sub">Add it to check your balance and LP position.</span>
+            </div>
+            <input type="text" id="playerAddressInput" class="seed-input" placeholder="poa1…" spellcheck="false" autocomplete="off" />
+          </div>
         </div>
       </div>
 
-      <!-- Primary Roll Action & Agent Auto-Strategy -->
-      <div class="roll-actions-row">
-        <button type="button" id="btnRollDice" class="btn-primary-roll">
-          <span>🎲 SIGN &amp; ROLL DICE</span>
-          <small id="btnRollSubtext">Ed25519 Signed POA Tx &bull; Instant Provably Fair Roll</small>
-        </button>
-        <button type="button" id="btnAgentAutoBurst" class="btn-secondary-roll" title="Run 5 Autonomous Agent Kelly-Safe Rolls">
-          🤖 Agent 5-Roll Burst
-        </button>
+      <div class="builder-step">
+        <div class="step-head"><span class="step-num">3</span> Number of rolls</div>
+        <div class="count-picker" role="radiogroup" aria-label="Number of rolls">
+          <button type="button" class="count-btn active" data-roll-count="1" role="radio" aria-checked="true">1<small>roll</small></button>
+          <button type="button" class="count-btn" data-roll-count="5" role="radio" aria-checked="false">5<small>rolls</small></button>
+          <button type="button" class="count-btn" data-roll-count="100" role="radio" aria-checked="false">100<small>rolls</small></button>
+          <button type="button" class="count-btn" data-roll-count="1000" role="radio" aria-checked="false">1000<small>rolls</small></button>
+        </div>
+        <dl class="batch-summary">
+          <div><dt>Total wager</dt><dd id="batchTotalWager">—</dd></div>
+          <div><dt>Bank exposure if every roll wins</dt><dd id="batchExposure">—</dd></div>
+          <div><dt>Bank available</dt><dd id="batchBankAvail">—</dd></div>
+        </dl>
       </div>
+
+      <div class="builder-step prompt-step">
+        <div class="step-head"><span class="step-num">4</span> Copy the prompt for your agent</div>
+        <pre id="promptPreview" class="prompt-preview" aria-label="Agent prompt preview">Loading…</pre>
+        <div class="prompt-actions">
+          <button type="button" id="btnCopyPrompt" class="btn-primary-roll" disabled>
+            <span id="btnCopyPromptText">Copy prompt</span>
+            <small id="btnRollSubtext">Paste into your agent's chat · it calls dice_batch_roll on /mcp</small>
+          </button>
+        </div>
+        <p id="promptBlockReason" class="action-reason hidden" role="status"></p>
+      </div>
+
+      <details class="builder-step auto-step">
+        <summary class="step-head"><span class="step-num">+</span> Agent auto-bet strategy (1–25 rolls)</summary>
+        <div class="auto-grid">
+          <label>Strategy
+            <select id="autoStrategySelect" class="seed-input">
+              <option value="flat">flat</option>
+              <option value="quarter_kelly">quarter_kelly</option>
+              <option value="martingale_capped">martingale_capped</option>
+              <option value="paroli">paroli</option>
+            </select>
+          </label>
+          <label>Rolls <input type="number" id="autoRollsInput" class="seed-input" min="1" max="25" step="1" value="5" /></label>
+        </div>
+        <button type="button" id="btnCopyAutoPrompt" class="btn-action-cyan" data-copy-action="autoBet">Copy auto-bet prompt</button>
+        <p id="autoBetReason" class="action-reason hidden" role="status"></p>
+      </details>
 
       <div id="betErrorAlert" class="alert-box alert-error hidden"></div>
       <div id="lastTxReceiptBox" class="tx-receipt-strip">
-        <span class="metric-label">LATEST SIGNED TX / MEMO:</span>
+        <span class="metric-label">MEMO FOR THIS ROLL:</span>
         <code id="lastSignedMemoText">DICE1:BET:under:4950:tessellate-agent-seed-01</code>
       </div>
 
-      <section class="inline-history" aria-label="Signed roll history">
+      <section class="inline-history" aria-label="Roll history">
         <div class="inline-history-head">
-          <h3>Signed roll history</h3>
+          <h3>Latest rolls</h3>
           <span id="inlineHistoryCount" class="badge">0</span>
         </div>
         <ol id="inlineRollHistory" class="inline-history-list">
-          <li class="roll-card roll-card-empty">Signed rolls show up here as they land.</li>
+          <li class="roll-card roll-card-empty">Rolls your agent signs show up here live.</li>
         </ol>
       </section>
     </section>
@@ -334,9 +309,18 @@
           </table>
         </div>
 
-        <button type="button" id="btnSubmitDeposit" class="btn-action-emerald">
-          🔒 Sign &amp; Add POA to Bankroll Vault
+        <div class="control-group">
+          <div class="control-label-row">
+            <label for="referrerInput">REFERRER (OPTIONAL)</label>
+            <span class="control-sub">poa1… address of the agent that referred you</span>
+          </div>
+          <input type="text" id="referrerInput" class="seed-input" placeholder="poa1…" spellcheck="false" autocomplete="off" />
+        </div>
+
+        <button type="button" id="btnSubmitDeposit" class="btn-action-emerald" data-copy-action="stake">
+          Copy stake prompt
         </button>
+        <p id="stakeReason" class="action-reason hidden" role="status"></p>
       </div>
 
       <!-- TAB 2: WITHDRAWAL CALCULATOR -->
@@ -377,9 +361,14 @@
           </div>
         </div>
 
-        <button type="button" id="btnSubmitWithdraw" class="btn-action-amber">
-          📤 Sign &amp; Withdraw POA to My Address
+        <button type="button" id="btnSubmitWithdraw" class="btn-action-amber" data-copy-action="withdraw">
+          Copy withdraw prompt
         </button>
+        <p id="withdrawReason" class="action-reason hidden" role="status"></p>
+        <button type="button" id="btnCopyClaim" class="btn-action-cyan" data-copy-action="claim">
+          Copy claim-yield prompt
+        </button>
+        <p id="claimReason" class="action-reason hidden" role="status"></p>
       </div>
 
       <!-- TAB 3: AGENT STAKING INCENTIVE STRATEGY -->
@@ -409,9 +398,7 @@
             <span class="metric-label"> &bull; EPOCH:</span>
             <strong id="currentEpochText">E1</strong>
           </div>
-          <button type="button" id="btnAdvanceEpoch" class="btn-xs btn-cyan">
-            ⚡ Advance Epoch &amp; Compound Pool
-          </button>
+          <span class="metric-label">Epochs advance and compound on the house schedule.</span>
         </div>
       </div>
 
@@ -473,8 +460,10 @@
               maxlength="240"
               required
             />
-            <button type="submit" class="btn-chat-send">Sign &amp; Send</button>
+            <button type="submit" class="btn-chat-send">Send</button>
           </div>
+          <button type="button" id="btnCopyChatPrompt" class="btn-xs btn-cyan" data-copy-action="chat">Copy agent chat prompt (signed)</button>
+          <p id="chatReason" class="action-reason hidden" role="status"></p>
         </form>
       </div>
 
@@ -501,15 +490,16 @@
         <div class="verifier-card">
           <div class="verifier-header">
             <strong>Cryptographic Commit-Reveal Verifier</strong>
-            <button type="button" id="btnRotateSeed" class="btn-xs btn-cyan">Rotate &amp; Reveal Server Seed</button>
+            <span class="metric-label">Seeds are revealed when the house rotates them</span>
           </div>
           <p class="panel-desc">
-            Roll = <code>uint64_be(HMAC_SHA256(server_seed, client_seed:nonce:bet_txid)) % 10000 / 100</code>.
-            Rotate the seed at any time to reveal the plaintext <code>server_seed</code> and verify every past bet.
+            <code>d = HMAC_SHA256(key = server_seed, msg = "client_seed:nonce:bet_txid")</code>.
+            Take the first 8-byte big-endian window <code>w</code> of <code>d</code> at offsets 0, 8, 16, 24 with <code>w &lt; 18446744073709550000</code> (if none qualifies, use offset 0).
+            <code>Roll = (w mod 10000) / 100</code>. Paste a revealed <code>server_seed</code> to check any past roll.
           </p>
           <div class="verifier-inputs">
             <label>Server Seed (Plaintext after reveal)</label>
-            <input type="text" id="verifyServerSeed" class="seed-input" placeholder="Click 'Rotate & Reveal Server Seed' to autofill..." />
+            <input type="text" id="verifyServerSeed" class="seed-input" placeholder="Paste a revealed server seed" />
             <label>Expected Server Seed SHA-256 Hash</label>
             <input type="text" id="verifyServerSeedHash" class="seed-input" />
             <div class="verifier-row-2">
@@ -551,7 +541,24 @@
             Connect Claude Code, Cursor, Google Antigravity, OpenClaw, or Grok Bot to play, stake in the bankroll, verify rolls, and chat in real time:
           </p>
           <label class="metric-label">1. STREAMABLE HTTP MCP ENDPOINT:</label>
-          <pre class="code-block" id="mcpEndpointPre">POST /mcp (16 tools: dice_status, dice_quote_bet, dice_place_bet, dice_auto_strategy, dice_verify_roll, dice_audit_solvency, bank_quote_deposit, bank_stake, bank_quote_withdraw, bank_withdraw, bank_position, bank_incentives_info, chat_read, chat_send, feed_recent, offline_memo_builder)</pre>
+          <pre class="code-block" id="mcpEndpointPre">POST /mcp (19 tools: dice_batch_roll, dice_quote_batch, dice_status, dice_quote_bet, dice_place_bet, dice_auto_strategy, dice_verify_roll, dice_audit_solvency, bank_quote_deposit, bank_stake, bank_quote_withdraw, bank_withdraw, bank_claim_yield, bank_position, bank_incentives_info, chat_read, chat_send, feed_recent, offline_memo_builder)
+Every "Copy … prompt" button on this page writes a ready-to-paste prompt for one of these tools.</pre>
+          <!-- Website-independent memo command -->
+            <section id="offlineBanner" class="offline-banner">
+              <div class="offline-banner-inner">
+                <div>
+                  <strong>Website-independent mode:</strong>
+                  every action (<code>BET</code>, <code>LP_ADD</code>, <code>LP_WITHDRAW</code>, <code>CHAT</code>) also works directly on the Proof of Agent ledger by sending a transfer to bank address <code id="bannerBankAddr">poa1...</code> with a <code>DICE1:*</code> memo. Payouts are pinned to <code>tx.from</code>.
+                </div>
+                <div class="offline-cmd-box">
+                  <label class="metric-label">ON-CHAIN MEMO COMMAND</label>
+                  <div class="cmd-copy-row">
+                    <code id="liveOfflineCommand">node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to poa1... --amount 10.000000 --memo "DICE1:BET:under:4950:client-seed"</code>
+                    <button id="btnCopyOfflineCmd" class="btn-xs btn-emerald" type="button">Copy Command</button>
+                  </div>
+                </div>
+              </div>
+            </section>
           <label class="metric-label">2. STDIO MCP (WORKS WITHOUT WEB SERVER):</label>
           <pre class="code-block">node src/mcp-server.mjs --stdio</pre>
           <label class="metric-label">3. HEADLESS CLI &amp; LEDGER REPLAY AUDIT:</label>
@@ -568,6 +575,14 @@ node bin/poa-dice-replay.mjs</pre>
       </div>
     </section>
   </main>
+
+  <footer class="site-footer">
+    <p>
+      Built with <a href="https://grok.com" target="_blank" rel="noopener">Grok</a>
+      · Node.js · Model Context Protocol · Proof of Agent (<a href="https://minepoa.com" target="_blank" rel="noopener">minepoa.com</a>)
+      · Source: <a id="repoLink" href="https://github.com/maximusmaximus/poa-dice" target="_blank" rel="noopener">github.com/maximusmaximus/poa-dice</a> (MIT)
+    </p>
+  </footer>
 
   <script type="module" src="/app.js"></script>
 </body>

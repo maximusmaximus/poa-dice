@@ -260,7 +260,9 @@ export class LedgerWatcher {
     rolls = 5,
     clientSeed = 'agent-auto-strategy',
     stopOnProfitPoa = null,
-    stopOnLossPoa = null
+    stopOnLossPoa = null,
+    maxTotalSpendPoa = null,
+    onRoll = null
   }) {
     if (!wallet || !wallet.address) {
       throw new Error('Valid Ed25519 wallet required for executeAutoStrategy');
@@ -270,6 +272,8 @@ export class LedgerWatcher {
     const baseMicros = toMicros(baseWagerPoa);
     const stopProfitMicros = stopOnProfitPoa ? toMicros(stopOnProfitPoa) : null;
     const stopLossMicros = stopOnLossPoa ? toMicros(stopOnLossPoa) : null;
+    const capMicros = maxTotalSpendPoa ? toMicros(String(maxTotalSpendPoa)) : null;
+    let spentMicros = 0n;
 
     let currentMicros = baseMicros;
     let cumulativeNetMicros = 0n;
@@ -303,6 +307,10 @@ export class LedgerWatcher {
         currentMicros = MIN_BET_MICROS;
       }
 
+      if (capMicros !== null && spentMicros + currentMicros > capMicros) {
+        stoppedReason = 'max_total_spend_reached';
+        break;
+      }
       const wagerPoa = fromMicros(currentMicros);
       const memo = formatDiceMemo({
         action: 'BET',
@@ -325,6 +333,8 @@ export class LedgerWatcher {
         break;
       }
 
+      spentMicros += currentMicros;
+      if (typeof onRoll === 'function') onRoll(receipt);
       const deltaMicros = receipt.won
         ? toMicros(receipt.payoutPoa) - toMicros(receipt.wagerPoa)
         : -toMicros(receipt.wagerPoa);
@@ -369,6 +379,7 @@ export class LedgerWatcher {
       losses,
       cumulativeNetPoa: fromMicros(cumulativeNetMicros),
       stoppedReason,
+      totalWageredPoa: fromMicros(spentMicros),
       receipts
     };
   }
