@@ -26,8 +26,9 @@ import {
 import { verifyRoll } from './provably-fair.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
-import { BATCH_COUNTS, executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
+import { BATCH_COUNTS, executeBatch, quoteAllCounts, quoteBatch, VIP_NOTE } from './batch-roll.mjs';
 import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake, WITHDRAW_TRIGGER_POA } from './actions.mjs';
+import { clampWaitSeconds, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS, TEMPLATE_TOOLS, transferTemplates } from './tx-templates.mjs';
 
 export const ROLL_FORMULA =
   'w = first 8-byte big-endian window of HMAC_SHA256(key=server_seed, msg="client_seed:nonce:bet_txid") at offsets 0,8,16,24 with w < 18446744073709550000 (else offset 0); roll = (w mod 10000) / 100';
@@ -38,9 +39,12 @@ export const MCP_INSTRUCTIONS = [
   'its exact arguments and a max_total_spend_poa cap. Do this:',
   '1) Call the matching quote tool first (dice_quote_batch, bank_quote_deposit, bank_quote_withdraw, dice_quote_bet) and STOP',
   'if it is not valid; tell the user the reason. 2) Call the action tool with the same arguments. Never raise amounts,',
-  'counts or caps beyond what the prompt states. 3) Sign with your own PoA key: prefer signed_tx/signed_txs built locally;',
+  'counts or caps beyond what the prompt states. 3) Sign with your own PoA key: prefer signed_tx/signed_txs built locally',
+  'from the exact unsigned templates (to, amount, memo, count, chain id) in the prompt, in the quote\'s transferTemplate or from tx_templates;',
   'pass privkey only if the user explicitly accepts sending it to this server. Never paste a private key into chat.',
-  '4) Report results (rolls, payouts, bet_txids, server seed hash) back to the user. The web page updates live by itself.',
+  '4) dice_place_bet / dice_batch_roll wait up to wait_seconds (default 60, max 120) for settlement and return wins, losses, net,',
+  'each bet_txid with its roll, payout txids and the server seed hash; if status is PENDING, poll tx_status per txid.',
+  'Report those results back to the user. The web page updates live by itself.',
   'The server re-validates everything (bank coverage, Kelly cap, balances, chain status) and rejects what it cannot cover.',
   'Admin actions (seed rotate, epoch advance, dev sweep) are not available to agents.'
 ].join(' ');
@@ -73,7 +77,8 @@ export const MCP_TOOLS = [
           description: 'Slider target in basis points (100..9800 for under, 199..9899 for over; e.g. 4950 = 49.50)'
         },
         direction: { type: 'string', enum: ['under', 'over'], description: 'Roll under or over target' },
-        address: { type: 'string', description: 'Optional player poa1... address for VIP staker rebate calculation' }
+        address: { type: 'string', description: 'Optional player poa1... address for VIP staker rebate calculation (without it the quote uses the standard edge)' },
+        client_seed: { type: 'string', description: 'Optional client seed; returned transferTemplate memo uses it (default "mcp-agent", like dice_place_bet)' }
       },
       required: ['amount_poa', 'target_bps', 'direction']
     }
@@ -89,8 +94,9 @@ export const MCP_TOOLS = [
         target_bps: { type: 'integer', description: 'Slider target in basis points (e.g. 5000 = 50.00)' },
         direction: { type: 'string', enum: ['under', 'over'] },
         client_seed: { type: 'string', description: 'Custom client seed string for provably fair HMAC' },
-        signed_tx: { type: 'object', description: 'Optional pre-signed POA transfer tx body' },
-        privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key to sign locally (never logged)' }
+        signed_tx: { type: 'object', description: 'Optional pre-signed POA transfer (build it from tx_templates / the quote transferTemplate)' },
+        privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key to sign locally (never logged)' },
+        wait_seconds: { type: 'integer', description: `Chain-settled server: wait up to this many seconds for the roll (and any payout) to settle (default ${DEFAULT_WAIT_SECONDS}, max ${MAX_WAIT_SECONDS}, 0 = return right after broadcast)` }
       },
       required: ['amount_poa', 'target_bps', 'direction']
     }
@@ -122,6 +128,7 @@ export const MCP_TOOLS = [
       properties: {
         amount_poa: { type: 'string', description: 'Deposit amount in POA (min 10.000000)' },
         lock_epochs: { type: 'integer', description: 'Optional conviction lock in 6h PoA epochs (0..100)' },
+        referrer: { type: 'string', description: 'Optional referrer poa1... address (included in the transferTemplate memo)' },
         address: { type: 'string', description: 'Optional staker poa1... address' }
       },
       required: ['amount_poa']
@@ -284,6 +291,30 @@ export const MCP_TOOLS = [
     }
   },
   {
+    name: 'tx_templates',
+    description:
+      'Read-only. Returns the exact UNSIGNED transfer template(s) for a signed action so you can build signed_tx / signed_txs locally without guessing: chain id, recipient bank address, amount, the exact DICE1 memo and how many transfers. Pass the same arguments you will pass to the action tool. Nothing is signed or sent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tool: { type: 'string', enum: [...TEMPLATE_TOOLS], description: 'The action tool you are about to call' },
+        count: { type: 'integer', enum: [...BATCH_COUNTS] },
+        amount_poa: { type: 'string' },
+        target_bps: { type: 'integer' },
+        direction: { type: 'string', enum: ['under', 'over'] },
+        client_seed: { type: 'string' },
+        lock_epochs: { type: 'integer' },
+        referrer: { type: 'string' },
+        mode: { type: 'string', enum: ['ALL', 'BPS', 'SHARES'] },
+        bps: { type: 'integer' },
+        shares: { type: 'string' },
+        text: { type: 'string', description: 'chat_send text (signature, not a transfer)' },
+        address: { type: 'string', description: 'Your poa1... address (needed for bank_claim_yield)' }
+      },
+      required: ['tool']
+    }
+  },
+  {
     name: 'dice_quote_batch',
     description:
       'Read-only. Check whether a batch of 1, 5, 100 or 1000 flat dice rolls can be covered by the bank right now (worst case: every roll wins). Returns valid, reason, total wager, max bank exposure, Kelly cap. Omit count to quote all four counts. Call this before dice_batch_roll.',
@@ -317,7 +348,8 @@ export const MCP_TOOLS = [
         stop_on_loss_poa: { type: 'string', description: 'Optional: stop once net loss reaches this' },
         stop_on_profit_poa: { type: 'string', description: 'Optional: stop once net profit reaches this' },
         include_all_rolls: { type: 'boolean', description: 'Return every roll (default: all when <=100, else first/last 25)' },
-        signed_txs: { type: 'array', items: { type: 'object' }, description: 'Optional pre-signed BET transfers (self-custody)' },
+        signed_txs: { type: 'array', items: { type: 'object' }, description: 'Optional pre-signed BET transfers (self-custody): exactly count transfers built from tx_templates / the quote transferTemplate' },
+        wait_seconds: { type: 'integer', description: `Chain-settled server: wait up to this many seconds for every roll (and payout) to settle (default ${DEFAULT_WAIT_SECONDS}, max ${MAX_WAIT_SECONDS}, 0 = return right after broadcast)` },
         privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key (sent to this server; only with user consent)' }
       },
       required: ['count', 'amount_poa', 'target_bps', 'direction', 'client_seed', 'max_total_spend_poa']
@@ -540,11 +572,136 @@ export class McpHandler {
         if (cov) {
           const view = { ok: cov.ok, code: cov.code || 'ok', freePoa: cov.freeMicros !== undefined ? fromMicros(cov.freeMicros) : null, worstCasePayoutPoa: cov.worstMicros !== undefined ? fromMicros(cov.worstMicros) : null };
           if (!cov.ok && out.valid !== false) return { ...out, valid: false, withinLimits: false, code: cov.code, reason: cov.reason, error: cov.reason, coverage: view };
-          return { ...out, coverage: view };
+          return this._withTemplate(toolName, args, { ...out, coverage: view });
         }
       }
     }
-    return out;
+    return this._withTemplate(toolName, args, out);
+  }
+
+  _bankAddress() {
+    return this.hooks.bankAddress ? this.hooks.bankAddress() : this.engine.bankAddress;
+  }
+
+  _chainId() {
+    return (this.hooks.chainId && this.hooks.chainId()) || this.watcher?.settlement?.client?.chainId || 'poa-mainnet-1';
+  }
+
+  _template(tool, args, extra = {}) {
+    return transferTemplates({ tool, args, bankAddress: this._bankAddress(), chainId: this._chainId(), ...extra });
+  }
+
+  /** Quote tools also return the exact unsigned transfer(s) the matching action tool expects. */
+  _withTemplate(toolName, args, out) {
+    if (!out || typeof out !== 'object' || out.valid === false) return out;
+    const map = { dice_quote_bet: 'dice_place_bet', dice_quote_batch: 'dice_batch_roll', bank_quote_deposit: 'bank_stake', bank_quote_withdraw: 'bank_withdraw' };
+    let tool = map[toolName];
+    if (toolName === 'bank_claim_yield' && args.dry_run && out.shares) {
+      return { ...out, transferTemplate: this._template('bank_claim_yield', { ...args }, { claimShares: out.shares }) };
+    }
+    if (!tool) return out;
+    if (toolName === 'dice_quote_batch' && (args.count === undefined || args.count === null)) return out;
+    const tpl = this._template(tool, args);
+    return tpl.ok ? { ...out, transferTemplate: tpl } : out;
+  }
+
+  /**
+   * Wait (bounded) until every bet settles on chain and every win payout is final.
+   * Ticks the settlement loop (re-entrancy safe) instead of busy-reading stale state.
+   */
+  async _awaitBets(txids, waitSeconds) {
+    const settlement = this.watcher.settlement;
+    const pollMs = this.hooks.waitPollMs ?? 2000;
+    const deadline = Date.now() + waitSeconds * 1000;
+    const started = Date.now();
+    let views = [];
+    for (;;) {
+      if (settlement) {
+        try {
+          await settlement.tick();
+        } catch {
+          // reported via tx_status / health
+        }
+      }
+      views = txids.map((id) => (settlement ? settlement.getTxStatus(id) : null) || { txid: id, status: 'PENDING_CONFIRMATION', rawStatus: 'UNKNOWN' });
+      const done = views.every((v) => this._betDone(v));
+      if (done || Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+    }
+    const summary = this._betSummary(views, Math.round((Date.now() - started) / 1000), waitSeconds);
+    Object.defineProperty(summary, 'views', { value: views, enumerable: false });
+    return summary;
+  }
+
+  _betDone(v) {
+    if (['FAILED', 'EXPIRED', 'NEEDS_REVIEW'].includes(v.rawStatus)) return true;
+    if (v.rawStatus !== 'BOOKED' || !v.result) return false;
+    if (!v.result.won) return true;
+    return (v.payouts || []).length > 0 && v.payouts.every((p) => p.status === 'CONFIRMED');
+  }
+
+  _betSummary(views, waitedSeconds, waitSeconds) {
+    let wins = 0;
+    let losses = 0;
+    let pending = 0;
+    let failed = 0;
+    let net = 0n;
+    let wagered = 0n;
+    let payoutsPending = 0;
+    const rolls = views.map((v) => {
+      const receipt = this.engine.processedTxids.get(v.txid) || this.engine.betHistory?.find?.((b) => b.betTxid === v.txid) || null;
+      const pf = receipt?.provablyFair || null;
+      const payout = (v.payouts || [])[0] || null;
+      const row = {
+        betTxid: v.txid,
+        status: v.rawStatus === 'BOOKED' ? 'SETTLED' : ['FAILED', 'EXPIRED', 'NEEDS_REVIEW'].includes(v.rawStatus) ? v.rawStatus : 'PENDING',
+        rollDisplay: v.result?.rollDisplay ?? null,
+        won: v.result ? Boolean(v.result.won) : null,
+        wagerPoa: v.amountPoa ?? null,
+        payoutPoa: v.result ? v.result.payoutPoa ?? '0.000000' : null,
+        payoutTxid: payout?.txid || v.result?.payoutTxid || null,
+        payoutStatus: payout ? payout.status : v.result?.won ? 'PENDING' : null,
+        explorer: v.explorer || null,
+        payoutExplorer: payout?.explorer || null,
+        error: v.error || null,
+        verify: pf ? { serverSeedHash: pf.serverSeedHash, clientSeed: pf.clientSeed, nonce: pf.nonce, hmacHex: pf.hmacHex, message: pf.message } : null
+      };
+      if (row.status === 'SETTLED') {
+        const w = toMicros(String(v.amountPoa || '0'));
+        wagered += w;
+        if (row.won) {
+          wins += 1;
+          net += toMicros(String(row.payoutPoa || '0')) - w;
+          if (row.payoutStatus !== 'CONFIRMED') payoutsPending += 1;
+        } else {
+          losses += 1;
+          net -= w;
+        }
+      } else if (row.status === 'PENDING') pending += 1;
+      else failed += 1;
+      return row;
+    });
+    const status = pending > 0 ? 'PENDING' : payoutsPending > 0 ? 'SETTLED_PAYOUT_PENDING' : 'COMPLETE';
+    return {
+      status: status === 'PENDING' ? 'PENDING_CONFIRMATION' : 'SETTLED',
+      note: status === 'COMPLETE' ? 'Settled on chain; every win payout is final.' : 'Waited the maximum time; see next.',
+      waitStatus: status,
+      waitedSeconds,
+      waitSeconds,
+      wins,
+      losses,
+      pending,
+      failed,
+      payoutsPending,
+      totalWageredPoa: fromMicros(wagered),
+      netPoa: fromMicros(net),
+      serverSeedHash: rolls.find((r) => r.verify)?.verify.serverSeedHash || this.engine.seedManager.currentSeedHash,
+      rolls,
+      next:
+        status === 'COMPLETE'
+          ? null
+          : `Not everything is final yet. Poll tx_status with each betTxid (and payoutTxid) every ~15 s until status is CONFIRMED and every win payout is CONFIRMED, then report wins, losses, net POA, each bet_txid with its roll, payout txids and the server seed hash. Do not resend anything.`
+    };
   }
 
   async _callTool(toolName, args = {}) {
@@ -554,12 +711,25 @@ export class McpHandler {
       }
 
       case 'dice_quote_bet': {
-        return this.engine.quoteBet({
+        const q = this.engine.quoteBet({
           address: args.address || '',
           amountPoa: args.amount_poa,
           targetBps: Number(args.target_bps),
           direction: args.direction
         });
+        return { ...q, addressUsed: args.address || null, vipNote: args.address ? null : VIP_NOTE };
+      }
+
+      case 'tx_templates': {
+        const tool = String(args.tool || '');
+        let claimShares = null;
+        if (tool === 'bank_claim_yield' && args.address) {
+          const cq = quoteClaimYield(this.engine, { address: args.address });
+          if (!cq.valid) return { ok: false, valid: false, code: cq.code, reason: cq.reason, error: cq.reason };
+          claimShares = cq.shares;
+        }
+        const tpl = this._template(tool, args, { claimShares });
+        return tpl.ok ? tpl : { ...tpl, valid: false };
       }
 
       case 'dice_place_bet': {
@@ -586,6 +756,12 @@ export class McpHandler {
         }
         const betReceipt = await this._submitPlayerTx(txEnvelope, { lockPoa: single.exposurePerRollPoa });
         if (betReceipt?.action === 'BET_SETTLED' && this.hooks.noteDebit) this.hooks.noteDebit(from, betReceipt.betTxid, betReceipt.wagerPoa);
+        const waitPb = clampWaitSeconds(args.wait_seconds);
+        if (this.watcher.settlement && betReceipt?.txid && betReceipt.direction === 'inbound' && waitPb > 0) {
+          const sum = await this._awaitBets([betReceipt.txid], waitPb);
+          const { note: _n, ...latest } = sum.views[0] || {};
+          return { ...betReceipt, ...latest, ...sum };
+        }
         return betReceipt;
       }
 
@@ -609,7 +785,12 @@ export class McpHandler {
           return { valid: false, rejected: true, error: 'This server is chain-backed: pass signed_txs (preferred) or privkey for your own PoA wallet.' };
         }
         try {
-          return await executeBatch({ engine: this.engine, watcher: this.watcher, hooks: this.hooks, args });
+          const res = await executeBatch({ engine: this.engine, watcher: this.watcher, hooks: this.hooks, args });
+          const waitB = clampWaitSeconds(args.wait_seconds);
+          if (this.watcher.settlement && res?.action === 'BATCH_BROADCAST' && waitB > 0) {
+            return { ...res, ...(await this._awaitBets(res.txids, waitB)) };
+          }
+          return res;
         } catch (err) {
           if (err.quote) return this._rejected(err.quote);
           throw err;

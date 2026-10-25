@@ -151,6 +151,22 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
         assert.match(text, new RegExp(`"max_total_spend_poa": "${(2 * n).toFixed(6)}"`));
         assert.match(text, /Spend cap: never send more than/);
         assert.match(text, /Stop condition/);
+        // exact unsigned transfer spec: no guessing for the agent
+        const bankAddr = (await (await fetch(`${srv.url}/api/health`)).json()).bankAddress;
+        assert.match(text, new RegExp(n === 1 ? 'exactly 1 minepoa transfer' : `exactly ${n} separate minepoa transfers`));
+        assert.match(text, /- chain id \(cid\): poa-mainnet-1/);
+        assert.ok(text.includes(`- to (bank address): ${bankAddr}`), 'bank address spelled out');
+        assert.match(text, /- amount: 2\.000000 POA/);
+        assert.match(text, /- memo \(exact, byte for byte\): DICE1:BET:under:\d+:e2e-seed-1/);
+        assert.match(text, new RegExp(`- count: ${n} transfer`));
+        assert.match(text, /plus "signed_txs"/);
+        assert.match(text, /tx_templates/);
+        assert.match(text, /"wait_seconds": 60/);
+        assert.match(text, /waits up to 60 s[\s\S]*payout txids[\s\S]*server seed hash/);
+        assert.match(text, /PENDING_CONFIRMATION[\s\S]*tx_status/);
+        assert.match(text, /My PoA address: not given[\s\S]*final edge may be lower/);
+        assert.ok(!/"address"/.test(text), 'no address in the args when none is given');
+        assert.match(text, /never add "privkey" unless I confirm/);
         assert.equal(await page.textContent('#promptPreview'), text, 'preview shows the copied prompt');
       }
       assert.ok(!sent.some((b) => /privkey/i.test(b)), 'no POST body from the page carries a private key');
@@ -254,6 +270,12 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       let text = await clipboard(page);
       assert.match(text, /bank_quote_deposit/);
       assert.match(text, /bank_stake/);
+      assert.ok(text.includes(`My PoA address: ${player.address}`), 'address in the prompt');
+      assert.ok(text.includes(`"address": "${player.address}"`), 'quote uses the address (VIP edge)');
+      assert.match(text, /- amount: 1000\.000000 POA/);
+      assert.ok(text.includes(`- memo (exact, byte for byte): DICE1:LP_ADD:epochs=3:ref=${staker.address}`), text);
+      assert.match(text, /plus "signed_tx"/);
+      assert.match(text, /tx_status[\s\S]*CONFIRMED/);
       assert.match(text, /"amount_poa": "1000\.000000"/);
       assert.match(text, /"lock_epochs": 3/);
       assert.match(text, new RegExp(`"referrer": "${staker.address}"`));
@@ -286,6 +308,8 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       assert.match(text, /bank_withdraw/);
       assert.match(text, /"mode": "BPS"/);
       assert.match(text, /"bps": 5000/);
+      assert.match(text, /- amount: 0\.000001 POA/);
+      assert.match(text, /- memo \(exact, byte for byte\): DICE1:LP_WITHDRAW:BPS=5000/);
 
       // Generate yield deterministically: rolls pay incentive fees; the (admin) epoch advance compounds them.
       await mcp(srv.url, 'dice_batch_roll', { count: 100, amount_poa: '5.000000', target_bps: 4950, direction: 'under', client_seed: 'yield', max_total_spend_poa: '500.000000', privkey: staker.privkey });
@@ -325,6 +349,7 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       assert.match(text, /"strategy": "martingale_capped"/);
       assert.match(text, /"rolls": 4/);
       assert.match(text, /"max_total_spend_poa": "\d+\.\d{6}"/);
+      assert.match(text, /only works with "privkey"[\s\S]*ONLY if I explicitly confirm/);
       await page.fill('#autoRollsInput', '99');
       await page.dispatchEvent('#autoRollsInput', 'change');
       await page.waitForFunction(() => document.getElementById('btnCopyAutoPrompt').disabled);
@@ -341,13 +366,28 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       await setInput(page, '#chatTextInput', 'gm from the e2e agent');
       await page.waitForFunction(() => !document.getElementById('btnCopyChatPrompt').disabled);
       await page.click('#btnCopyChatPrompt');
-      assert.match(await clipboard(page), /chat_send[\s\S]*gm from the e2e agent/);
+      const chatText = await clipboard(page);
+      assert.match(chatText, /chat_send[\s\S]*gm from the e2e agent/);
+      assert.match(chatText, /no transfer, no POA spent[\s\S]*"signature"/);
       t0 = Date.now();
       const chat = await mcp(srv.url, 'chat_send', { text: 'signed hello', sender_name: 'E2E', privkey: player.privkey });
       assert.equal(chat.isError, false);
       await page.waitForFunction(() => /signed hello/.test(document.getElementById('chatMessagesList').textContent), null, { timeout: 5000 });
       latency.chatMs = Date.now() - t0;
       assert.equal(await page.evaluate(() => window.__noReload), 'still-here');
+    });
+
+    await t.test('your PoA address is saved on this device and restored after a reload; clearing it removes it', async () => {
+      assert.equal(await page.evaluate(() => localStorage.getItem('poaDice.playerAddress')), player.address);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForFunction((a) => document.getElementById('playerAddressInput').value === a, player.address, { timeout: 5000 });
+      await page.waitForFunction(() => !document.getElementById('btnCopyPrompt').disabled, null, { timeout: 10000 });
+      await page.waitForFunction((a) => document.getElementById('promptPreview').textContent.includes(`My PoA address: ${a}`), player.address, { timeout: 5000 });
+      const preview = await page.textContent('#promptPreview');
+      assert.ok(preview.includes(`"address": "${player.address}"`), 'roll quote args carry the saved address');
+      await setInput(page, '#playerAddressInput', '');
+      assert.equal(await page.evaluate(() => localStorage.getItem('poaDice.playerAddress')), null);
+      await page.waitForFunction(() => /My PoA address: not given/.test(document.getElementById('promptPreview').textContent));
     });
 
     assert.deepEqual(errors, [], 'no page errors');

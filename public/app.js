@@ -81,21 +81,114 @@ function seedValue() {
 
 // ─── Prompt builder (shared by every action button) ─────────────────────────
 
-export function buildAgentPrompt({ title, tool, args, quoteTool, quoteArgs, spendCapPoa, stop, report }) {
+export const ADDRESS_STORAGE_KEY = 'poaDice.playerAddress';
+export const PROMPT_WAIT_SECONDS = 60;
+const WITHDRAW_TRIGGER = '0.000001';
+const VIP_LINE = 'Quotes without an address use the standard house edge; the final edge may be lower (payout slightly higher) if that address is a VIP staker.';
+
+function loadSavedAddress() {
+  try {
+    const a = String(window.localStorage.getItem(ADDRESS_STORAGE_KEY) || '').trim();
+    return ADDR_RE.test(a) ? a : '';
+  } catch {
+    return '';
+  }
+}
+
+function saveAddress(a) {
+  try {
+    if (a) window.localStorage.setItem(ADDRESS_STORAGE_KEY, a);
+    else window.localStorage.removeItem(ADDRESS_STORAGE_KEY);
+  } catch {
+    // storage blocked (private mode): the field still works for this visit
+  }
+}
+
+/** Mirror of the server's formatDiceMemo (src/crypto-poa.mjs); tests assert they agree. */
+export function diceMemo(spec) {
+  const act = String(spec.action || '').toUpperCase();
+  if (act === 'BET') return `DICE1:BET:${spec.direction === 'over' ? 'over' : 'under'}:${Number(spec.targetBps)}:${String(spec.clientSeed || 'default').replace(/[:\r\n]/g, '_').slice(0, 64)}`;
+  if (act === 'LP_ADD') {
+    const extras = [];
+    if (spec.lockEpochs && Number(spec.lockEpochs) > 0) extras.push(`epochs=${Number(spec.lockEpochs)}`);
+    if (spec.referrer && ADDR_RE.test(spec.referrer)) extras.push(`ref=${spec.referrer}`);
+    return ['DICE1:LP_ADD', ...extras].join(':');
+  }
+  if (act === 'LP_WITHDRAW') {
+    if (spec.shares) return `DICE1:LP_WITHDRAW:${spec.shares}`;
+    if (spec.bps && Number(spec.bps) < 10000) return `DICE1:LP_WITHDRAW:BPS=${Number(spec.bps)}`;
+    return 'DICE1:LP_WITHDRAW:ALL';
+  }
+  return '';
+}
+
+/** Fallback when the server quote did not carry a transferTemplate (same shape). */
+function localTemplate({ amount, memo, count = 1 }) {
+  const to = state.summary?.bankAddress;
+  if (!to || !memo || !AMOUNT_RE.test(String(amount))) return null;
+  const amt = Number(amount).toFixed(6);
+  return { ok: true, kind: 'transfer', chainId: state.summary?.chainId || 'poa-mainnet-1', to, amount: amt, memo, count, totalPoa: (Number(amt) * count).toFixed(6) };
+}
+
+function transferLines(tpl) {
+  return [
+    `   - chain id (cid): ${tpl.chainId}`,
+    `   - to (bank address): ${tpl.to}`,
+    `   - amount: ${tpl.amount} POA${tpl.count > 1 ? ` each (${tpl.totalPoa} POA in total)` : ''}`,
+    `   - memo (exact, byte for byte): ${tpl.memo}`,
+    `   - count: ${tpl.count} transfer${tpl.count === 1 ? '' : 's'}${tpl.count > 1 ? ', one per roll, consecutive nonces, all from my address' : ''}`,
+  ];
+}
+
+/**
+ * signing: 'signed_tx' | 'signed_txs' (self-custody transfers from `transfer`),
+ *          'signature' (chat), 'privkey_only' (auto-bet), 'from_quote' (claim: memo comes from the dry run).
+ */
+export function buildAgentPrompt({ title, tool, args, quoteTool, quoteArgs, spendCapPoa, stop, report, transfer = null, signing = 'signed_tx', address = '' }) {
   const lines = [
     `Please run this POA Dice action for me through the POA Dice MCP server.`,
     ``,
     `MCP server: ${mcpUrl()} (Streamable HTTP, JSON-RPC 2.0). If you cannot add MCP servers, POST JSON-RPC "tools/call" requests to that URL.`,
     `Action: ${title}`,
+    address
+      ? `My PoA address: ${address}. Sign everything from this address; if your wallet has a different address, stop and tell me.`
+      : `My PoA address: not given, so sign from your own PoA wallet. ${VIP_LINE}`,
     ``,
   ];
   let step = 1;
   if (quoteTool) {
     lines.push(`${step++}. First call the read-only tool \`${quoteTool}\` with:`, JSON.stringify(quoteArgs, null, 2), `   If it is not valid, stop and tell me the reason.`);
   }
-  lines.push(`${step++}. Then call \`${tool}\` with exactly these arguments:`, JSON.stringify(args, null, 2));
+  if ((signing === 'signed_tx' || signing === 'signed_txs') && transfer) {
+    lines.push(
+      `${step++}. Build and sign LOCALLY ${transfer.count === 1 ? 'exactly 1 minepoa transfer' : `exactly ${transfer.count} separate minepoa transfers`} from my wallet. Each one must contain exactly:`,
+      ...transferLines(transfer),
+      `   No fee field, no other transfers. The quote's "transferTemplate" (or the read-only tool \`tx_templates\`) returns these same values; if anything differs, stop and tell me.`,
+      `${step++}. Then call \`${tool}\` with exactly these arguments, plus "${signing}": ${signing === 'signed_txs' ? `[the ${transfer.count} signed transfer${transfer.count === 1 ? '' : 's'}]` : '<the signed transfer>'}:`,
+      JSON.stringify(args, null, 2)
+    );
+  } else if (signing === 'from_quote') {
+    const to = transfer?.to || state.summary?.bankAddress || '<bank address from the quote>';
+    lines.push(
+      `${step++}. Build and sign LOCALLY exactly 1 minepoa transfer from my wallet: chain id ${transfer?.chainId || state.summary?.chainId || 'poa-mainnet-1'}, to ${to}, amount ${WITHDRAW_TRIGGER} POA, memo exactly as in the dry run's "transferTemplate" (it carries the exact share units). No fee field, no other transfers.`,
+      `${step++}. Then call \`${tool}\` with exactly these arguments, plus "signed_tx": <the signed transfer>:`,
+      JSON.stringify(args, null, 2)
+    );
+  } else if (signing === 'signature') {
+    lines.push(
+      `${step++}. Sign the exact message text below with my Ed25519 key LOCALLY (no transfer, no POA spent), then call \`${tool}\` with exactly these arguments plus "address" (my poa1 address) and "signature" (Base58):`,
+      JSON.stringify(args, null, 2)
+    );
+  } else if (signing === 'privkey_only') {
+    lines.push(
+      `${step++}. \`${tool}\` sizes and signs every roll on the server, so it only works with "privkey". Do this ONLY if I explicitly confirm that I accept sending my key to this server; otherwise stop and tell me (a roll batch with signed_txs needs no key). Then call it with exactly these arguments:`,
+      JSON.stringify(args, null, 2)
+    );
+  } else {
+    lines.push(`${step++}. Then call \`${tool}\` with exactly these arguments:`, JSON.stringify(args, null, 2));
+  }
   lines.push(
-    `${step++}. Sign with my own PoA wallet. Prefer building signed_tx / signed_txs locally; only add "privkey" if I confirm I accept sending it to this server. Never print a private key in chat.`,
+    `Safety: never add "privkey" unless I confirm I accept sending it to this server, and never print a private key in chat.`,
     `Spend cap: never send more than ${spendCapPoa} POA in total for this action. Do not change any amount, count, target or cap.`,
     `Stop condition: ${stop}`,
     `${step++}. Report back: ${report}`,
@@ -116,6 +209,7 @@ function rollArgs() {
     direction: state.direction,
     client_seed: seedValue(),
     max_total_spend_poa: total,
+    wait_seconds: PROMPT_WAIT_SECONDS,
   };
 }
 
@@ -125,6 +219,10 @@ function rollPrompt() {
   const quoteArgs = { count: args.count, amount_poa: args.amount_poa, target_bps: args.target_bps, direction: args.direction, client_seed: args.client_seed, max_total_spend_poa: cap };
   if (state.playerAddress) quoteArgs.address = state.playerAddress;
   const cmp = state.direction === 'under' ? 'under' : 'over';
+  const sel = state.batchQuotes?.find((x) => x.count === args.count);
+  const transfer =
+    (sel?.transferTemplate?.memo === diceMemo({ action: 'BET', direction: args.direction, targetBps: args.target_bps, clientSeed: args.client_seed }) && sel.transferTemplate) ||
+    localTemplate({ amount: args.amount_poa, memo: diceMemo({ action: 'BET', direction: args.direction, targetBps: args.target_bps, clientSeed: args.client_seed }), count: args.count });
   return buildAgentPrompt({
     title: `${args.count} dice roll${args.count === 1 ? '' : 's'} · roll ${cmp} ${(state.targetBps / 100).toFixed(2)} · ${args.amount_poa} POA each`,
     tool: 'dice_batch_roll',
@@ -132,9 +230,17 @@ function rollPrompt() {
     quoteTool: 'dice_quote_batch',
     quoteArgs,
     spendCapPoa: cap,
-    stop: `stop after ${args.count} roll${args.count === 1 ? '' : 's'}, or immediately if the server rejects the batch or reports the bank cannot cover it. Do not retry with different numbers.`,
-    report: 'wins, losses, net POA, each bet_txid with its roll, and the server seed hash.',
+    transfer,
+    signing: 'signed_txs',
+    address: state.playerAddress,
+    stop: `stop after ${args.count} roll${args.count === 1 ? '' : 's'}, or immediately if the server rejects the batch or reports the bank cannot cover it. Do not retry with different numbers and never resend a transfer.`,
+    report: `dice_batch_roll waits up to ${PROMPT_WAIT_SECONDS} s and returns wins, losses, net POA, each bet_txid with its roll, payout txids and the server seed hash. If its status is PENDING_CONFIRMATION (or waitStatus is not COMPLETE), poll \`tx_status\` for each bet_txid and payout txid every ~15 s until they are CONFIRMED, without resending anything. Then tell me: wins, losses, net POA, each bet_txid with its roll, each payout txid, and the server seed hash.`,
   });
+}
+
+function actionTemplate(kind) {
+  const t = state.actionQuotes?.[kind]?.transferTemplate;
+  return t && t.ok ? t : null;
 }
 
 function actionPrompt(kind) {
@@ -145,41 +251,55 @@ function actionPrompt(kind) {
     const ref = String($('referrerInput').value || '').trim();
     const args = { amount_poa: amount, lock_epochs: lock, max_total_spend_poa: amount };
     if (ref) args.referrer = ref;
+    const memo = diceMemo({ action: 'LP_ADD', lockEpochs: lock, referrer: ref });
+    const st = actionTemplate('stake');
     return buildAgentPrompt({
       title: `Stake ${amount} POA into the bankroll vault${lock ? ` (locked ${lock} epoch${lock === 1 ? '' : 's'})` : ''}${ref ? ' with a referrer' : ''}`,
       tool: 'bank_stake',
       args,
       quoteTool: 'bank_quote_deposit',
-      quoteArgs: { amount_poa: amount, lock_epochs: lock, ...(addr ? { address: addr } : {}) },
+      quoteArgs: { amount_poa: amount, lock_epochs: lock, ...(ref ? { referrer: ref } : {}), ...(addr ? { address: addr } : {}) },
       spendCapPoa: amount,
-      stop: 'one deposit only. Stop if the quote or deposit is rejected.',
-      report: 'shares minted, % of bank owned, lock-until epoch and the deposit txid.',
+      transfer: (st && st.memo === memo && st.amount === amount && st) || localTemplate({ amount, memo }),
+      signing: 'signed_tx',
+      address: addr,
+      stop: 'one deposit only. Stop if the quote or deposit is rejected; never resend the transfer.',
+      report: 'the deposit txid. Poll `tx_status` with it every ~15 s until it is CONFIRMED (booked), then tell me the shares minted, % of the bank owned, lock-until epoch and the deposit txid.',
     });
   }
   if (kind === 'withdraw') {
     const bps = state.withdrawBps;
     const args = bps === 10000 ? { mode: 'ALL' } : { mode: 'BPS', bps };
+    const memo = diceMemo({ action: 'LP_WITHDRAW', bps });
+    const wt = actionTemplate('withdraw');
     return buildAgentPrompt({
       title: `Withdraw ${(bps / 100).toFixed(0)}% of my bankroll shares`,
       tool: 'bank_withdraw',
       args,
       quoteTool: 'bank_quote_withdraw',
       quoteArgs: { address: addr || '<my poa1 address>', ...args },
-      spendCapPoa: '0.000001',
-      stop: 'one withdrawal only. Stop if I hold no shares, the position is locked, or the quote is rejected.',
-      report: 'shares redeemed, exit fee, net POA returned and the payout txid.',
+      spendCapPoa: WITHDRAW_TRIGGER,
+      transfer: (wt && wt.memo === memo && wt) || localTemplate({ amount: WITHDRAW_TRIGGER, memo }),
+      signing: 'signed_tx',
+      address: addr,
+      stop: 'one withdrawal only. Stop if I hold no shares, the position is locked, or the quote is rejected; never resend the trigger.',
+      report: 'the trigger txid. Poll `tx_status` with it every ~15 s until the payout is CONFIRMED, then tell me the shares redeemed, exit fee, net POA returned and the payout txid.',
     });
   }
   if (kind === 'claim') {
+    const ct = actionTemplate('claim');
     return buildAgentPrompt({
       title: 'Claim my bankroll yield (keep principal staked)',
       tool: 'bank_claim_yield',
       args: {},
       quoteTool: 'bank_claim_yield',
       quoteArgs: { dry_run: true, address: addr || '<my poa1 address>' },
-      spendCapPoa: '0.000001',
-      stop: 'one claim only. Stop if there is no position or no yield.',
-      report: 'yield claimed in POA, shares redeemed and the payout txid.',
+      spendCapPoa: WITHDRAW_TRIGGER,
+      transfer: ct,
+      signing: 'from_quote',
+      address: addr,
+      stop: 'one claim only. Stop if there is no position or no yield; never resend the trigger.',
+      report: 'the trigger txid. Poll `tx_status` with it every ~15 s until the payout is CONFIRMED, then tell me the yield claimed in POA, shares redeemed and the payout txid.',
     });
   }
   if (kind === 'autoBet') {
@@ -194,6 +314,8 @@ function actionPrompt(kind) {
       quoteTool: 'dice_quote_bet',
       quoteArgs: { amount_poa: wager, target_bps: state.targetBps, direction: state.direction, ...(addr ? { address: addr } : {}) },
       spendCapPoa: cap,
+      signing: 'privkey_only',
+      address: addr,
       stop: `after ${rolls} rolls, when the spend cap is reached, or if any roll is rejected.`,
       report: 'rolls executed, wins/losses, net POA, stopped reason and each bet_txid.',
     });
@@ -206,6 +328,8 @@ function actionPrompt(kind) {
       args: { text, sender_name: String($('chatSenderInput').value || 'Agent').trim() },
       quoteTool: null,
       spendCapPoa: '0',
+      signing: 'signature',
+      address: addr,
       stop: 'post once.',
       report: 'the posted message id and whether the signature verified.',
     });
@@ -223,7 +347,7 @@ function localRollProblem() {
   const max = state.direction === 'under' ? 9800 : 9899;
   if (!Number.isInteger(state.targetBps) || state.targetBps < min || state.targetBps > max) return 'Target is out of range';
   const a = String($('playerAddressInput').value || '').trim();
-  if (a && !ADDR_RE.test(a)) return 'Agent address must be a valid poa1… address (or leave it empty)';
+  if (a && !ADDR_RE.test(a)) return 'Your PoA address must be a valid poa1… address (or leave it empty)';
   return null;
 }
 
@@ -717,6 +841,11 @@ export function bootPoaDice() {
   const myGen = ++bootGeneration;
   const alive = () => myGen === bootGeneration && !!document.getElementById('btnCopyPrompt');
   bindEvents();
+  const saved = loadSavedAddress();
+  if (saved && !String($('playerAddressInput').value || '').trim()) {
+    $('playerAddressInput').value = saved;
+    state.playerAddress = saved;
+  }
   updateSliderVisuals();
   renderRollAvailability();
   void (async () => {
@@ -877,6 +1006,7 @@ function bindEvents() {
   $('playerAddressInput').addEventListener('input', () => {
     const a = String($('playerAddressInput').value || '').trim();
     state.playerAddress = ADDR_RE.test(a) ? a : '';
+    if (state.playerAddress || !a) saveAddress(state.playerAddress);
     onRollInput();
     refreshStateSoon();
   });

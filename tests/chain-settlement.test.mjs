@@ -417,11 +417,11 @@ test('bets on chain: single bet + 5-roll batch settle only after confirmation; w
     mock.finalizeAll();
     await srv.settle();
     const availBefore = srv.app.engine.availableBankrollMicros;
-    const one = await srv.mcp('dice_place_bet', { amount_poa: '1.000000', target_bps: 4950, direction: 'under', client_seed: 'chain1', privkey: player.privkey });
+    const one = await srv.mcp('dice_place_bet', { amount_poa: '1.000000', target_bps: 4950, direction: 'under', client_seed: 'chain1', privkey: player.privkey, wait_seconds: 0 });
     assert.equal(one.isError, false, JSON.stringify(one.data));
     assert.equal(one.data.status, 'PENDING_CONFIRMATION');
     assert.ok(srv.app.engine.availableBankrollMicros < availBefore, 'exposure reserved while pending');
-    const batch = await srv.mcp('dice_batch_roll', { count: 5, amount_poa: '1.000000', target_bps: 4950, direction: 'under', client_seed: 'chain5', max_total_spend_poa: '5.000000', privkey: player.privkey });
+    const batch = await srv.mcp('dice_batch_roll', { count: 5, amount_poa: '1.000000', target_bps: 4950, direction: 'under', client_seed: 'chain5', max_total_spend_poa: '5.000000', privkey: player.privkey, wait_seconds: 0 });
     assert.equal(batch.isError, false, JSON.stringify(batch.data));
     assert.equal(batch.data.submitted, 5);
     assert.equal(srv.app.engine.totalBetsCount, 0, 'no roll before confirmation');

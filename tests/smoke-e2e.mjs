@@ -58,6 +58,30 @@ async function main() {
 
     const jsRes = await fetch(`${srv.url}/app.js`);
     assert.equal(jsRes.status, 200);
+    const jsText = await jsRes.text();
+    // Generated prompts: exact transfer spec, your address (saved locally), wait-for-settlement report
+    for (const needle of ['tx_templates', 'memo (exact, byte for byte)', 'chain id (cid)', 'wait_seconds', 'poaDice.playerAddress', 'final edge may be lower']) {
+      assert.equal(jsText.includes(needle), true, `app.js prompt builder must include: ${needle}`);
+    }
+    assert.equal(htmlText.includes('YOUR POA ADDRESS'), true, 'address field label');
+
+    // MCP: unsigned transfer templates + address-aware (VIP) quotes
+    let rpc = 0;
+    const mcpCall = async (name, args) => {
+      const r = await (await fetch(`${srv.url}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++rpc, method: 'tools/call', params: { name, arguments: args } }) })).json();
+      return JSON.parse(r.result.content[0].text);
+    };
+    const tplArgs = { count: 5, amount_poa: '1.000000', target_bps: 4950, direction: 'under', client_seed: 'smoke-seed' };
+    const tpl = await mcpCall('tx_templates', { tool: 'dice_batch_roll', ...tplArgs });
+    assert.equal(tpl.ok, true);
+    assert.equal(tpl.memo, 'DICE1:BET:under:4950:smoke-seed');
+    assert.equal(tpl.count, 5);
+    assert.equal(tpl.to, app.engine.bankAddress);
+    assert.equal(tpl.chainId, 'poa-mainnet-1');
+    const qb = await mcpCall('dice_quote_batch', { ...tplArgs, max_total_spend_poa: '5.000000' });
+    assert.equal(qb.valid, true);
+    assert.equal(qb.transferTemplate.memo, tpl.memo);
+    assert.match(qb.vipNote, /VIP/);
 
     // 2. Test CLI against running server (async so parent HTTP server event loop stays active)
     console.log('2️⃣  Testing CLI against live server (stake, bet, chat, sweep-dev)...');

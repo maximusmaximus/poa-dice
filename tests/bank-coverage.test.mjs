@@ -110,7 +110,7 @@ test('bank smaller than the worst-case payout: refused (quote + place); a covere
     assert.equal(mock.submits.length, before, 'not broadcast');
     const ok = (await srv.mcp('dice_quote_bet', { amount_poa: '4.000000', target_bps: 4950, direction: 'under' })).data;
     assert.equal(ok.valid, true, JSON.stringify(ok));
-    const placed = (await srv.mcp('dice_place_bet', { amount_poa: '4.000000', target_bps: 4950, direction: 'under', signed_tx: betTx(mock, p, bank, '4.000000') })).data;
+    const placed = (await srv.mcp('dice_place_bet', { amount_poa: '4.000000', target_bps: 4950, direction: 'under', signed_tx: betTx(mock, p, bank, '4.000000'), wait_seconds: 0 })).data;
     assert.equal(placed.status, 'PENDING_CONFIRMATION', JSON.stringify(placed));
   } finally {
     await srv.close();
@@ -135,8 +135,8 @@ test('concurrent bets on two instances that together exceed the bank: exactly on
     await b.settle(2);
     // each bet alone fits (worst case 6 <= 10); together (12) they do not
     const [r1, r2] = await Promise.all([
-      a.mcp('dice_place_bet', { amount_poa: '3.000000', target_bps: 4950, direction: 'under', signed_tx: betTx(mock, p1, bank, '3.000000') }),
-      b.mcp('dice_place_bet', { amount_poa: '3.000000', target_bps: 4950, direction: 'under', signed_tx: betTx(mock, p2, bank, '3.000000') })
+      a.mcp('dice_place_bet', { amount_poa: '3.000000', target_bps: 4950, direction: 'under', signed_tx: betTx(mock, p1, bank, '3.000000'), wait_seconds: 0 }),
+      b.mcp('dice_place_bet', { amount_poa: '3.000000', target_bps: 4950, direction: 'under', signed_tx: betTx(mock, p2, bank, '3.000000'), wait_seconds: 0 })
     ]);
     const accepted = [r1.data, r2.data].filter((d) => d.status === 'PENDING_CONFIRMATION');
     assert.equal(accepted.length, 1, JSON.stringify([r1.data, r2.data]));
