@@ -1481,7 +1481,8 @@ export class BankrollEngine {
         playerClientSeeds: [...this.playerClientSeeds.entries()],
         processedTxids: [...this.processedTxids.entries()].slice(-1000),
         withdrawalQueue: this.withdrawalQueue,
-        outboundQueue: this.outboundQueue.slice(-500),
+        // Never drop an unsettled order: keep every non-final item plus recent history.
+        outboundQueue: this.outboundQueue.filter((x, i, all) => !['SENT_SIGNED', 'CONFIRMED', 'FAILED'].includes(x.status) || i >= all.length - 500),
         betHistory: this.betHistory.slice(0, 100),
         bankHistory: this.bankHistory.slice(0, 100),
         chatMessages: this.chatMessages.slice(0, 100),

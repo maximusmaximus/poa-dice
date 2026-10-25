@@ -236,6 +236,9 @@ export async function executeBatch({ engine, watcher, hooks = {}, args = {} }) {
   const wagerMicros = toMicros(quote.wagerPoa);
   const lockPerRoll = toMicros(quote.exposurePerRollPoa);
   const totalWager = toMicros(quote.totalWagerPoa);
+  if (watcher.settlement) {
+    return executeChainBatch({ engine, watcher, args, quote, wallet, address, memo, count, batchId, lockPerRoll, stopOnLoss, stopOnProfit });
+  }
   // Synchronous from here on: reservation + every roll happen in one tick, so no other
   // request can interleave. Player spend is reserved too for the async chain check.
   if (hooks.reserveSpend) hooks.reserveSpend(address, totalWager);
@@ -326,5 +329,62 @@ export async function executeBatch({ engine, watcher, hooks = {}, args = {} }) {
     rolls,
     verifyHow:
       'Roll = first 8-byte big-endian window w (offsets 0,8,16,24) of HMAC_SHA256(key=server_seed, msg="client_seed:nonce:bet_txid") with w < 18446744073709550000 (falls back to offset 0), then w % 10000 / 100. Call dice_verify_roll after the server seed is revealed.'
+  };
+}
+
+/**
+ * Chain-settled batch: every roll is a real minepoa transfer. All N are broadcast now; each roll
+ * settles when the ledger confirms its transfer (bet.settled), batch.completed fires once all
+ * N resolve. The full worst-case exposure stays reserved until each roll settles or fails.
+ */
+async function executeChainBatch({ engine, watcher, args, quote, wallet, address, memo, count, batchId, lockPerRoll, stopOnLoss, stopOnProfit }) {
+  if (stopOnLoss || stopOnProfit) {
+    throw Object.assign(new Error('stop_on_loss_poa / stop_on_profit_poa need each roll settled first; they are not supported on a chain-settled server (all rolls are broadcast up front)'), { status: 400 });
+  }
+  const settlement = watcher.settlement;
+  engine.reserveExposure(batchId, lockPerRoll * BigInt(count));
+  settlement.openGroup(batchId, { count, address });
+  engine._emit('batch.started', { batchId, address, count, wagerPoa: quote.wagerPoa, targetBps: quote.targetBps, direction: quote.direction, maxBankExposurePoa: quote.maxBankExposurePoa, settlement: 'chain' });
+  const submitted = [];
+  let error = null;
+  for (let i = 0; i < count; i++) {
+    try {
+      const tx = wallet ? await watcher.buildPlayerTransfer(wallet, { amount: quote.wagerPoa, memo }) : args.signed_txs[i];
+      const view = await settlement.submitInbound(tx, { reserve: { key: batchId, micros: lockPerRoll.toString() }, groupId: batchId });
+      submitted.push(view.txid);
+    } catch (err) {
+      error = String(err.message || err);
+      break;
+    }
+  }
+  if (submitted.length < count) {
+    // Keep exactly one slice per roll still waiting for the ledger; release the rest.
+    const recs = Object.values(settlement.state.inbound).filter((r) => r.groupId === batchId);
+    const stillHeld = BigInt(recs.filter((r) => r.reserve).length) * lockPerRoll;
+    const held = engine.batchReservations.get(batchId) || 0n;
+    if (held > stillHeld) engine.releaseExposure(batchId, held - stillHeld);
+    const g = settlement.state.groups[batchId];
+    if (g) {
+      g.count = recs.length;
+      settlement._save();
+    }
+  }
+  if (submitted.length === 0) {
+    throw Object.assign(new Error(`No roll was broadcast: ${error}`), { status: 502 });
+  }
+  return {
+    ok: true,
+    action: 'BATCH_BROADCAST',
+    status: 'PENDING_CONFIRMATION',
+    batchId,
+    address,
+    count,
+    submitted: submitted.length,
+    txids: submitted,
+    error,
+    signer: wallet ? 'privkey' : 'signed_txs',
+    quote,
+    serverSeedHash: engine.seedManager.currentSeedHash,
+    note: 'Each roll is a real minepoa transfer and settles once the ledger confirms it. Poll tx_status per txid or watch /api/stream for bet.settled and batch.completed.'
   };
 }

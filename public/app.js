@@ -397,7 +397,7 @@ function updateSliderVisuals() {
 }
 
 function updateOfflineCommandPreview() {
-  const bankAddr = state.summary?.bankAddress || 'poa1...';
+  const bankAddr = state.summary?.bankAddress || (state.summary?.settlement?.readOnly ? '(bank offline)' : 'poa1...');
   $('bannerBankAddr').textContent = bankAddr;
   const clientSeed = seedValue().replace(/[^a-zA-Z0-9._-]/g, '') || 'client-seed-1';
   const memo = `DICE1:BET:${state.direction}:${state.targetBps}:${clientSeed}`;
@@ -446,7 +446,8 @@ function applyStateSnapshot(data) {
   } else {
     $('chainBalanceText').textContent = 'Add it to check your balance and LP position.';
   }
-  if (chain && !chain.ok) setStatus('CHAIN DOWN', 'down');
+  if (data.settlement?.readOnly) setStatus(String(data.settlement.status || 'READ ONLY').replace(/_/g, ' '), 'down');
+  else if (chain && !chain.ok) setStatus('CHAIN DOWN', 'down');
   else if (state.sseConnected) setStatus(chain ? 'CHAIN LIVE' : 'LIVE', 'live');
 
   if (data.devReserve) {

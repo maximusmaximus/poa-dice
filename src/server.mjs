@@ -27,6 +27,10 @@ import { MCP_INSTRUCTIONS, MCP_TOOLS, McpHandler, ROLL_FORMULA } from './mcp-ser
 import { executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
 import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
 import crypto from 'node:crypto';
+import { loadBankWallet } from './bank-key.mjs';
+import { ChainSettlement } from './chain-settlement.mjs';
+import { DEFAULT_CHAIN_ID, MinepoaClient } from './minepoa-client.mjs';
+import { createFileStore, isWritableDir } from './settlement-store.mjs';
 import {
   fetchExplorerAddress,
   formatMicros,
@@ -47,6 +51,9 @@ const MIME_TYPES = {
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml'
 };
+
+/** POST paths that move POA; refused (503) while chain mode is read-only. */
+const WRITE_PATHS = new Set(['/api/tx/submit', '/api/action/sign-and-submit', '/api/action/auto-bet', '/api/action/batch-roll', '/api/dev/sweep', '/api/epoch/advance']);
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data);
@@ -87,12 +94,18 @@ function readJsonBody(req, maxBytes = 262144) {
 
 export function createDiceServer(options = {}) {
   const dataDir = options.dataDir !== undefined ? options.dataDir : path.resolve(__dirname, '..', 'data');
+  // A chain-settled vault never starts with invented POA: the bankroll is only what lands on chain.
+  const wantChain =
+    options.chainSettlement !== undefined
+      ? Boolean(options.chainSettlement)
+      : (options.watcher?.mode || options.watcherMode || 'simulated') !== 'simulated';
   const engine =
     options.engine ||
     new BankrollEngine({
       dataDir,
-      initialBootstrapPoa:
-        options.initialBootstrapPoa !== undefined
+      initialBootstrapPoa: wantChain
+        ? null
+        : options.initialBootstrapPoa !== undefined
           ? options.initialBootstrapPoa
           : process.env.POA_DICE_BOOTSTRAP_POA || null,
       bootstrapAddress: DEV_RESERVE_ADDRESS
@@ -105,8 +118,71 @@ export function createDiceServer(options = {}) {
       mode: options.watcherMode || 'simulated'
     });
 
+  if (options.nodeUrl) watcher.nodeUrl = String(options.nodeUrl).replace(/\/+$/, '');
   const sseClients = new Set();
-  const requireChain = options.requireChain !== undefined ? Boolean(options.requireChain) : watcher.mode !== 'simulated';
+  // Chain settlement = real minepoa deposits/payouts. On whenever the watcher is not simulated.
+  const chainSettlement = options.chainSettlement !== undefined ? Boolean(options.chainSettlement) : watcher.mode !== 'simulated';
+  const requireChain = chainSettlement || (options.requireChain !== undefined ? Boolean(options.requireChain) : watcher.mode !== 'simulated');
+  let settlement = null;
+  let readOnlyState = null; // { status, error } when chain mode cannot safely accept funds
+  let bankKeySource = null;
+  if (chainSettlement) {
+    const key = loadBankWallet({ env: options.bankEnv || process.env, allowEphemeral: false });
+    bankKeySource = key.source;
+    const store = options.settlementStore || (dataDir && isWritableDir(dataDir) ? createFileStore(dataDir) : null);
+    if (key.status !== 'OK') {
+      readOnlyState = { status: key.status, error: key.error };
+    } else if (!store) {
+      readOnlyState = {
+        status: 'STORAGE_UNAVAILABLE',
+        error: 'Chain mode needs durable storage: set POA_DICE_DATA_DIR to a persistent writable directory (or plug in a KV store adapter).'
+      };
+    } else {
+      const fresh =
+        engine.totalShares === 0n &&
+        engine.bankNavMicros === 0n &&
+        engine.outboundQueue.every((x) => ['SENT_SIGNED', 'CONFIRMED', 'FAILED'].includes(x.status));
+      if (engine.bankAddress !== key.wallet.address) {
+        if (fresh || String(engine.bankAddress).startsWith('poa1BankVault')) {
+          engine.bankAddress = key.wallet.address;
+          engine._saveToDisk();
+        } else {
+          readOnlyState = {
+            status: 'BANK_ADDRESS_MISMATCH',
+            error: `Stored vault state belongs to bank ${engine.bankAddress}, but the configured key is for ${key.wallet.address}. Refusing to mix them.`
+          };
+        }
+      }
+      if (!readOnlyState) {
+        const client =
+          options.minepoaClient ||
+          new MinepoaClient({
+            nodeUrl: options.nodeUrl || watcher.nodeUrl,
+            fetchImpl: options.minepoaFetch || globalThis.fetch,
+            chainId: options.chainId || process.env.POA_CHAIN_ID || DEFAULT_CHAIN_ID
+          });
+        try {
+          settlement = new ChainSettlement({
+            engine,
+            watcher,
+            client,
+            bankWallet: key.wallet,
+            store,
+            confirmPolicy: options.confirmPolicy || process.env.POA_DICE_CONFIRM || 'final',
+            backoffBaseMs: options.backoffBaseMs ?? 2000,
+            backoffMaxMs: options.backoffMaxMs ?? 5 * 60 * 1000,
+            inboundExpireMs: options.inboundExpireMs ?? 30 * 60 * 1000
+          });
+          watcher.bankWallet = key.wallet;
+          watcher.attachSettlement(settlement);
+        } catch (err) {
+          readOnlyState = { status: 'SETTLEMENT_STORE_MISMATCH', error: redactSecrets(err.message) };
+        }
+      }
+    }
+  }
+  const readOnly = () => readOnlyState;
+  const publicBankAddress = () => (chainSettlement && !settlement ? null : engine.bankAddress);
   const chainFetch = options.chainFetch || ((address) => fetchExplorerAddress(watcher.nodeUrl, address));
   const chainCacheMs = options.chainCacheMs ?? 15000;
   const devEndpoints = options.devEndpoints !== undefined ? Boolean(options.devEndpoints) : process.env.POA_DICE_DEV_ENDPOINTS === '1';
@@ -145,6 +221,7 @@ export function createDiceServer(options = {}) {
   }
 
   const mcpHooks = {
+    readOnly,
     chainRequired: requireChain,
     chainContext,
     adminToken,
@@ -225,6 +302,25 @@ export function createDiceServer(options = {}) {
     }
   });
 
+  function settlementBrief() {
+    if (!chainSettlement) return { mode: 'simulated', status: 'SIMULATED', readOnly: false, note: 'Local demo ledger: nothing moves on minepoa' };
+    if (readOnlyState) return { mode: 'chain', status: readOnlyState.status, readOnly: true, error: readOnlyState.error };
+    const sum = settlement.summary();
+    return {
+      mode: 'chain',
+      status: 'OK',
+      readOnly: false,
+      bankKeySource,
+      confirmPolicy: sum.confirmPolicy,
+      store: sum.store,
+      lastTick: sum.lastTick,
+      lastError: sum.lastError,
+      onChainBankBalancePoa: sum.onChainBankBalancePoa,
+      inbound: sum.inbound,
+      outbound: sum.outbound
+    };
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'OPTIONS') {
@@ -240,15 +336,40 @@ export function createDiceServer(options = {}) {
       const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       const pathname = urlObj.pathname;
 
+      if (readOnlyState && req.method === 'POST' && WRITE_PATHS.has(pathname)) {
+        return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });
+      }
+
+      if (pathname === '/api/settlement' && req.method === 'GET') {
+        return sendJson(res, 200, settlement ? settlement.summary() : settlementBrief());
+      }
+
+      const txStatusMatch = pathname.match(/^\/api\/tx\/([0-9a-f]{64}|[0-9a-f]{24})\/status$/);
+      if (txStatusMatch && req.method === 'GET') {
+        const id = txStatusMatch[1];
+        const st = settlement ? settlement.getTxStatus(id) : engine.processedTxids.has(id) ? { txid: id, status: 'CONFIRMED', mode: 'simulated' } : null;
+        return st ? sendJson(res, 200, st) : sendJson(res, 404, { error: 'Unknown txid' });
+      }
+
+      if (pathname === '/api/audit/chain' && req.method === 'GET') {
+        if (!settlement) return sendJson(res, 200, { checked: false, reason: readOnlyState ? readOnlyState.status : 'simulated mode' });
+        try {
+          return sendJson(res, 200, { checked: true, ...(await settlement.auditAgainstChain()) });
+        } catch (err) {
+          return sendJson(res, 503, { checked: false, error: redactSecrets(err.message) });
+        }
+      }
+
       // 1. Health endpoint
       if (pathname === '/api/health' && req.method === 'GET') {
         return sendJson(res, 200, {
           ok: true,
           protocol: 'poa-dice/v1',
           chainId: 'poa-mainnet-1',
-          bankAddress: engine.bankAddress,
+          bankAddress: publicBankAddress(),
           devReserveAddress: DEV_RESERVE_ADDRESS,
           devFeeBps: 10,
+          settlement: settlementBrief(),
           stateRootSha256: engine.computeStateRoot(),
           connectedSseClients: sseClients.size,
           mcpEndpoint: '/mcp',
@@ -287,6 +408,8 @@ export function createDiceServer(options = {}) {
       if ((pathname === '/api/state' || pathname === '/api/status') && req.method === 'GET') {
         const address = urlObj.searchParams.get('address') || '';
         const summary = engine.getStateSummary(address);
+        summary.bankAddress = publicBankAddress();
+        summary.settlement = settlementBrief();
         if (requireChain) {
           try {
             const bank = await cachedExplorer(engine.bankAddress);
@@ -347,10 +470,11 @@ export function createDiceServer(options = {}) {
           maxTotalSpendPoa: p.maxTotalSpendPoa ?? null,
           chain
         };
-        if (p.count) return sendJson(res, 200, quoteBatch(engine, { ...params, count: Number(p.count) }));
+        const roBlock = (q) => (readOnlyState ? { ...q, valid: false, code: readOnlyState.status, reason: `Vault is read-only (${readOnlyState.status.replace(/_/g, ' ')})`, error: readOnlyState.error } : q);
+        if (p.count) return sendJson(res, 200, roBlock(quoteBatch(engine, { ...params, count: Number(p.count) })));
         return sendJson(res, 200, {
           chain: { required: chain.required, ok: chain.ok },
-          counts: quoteAllCounts(engine, params)
+          counts: quoteAllCounts(engine, params).map(roBlock)
         });
       }
 
@@ -360,7 +484,7 @@ export function createDiceServer(options = {}) {
         const address = p.address && isValidPoaAddress(p.address) ? p.address : '';
         const chain = await chainContext(address);
         const addressError = p.address && !address ? 'Player address must be a valid poa1… address' : null;
-        return sendJson(res, 200, {
+        const out = {
           chain: { required: chain.required, ok: chain.ok },
           address,
           addressError,
@@ -378,7 +502,15 @@ export function createDiceServer(options = {}) {
             chain
           }),
           chat: quoteChat({ text: p.chatText || '' })
-        });
+        };
+        if (readOnlyState) {
+          for (const k of ['stake', 'withdraw', 'claim', 'autoBet']) {
+            out[k] = { ...out[k], valid: false, code: readOnlyState.status, reason: `Vault is read-only (${readOnlyState.status.replace(/_/g, ' ')})` };
+          }
+        } else if (settlement) {
+          out.autoBet = { ...out.autoBet, valid: false, code: 'chain_settled', reason: 'Auto-bet needs each roll settled first; use the roll builder batch instead' };
+        }
+        return sendJson(res, 200, out);
       }
 
       if (pathname === '/api/quote/deposit' && (req.method === 'POST' || req.method === 'GET')) {
@@ -406,8 +538,8 @@ export function createDiceServer(options = {}) {
       if (pathname === '/api/tx/submit' && req.method === 'POST') {
         const body = await readJsonBody(req);
         const txEnvelope = body.tx || body;
-        const receipt = watcher.processSignedTransaction(txEnvelope);
-        return sendJson(res, 200, { ok: true, receipt });
+        const receipt = await watcher.submitSignedTransaction(txEnvelope);
+        return sendJson(res, settlement ? 202 : 200, { ok: true, receipt });
       }
 
       // 6. Client/Agent Local Wallet Generator & Sign-and-Submit Helper
@@ -449,14 +581,9 @@ export function createDiceServer(options = {}) {
         if (action === 'BET' || action === 'LP_ADD') {
           await assertChainSpendable(wallet.address, amount);
         }
-        const signedTx = buildSignedTransfer({
-          wallet,
-          to: engine.bankAddress,
-          amount,
-          memo,
-          nonce: Number(body.nonce || Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000))
-        });
-        const receipt = watcher.processSignedTransaction(signedTx);
+        if (settlement && !body.privkey) return sendJson(res, 400, { ok: false, error: 'Chain-settled server: sign with your own wallet' });
+        const signedTx = await watcher.buildPlayerTransfer(wallet, { amount, memo, nonce: body.nonce ? Number(body.nonce) : null });
+        const receipt = await watcher.submitSignedTransaction(signedTx);
         if ((action === 'BET' || action === 'LP_ADD') && (receipt?.action === 'BET_SETTLED' || receipt?.action === 'LP_DEPOSIT')) {
           noteChainDebit(wallet.address, signedTx.id, amount);
         }
@@ -626,6 +753,8 @@ export function createDiceServer(options = {}) {
     engine,
     watcher,
     mcpHandler,
+    settlement,
+    readOnly,
     async listen(port = Number(process.env.PORT || 3080), host = '127.0.0.1') {
       await new Promise((resolve, reject) => {
         server.once('error', reject);
@@ -640,6 +769,7 @@ export function createDiceServer(options = {}) {
     },
     async close() {
       watcher.stopPolling();
+      if (settlement) settlement.stop();
       for (const client of sseClients) {
         try {
           client.end();
@@ -660,16 +790,25 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 if (isMain) {
   const port = Number(process.env.PORT || 3080);
   const host = process.env.HOST || '127.0.0.1';
+  const watcherMode = process.env.POA_DICE_WATCHER_MODE || 'live';
   const app = createDiceServer({
-    watcherMode: process.env.POA_DICE_WATCHER_MODE || 'hybrid',
-    initialBootstrapPoa: process.env.POA_DICE_BOOTSTRAP_POA || null
+    watcherMode,
+    dataDir: process.env.POA_DICE_DATA_DIR || undefined,
+    initialBootstrapPoa: watcherMode === 'simulated' ? process.env.POA_DICE_BOOTSTRAP_POA || null : null
   });
-  if (app.watcher.mode !== 'simulated') app.watcher.startPolling(20000);
+  const ro = app.readOnly();
+  if (ro) {
+    console.error(`POA Dice is READ-ONLY: ${ro.status}. ${ro.error}`);
+    if (process.env.POA_DICE_REQUIRE_BANK_KEY === '1') process.exit(1);
+  } else if (app.settlement) {
+    app.settlement.start(Number(process.env.POA_DICE_SETTLE_MS || 5000));
+  }
   app.listen(port, host).then((info) => {
     console.log(`POA Dice & Bankroll Vault live at ${info.url}`);
     console.log(`  MCP Endpoint : ${info.url}/mcp`);
     console.log(`  SSE Stream   : ${info.url}/api/stream`);
-    console.log(`  Bank Address : ${app.engine.bankAddress}`);
+    console.log(`  Bank Address : ${ro ? `(none: ${ro.status})` : app.engine.bankAddress}`);
+    console.log(`  Settlement   : ${app.settlement ? 'minepoa chain (real deposits + payouts)' : ro ? 'read-only' : 'simulated'}`);
     console.log(`  Dev Reserve  : ${DEV_RESERVE_ADDRESS} (0.1% reserved)`);
   });
 }
