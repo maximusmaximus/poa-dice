@@ -522,7 +522,8 @@ export class McpHandler {
           senderName: args.sender_name || `Agent-${addr.slice(4, 10)}`,
           text: args.text,
           isAgent: true,
-          signature: verified ? sig : null
+          signature: verified ? sig : null,
+          verified
         });
       }
 

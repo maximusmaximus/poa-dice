@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * ledger-watcher.mjs — POA Ledger Memo Watcher, Signature Verifier & Outbound Payout Dispatcher.
  *
@@ -96,7 +97,8 @@ export class LedgerWatcher {
       to: body.to,
       amountPoa: body.amount,
       memo: body.memo || '',
-      ts: body.ts || Math.floor(Date.now() / 1000)
+      ts: body.ts || Math.floor(Date.now() / 1000),
+      playerSig: body.sig || null
     });
   }
 
@@ -104,7 +106,7 @@ export class LedgerWatcher {
    * Execute a parsed DICE1:* memo from an on-ledger transfer.
    * Any invalid or out-of-bounds transfer is safely refunded to `from` (never confiscated).
    */
-  executeMemoAction({ txid, from, amountPoa, memo, ts = Math.floor(Date.now() / 1000) }) {
+  executeMemoAction({ txid, from, amountPoa, memo, ts = Math.floor(Date.now() / 1000), playerSig = null }) {
     if (this.engine.processedTxids.has(txid)) {
       return { idempotent: true, ...this.engine.processedTxids.get(txid) };
     }
@@ -133,6 +135,7 @@ export class LedgerWatcher {
           direction: parsed.direction,
           clientSeed: parsed.clientSeed,
           fromOnChainMemo: true,
+          playerSig,
           ts
         });
         this.flushOutboundQueueSync();
@@ -429,12 +432,21 @@ export class LedgerWatcher {
       });
       if (!resp.ok) return { polled: false, status: resp.status, processed: [] };
       const data = await resp.json();
-      const txs = Array.isArray(data?.txs) ? [...data.txs].reverse() : [];
+      const txs = Array.isArray(data?.txs) ? data.txs.map((t) => ({
+        id: t.id || t.txid,
+        type: t.type || '',
+        from: t.from || t.from_addr || '',
+        to: t.to || t.to_addr || '',
+        amount: t.amount || '0',
+        memo: t.memo || '',
+        ts: t.ts || Math.floor(Date.now() / 1000)
+      })).reverse() : [];
       const processed = [];
       for (const t of txs) {
         const txid = t.id || t.txid;
         if (!txid || this.engine.processedTxids.has(txid)) continue;
-        if (t.type === 'transfer' && t.to === this.engine.bankAddress && String(t.memo || '').startsWith('DICE1:')) {
+        const memo = String(t.memo || '');
+        if (t.type === 'transfer' && t.to === this.engine.bankAddress && memo.startsWith('DICE1:')) {
           const res = this.executeMemoAction({
             txid,
             from: t.from,

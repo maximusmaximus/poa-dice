@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * bankroll-engine.mjs — Bulletproof BigInt Micro-POA Bankroll Vault & Dice Settlement Engine.
  *
@@ -763,6 +764,7 @@ export class BankrollEngine {
     direction,
     clientSeed = 'default',
     fromOnChainMemo = false,
+    playerSig = null,
     ts = Math.floor(Date.now() / 1000)
   }) {
     if (!betTxid) throw new Error('betTxid required');
@@ -823,6 +825,7 @@ export class BankrollEngine {
       houseEdgePercent: quote.houseEdgePercent,
       vipTierName: quote.vipTierName,
       clientSeed: cleanSeed,
+      playerSig: typeof playerSig === 'string' && playerSig.length > 0 ? playerSig.slice(0, 128) : null,
       lockedAt: ts
     };
 
@@ -947,6 +950,7 @@ export class BankrollEngine {
         message: roll.message,
         hmacHex: roll.hmacHex
       },
+      playerSig: locked.playerSig || null,
       ts
     };
 
@@ -1148,6 +1152,7 @@ export class BankrollEngine {
     text,
     isAgent = false,
     signature = null,
+    verified = false,
     onChainTxid = null,
     ts = Math.floor(Date.now() / 1000)
   }) {
@@ -1156,7 +1161,7 @@ export class BankrollEngine {
       throw new Error('Chat message cannot be empty');
     }
     const validAddr = isValidPoaAddress(address);
-    const verified = Boolean(onChainTxid || signature);
+    const reallyVerified = Boolean(verified && validAddr && signature);
     const msg = {
       id: `chat_${ts}_${Math.random().toString(36).slice(2, 8)}`,
       address: validAddr ? address : 'guest',
@@ -1166,7 +1171,8 @@ export class BankrollEngine {
       ),
       text: cleanText,
       isAgent: Boolean(isAgent),
-      verified,
+      verified: reallyVerified,
+      signature: reallyVerified ? signature : null,
       vipTier: validAddr ? this.getVipTierForAddress(address).tierName : 'Guest',
       onChainTxid: onChainTxid || null,
       ts
@@ -1506,7 +1512,9 @@ export class BankrollEngine {
       this.outboundQueue = raw.outboundQueue || [];
       this.betHistory = raw.betHistory || [];
       this.bankHistory = raw.bankHistory || [];
-      this.chatMessages = raw.chatMessages || [];
+      this.chatMessages = (raw.chatMessages || []).filter(
+        (m) => m && m.signature !== 'genesis_welcome_sig' && m.text
+      );
       if (raw.seedState) {
         this.seedManager = new SeedCommitManager(raw.seedState);
       }

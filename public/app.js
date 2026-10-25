@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * POA Dice — Interactive Frontend Controller (public/app.js)
  *
@@ -24,9 +25,21 @@ const state = {
   chatMessages: [],
   stakers: [],
   sseConnected: false,
+  rollAnimating: false,
+  hasRolled: false,
+  rollAnimFrame: 0,
 };
 
-const $ = (id) => document.getElementById(id);
+const $ = (id) => document.getElementById(id) || document.createElement('div');
+
+function api(path) {
+  if (typeof window === 'undefined') return path;
+  const host = window.location.hostname.toLowerCase();
+  const previewHosts = new Set(['preview.grok.genai.mil', 'preview.grok.mil', 'preview.grokgsac.com']);
+  if (!previewHosts.has(host)) return path;
+  const match = window.location.pathname.match(/^\/hds-[a-z0-9]+-\d+-[a-z0-9]+/i);
+  return match ? match[0] + path : path;
+}
 
 function shortAddr(addr) {
   if (!addr || addr.length < 18) return addr || 'poa1...';
@@ -53,54 +66,75 @@ function escapeHtml(str) {
 // ─── Wallet Management ───────────────────────────────────────────────────────
 
 async function initWallet(forceNew = false) {
-  if (!forceNew) {
-    try {
-      const saved = sessionStorage.getItem('poa_dice_session_wallet');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed && parsed.address && parsed._priv) {
-          state.wallet = { address: parsed.address, pubkey: parsed.pubkey };
-          state._demoPrivkey = parsed._priv;
-          renderWalletHeader();
-          return;
-        }
-      }
-    } catch {
-      // Ignore storage error
-    }
-  }
-
+  const cacheKey = 'poa_dice_dev_wallet';
   try {
-    const res = await fetch('/api/wallet/generate', { method: 'POST' });
+    const res = await fetch(api('/api/wallet/dev'), {
+      method: forceNew ? 'POST' : 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: forceNew ? JSON.stringify({ rotate: true }) : undefined,
+    });
     const data = await res.json();
-    if (data && data.address) {
+    if (data && data.address && data.privkey) {
       state.wallet = { address: data.address, pubkey: data.pubkey };
       state._demoPrivkey = data.privkey;
       try {
-        sessionStorage.setItem(
-          'poa_dice_session_wallet',
+        localStorage.setItem(
+          cacheKey,
           JSON.stringify({
             address: data.address,
             pubkey: data.pubkey,
             _priv: data.privkey,
+            source: data.source || 'dev-store',
           })
         );
       } catch {
         // Ignore storage error
       }
-      renderWalletHeader();
-      await fetchState();
-      await refreshAllQuotes();
+      renderWalletHeader(data.source || 'dev-store');
+      return;
     }
   } catch {
+    // Fall through to the last key this browser already pulled from dev.
+  }
+
+  try {
+    const saved = localStorage.getItem(cacheKey) || sessionStorage.getItem('poa_dice_session_wallet');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && parsed.address && parsed._priv) {
+        state.wallet = { address: parsed.address, pubkey: parsed.pubkey };
+        state._demoPrivkey = parsed._priv;
+        renderWalletHeader(parsed.source || 'local-cache');
+        return;
+      }
+    }
+  } catch {
+    // Ignore storage error
+  }
+  if ($('activeWalletAddr')) {
     $('activeWalletAddr').textContent = 'Offline Mode (Use Local ~/.poa/key CLI)';
   }
 }
 
-function renderWalletHeader() {
+function renderWalletHeader(source) {
   if (!state.wallet) return;
-  $('activeWalletAddr').textContent = state.wallet.address;
-  $('activeWalletAddr').title = `Ed25519 Self-Custody Address: ${state.wallet.address}`;
+  const el = document.getElementById('activeWalletAddr');
+  if (!el) return;
+  el.textContent = shortAddr(state.wallet.address);
+  const label =
+    source === 'env'
+      ? 'loaded from dev env'
+      : source === 'dev-store'
+        ? 'loaded from dev key store'
+        : source === 'generated'
+          ? 'new key saved to dev store'
+          : 'cached signer';
+  el.title = `Ed25519 self-custody address (${label}): ${state.wallet.address}`;
+  const header = document.querySelector('.wallet-header .metric-label');
+  if (header) {
+    header.textContent =
+      source === 'env' ? 'DEV ENV SIGNER' : source === 'generated' ? 'NEW DEV SIGNER' : 'DEV STORE SIGNER';
+  }
 }
 
 // ─── Slider & Visual Track Sync ──────────────────────────────────────────────
@@ -117,8 +151,15 @@ function updateSliderVisuals() {
   $('directionText').textContent = state.direction === 'under' ? 'Roll Under' : 'Roll Over';
   $('thresholdBadge').textContent =
     state.direction === 'under'
-      ? `ROLL UNDER ${(state.targetBps / 100).toFixed(2)} TO WIN`
-      : `ROLL OVER ${(state.targetBps / 100).toFixed(2)} TO WIN`;
+      ? `ROLL UNDER ${pct} TO WIN`
+      : `ROLL OVER ${pct} TO WIN`;
+
+  if (!state.rollAnimating && !state.hasRolled) {
+    const digits = $('rollDigits');
+    digits.textContent = pct;
+    digits.className = 'roll-digits';
+    $('rollStatusLabel').textContent = 'TARGET SET — SIGN & ROLL';
+  }
 
   const winBps = state.direction === 'under' ? state.targetBps : 9999 - state.targetBps;
   $('targetInput').value = (state.targetBps / 100).toFixed(2);
@@ -144,7 +185,7 @@ function updateOfflineCommandPreview() {
 async function fetchState() {
   try {
     const addr = state.wallet?.address || '';
-    const res = await fetch(`/api/state?address=${encodeURIComponent(addr)}`);
+    const res = await fetch(api(`/api/state?address=${encodeURIComponent(addr)}`));
     const data = await res.json();
     if (data && data.bankroll) {
       applyStateSnapshot(data);
@@ -161,6 +202,23 @@ function applyStateSnapshot(data) {
     $('topBankNav').textContent = `${formatNum(b.bankNavPoa, 4)} POA`;
     $('topBankAvail').textContent = `${formatNum(b.availableBankrollPoa, 4)} POA`;
     $('topKellyMax').textContent = `${formatNum(b.kellyMaxProfitPoa, 4)} POA`;
+  }
+  const chain = data.chain;
+  $('topBankChain').textContent = chain?.bank?.balance ? `Chain ${chain.bank.balance} POA` : 'Chain unavailable';
+  if (chain?.dev?.balance) {
+    $('topDevChain').textContent = `Chain ${chain.dev.balance} POA`;
+    $('topDevChain').title = `Live minepoa.com balance of ${chain.dev.address}. This is not vault fee accrual.`;
+  } else if ($('topDevChain')) {
+    $('topDevChain').textContent = 'Chain unavailable';
+  }
+  if ($('chainBalanceText')) {
+    $('chainBalanceText').textContent = chain?.player?.spendable
+      ? `Spendable ${chain.player.spendable} POA`
+      : 'Chain balance unavailable';
+  }
+  const sse = $('sseStatusText');
+  if (sse && chain) {
+    sse.textContent = chain.ok ? (state.sseConnected ? 'CHAIN LIVE' : 'CHAIN') : 'CHAIN DOWN';
   }
 
   if (data.devReserve) {
@@ -216,7 +274,7 @@ async function fetchBetQuote() {
       direction: state.direction,
       address,
     });
-    const res = await fetch(`/api/quote/bet?${qs.toString()}`);
+    const res = await fetch(api(`/api/quote/bet?${qs.toString()}`));
     const q = await res.json();
     state.lastBetQuote = q;
 
@@ -231,6 +289,9 @@ async function fetchBetQuote() {
 
     if (!q.valid) {
       alertEl.textContent = `⚠️ ${q.error}`;
+      alertEl.classList.remove('hidden');
+    } else if (state.summary?.chain?.ok && state.summary.chain.player?.spendable != null && Number(state.summary.chain.player.spendable) < Number(amountPoa)) {
+      alertEl.textContent = `On-chain spendable is ${state.summary.chain.player.spendable} POA. This key cannot cover ${amountPoa} POA.`;
       alertEl.classList.remove('hidden');
     } else {
       alertEl.classList.add('hidden');
@@ -259,7 +320,7 @@ async function fetchDepositQuote() {
       lockEpochs: String(lockEpochs),
       address: state.wallet?.address || '',
     });
-    const res = await fetch(`/api/quote/deposit?${qs.toString()}`);
+    const res = await fetch(api(`/api/quote/deposit?${qs.toString()}`));
     const q = await res.json();
     if (!q.valid) return;
     $('quoteSharesMinted').textContent = Number(q.sharesMinted).toLocaleString('en-US');
@@ -291,7 +352,7 @@ async function fetchWithdrawQuote() {
       mode: state.withdrawBps === 10000 ? 'ALL' : 'BPS',
       bpsToRedeem: String(state.withdrawBps),
     });
-    const res = await fetch(`/api/quote/withdraw?${qs.toString()}`);
+    const res = await fetch(api(`/api/quote/withdraw?${qs.toString()}`));
     const q = await res.json();
     if (!q.valid) {
       $('withdrawQuoteShares').textContent = '0 (No Active Position)';
@@ -337,6 +398,10 @@ function renderUserLpPosition(pos) {
 function renderStakersTable() {
   $('stakersCountBadge').textContent = `${state.stakers.length} Staker${state.stakers.length === 1 ? '' : 's'}`;
   const tbody = $('stakersTableBody');
+  if (state.stakers.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4">No deposits yet. The vault only counts signed deposits.</td></tr>';
+    return;
+  }
   tbody.innerHTML = state.stakers
     .map((s) => {
       const isMe = s.address === state.wallet?.address;
@@ -355,11 +420,55 @@ function renderStakersTable() {
     .join('');
 }
 
+function sigShort(sig) {
+  if (!sig || typeof sig !== 'string') return '';
+  if (sig.length <= 16) return sig;
+  return `${sig.slice(0, 8)}…${sig.slice(-6)}`;
+}
+
+function upsertBet(bet) {
+  if (!bet || !bet.betTxid) return;
+  const idx = state.recentBets.findIndex((b) => b.betTxid === bet.betTxid);
+  if (idx === -1) state.recentBets.unshift(bet);
+  else state.recentBets[idx] = { ...state.recentBets[idx], ...bet };
+}
+
+function renderInlineHistory() {
+  const list = $('inlineRollHistory');
+  const count = $('inlineHistoryCount');
+  if (!list) return;
+  const bets = state.recentBets.filter((b) => b && b.rollDisplay).slice(0, 8);
+  if (count) count.textContent = String(state.recentBets.filter((b) => b && b.rollDisplay).length);
+  if (state.rollAnimating) return;
+  if (bets.length === 0) {
+    list.innerHTML = '<li class="roll-card roll-card-empty">Signed rolls show up here as they land.</li>';
+    return;
+  }
+  list.innerHTML = bets
+    .map((b) => {
+      const sig = b.playerSig || '';
+      const cond = `${b.direction === 'under' ? 'Under' : 'Over'} ${b.targetDisplay || (b.targetBps / 100).toFixed(2)}`;
+      return `
+        <li class="roll-card ${b.won ? 'is-win' : 'is-loss'}" data-bet-txid="${escapeHtml(b.betTxid)}">
+          <div class="roll-card-num">${escapeHtml(b.rollDisplay)}</div>
+          <div class="roll-card-meta">
+            <strong>${b.won ? 'Win' : 'Loss'}</strong>
+            <span>${escapeHtml(cond)} · ${formatNum(b.wagerPoa, 2)} POA</span>
+            <span>${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</span>
+            <code class="roll-card-sig" title="${escapeHtml(sig || 'Signature missing')}">${sig ? 'Ed25519 ' + escapeHtml(sigShort(sig)) : 'Unsigned'}</code>
+          </div>
+        </li>
+      `;
+    })
+    .join('');
+}
+
 function renderLiveBetsTable() {
   $('betsCountBadge').textContent = String(state.recentBets.length);
   const tbody = $('liveBetsTableBody');
   if (state.recentBets.length === 0) {
     tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#8fa3c7;">No bets yet — click Sign &amp; Roll Dice to place the first provably fair roll!</td></tr>`;
+    renderInlineHistory();
     return;
   }
 
@@ -372,12 +481,17 @@ function renderLiveBetsTable() {
           <td><code>${escapeHtml(shortAddr(b.address))}</code></td>
           <td>${escapeHtml(cond)} (${escapeHtml(b.multiplierDisplay)})</td>
           <td>${formatNum(b.wagerPoa, 4)} POA</td>
-          <td class="${b.won ? 'bet-win-pill' : 'bet-loss-pill'}">${escapeHtml(b.rollDisplay)}</td>
+          <td class="${b.won ? 'bet-win-pill' : 'bet-loss-pill'}">
+            ${escapeHtml(b.rollDisplay)}
+            <code class="sig-mini" title="${escapeHtml(b.playerSig || '')}">${b.playerSig ? escapeHtml(sigShort(b.playerSig)) : '—'}</code>
+          </td>
           <td class="${b.won ? 'bet-win-pill' : ''}">${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</td>
         </tr>
       `;
     })
     .join('');
+
+  renderInlineHistory();
 
   tbody.querySelectorAll('tr[data-bet-txid]').forEach((row) => {
     row.addEventListener('click', () => {
@@ -399,6 +513,10 @@ function renderLiveBetsTable() {
 function renderChatMessages() {
   $('chatCountBadge').textContent = String(state.chatMessages.length);
   const list = $('chatMessagesList');
+  if (state.chatMessages.length === 0) {
+    list.innerHTML = '<div class="chat-msg"><div class="chat-text">No signed messages yet.</div></div>';
+    return;
+  }
   list.innerHTML = state.chatMessages
     .slice(-50)
     .map((m) => {
@@ -438,7 +556,7 @@ async function signAndRollSingle() {
     const memo = `DICE1:BET:${state.direction}:${state.targetBps}:${clientSeed}`;
     $('lastSignedMemoText').textContent = memo;
 
-    const res = await fetch('/api/action/sign-and-submit', {
+    const res = await fetch(api('/api/action/sign-and-submit'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -464,7 +582,8 @@ async function signAndRollSingle() {
       return receipt;
     }
 
-    animateRollResult(receipt);
+    if (data.signedTx?.body?.sig) receipt.playerSig = data.signedTx.body.sig;
+    await animateRollResult(receipt);
     await fetchState();
     await refreshAllQuotes();
     return receipt;
@@ -477,26 +596,102 @@ async function signAndRollSingle() {
   }
 }
 
-function animateRollResult(bet) {
-  if (!bet || typeof bet.rollBps !== 'number') return;
+function paintSettledRoll(bet) {
   const stage = $('rollStage');
   const digits = $('rollDigits');
   const statusLbl = $('rollStatusLabel');
   const pin = $('lastRollPin');
   const pinText = $('lastRollPinText');
-
   digits.textContent = bet.rollDisplay;
   digits.className = `roll-digits ${bet.won ? 'win-text' : 'loss-text'}`;
   stage.className = `roll-stage ${bet.won ? 'win-glow' : 'loss-glow'}`;
-
   statusLbl.textContent = bet.won
-    ? `🎉 YOU WON +${formatNum(bet.netPlayerDeltaPoa, 4)} POA (${bet.multiplierDisplay})!`
-    : `🎲 ROLLED ${bet.rollDisplay} — HOUSE BANK COLLECTS ${formatNum(bet.wagerPoa, 4)} POA`;
-
+    ? `YOU WON +${formatNum(bet.netPlayerDeltaPoa, 4)} POA (${bet.multiplierDisplay})`
+    : `ROLLED ${bet.rollDisplay} — HOUSE COLLECTS ${formatNum(bet.wagerPoa, 4)} POA`;
   const pct = Math.min(99, Math.max(1, bet.rollBps / 100));
   pin.style.left = `${pct}%`;
   pinText.textContent = bet.rollDisplay;
   pin.classList.remove('hidden');
+}
+
+function showLiveHistoryCard() {
+  const list = $('inlineRollHistory');
+  if (!list) return;
+  const empty = list.querySelector('.roll-card-empty');
+  if (empty) empty.remove();
+  const existing = document.getElementById('inlineLiveCard');
+  if (existing) existing.remove();
+  const card = document.createElement('li');
+  card.id = 'inlineLiveCard';
+  card.className = 'roll-card is-rolling';
+  card.innerHTML = `
+    <div class="roll-card-num" id="inlineLiveDigits">00.00</div>
+    <div class="roll-card-meta">
+      <strong>Rolling</strong>
+      <span>Signing the roll…</span>
+      <code class="roll-card-sig">Ed25519 …</code>
+    </div>
+  `;
+  list.prepend(card);
+}
+
+function animateRollResult(bet) {
+  return new Promise((resolve) => {
+    if (!bet || typeof bet.rollBps !== 'number') {
+      resolve();
+      return;
+    }
+    if (state.rollAnimFrame) cancelAnimationFrame(state.rollAnimFrame);
+    state.rollAnimating = true;
+    state.hasRolled = true;
+    showLiveHistoryCard();
+    const digits = $('rollDigits');
+    const liveDigits = () => document.getElementById('inlineLiveDigits');
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const finish = () => {
+      state.rollAnimating = false;
+      state.rollAnimFrame = 0;
+      paintSettledRoll(bet);
+      const live = liveDigits();
+      if (live) live.textContent = bet.rollDisplay;
+      upsertBet(bet);
+      renderInlineHistory();
+      renderLiveBetsTable();
+      resolve();
+    };
+    if (reduce) {
+      finish();
+      return;
+    }
+    $('rollStatusLabel').textContent = 'ROLLING…';
+    $('rollStage').className = 'roll-stage is-rolling';
+    const start = performance.now();
+    const step = (now) => {
+      if (!document.getElementById('rollDigits')) {
+        state.rollAnimating = false;
+        resolve();
+        return;
+      }
+      if (now - start < 1100) {
+        const spinning = (Math.floor(Math.random() * 10000) / 100).toFixed(2);
+        digits.textContent = spinning;
+        digits.className = 'roll-digits is-spinning';
+        const live = liveDigits();
+        if (live) live.textContent = spinning;
+        state.rollAnimFrame = requestAnimationFrame(step);
+      } else {
+        finish();
+      }
+    };
+    state.rollAnimFrame = requestAnimationFrame(step);
+  });
+}
+
+async function playRollSequence(receipts) {
+  for (const receipt of receipts) {
+    if (!receipt || typeof receipt.rollBps !== 'number') continue;
+    await animateRollResult(receipt);
+  }
 }
 
 async function runAgentBurst() {
@@ -506,7 +701,7 @@ async function runAgentBurst() {
   const origText = btn.textContent;
   try {
     btn.textContent = '🤖 Running 5-Roll Kelly Strategy...';
-    const res = await fetch('/api/action/auto-bet', {
+    const res = await fetch(api('/api/action/auto-bet'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -521,7 +716,7 @@ async function runAgentBurst() {
     });
     const data = await res.json();
     if (data.ok && Array.isArray(data.receipts) && data.receipts.length > 0) {
-      animateRollResult(data.receipts[data.receipts.length - 1]);
+      await playRollSequence(data.receipts);
       await fetchState();
       await refreshAllQuotes();
     }
@@ -538,7 +733,7 @@ async function submitBankDeposit() {
   const memo = `DICE1:LP_ADD:epochs=${lockEpochs}`;
   $('lastSignedMemoText').textContent = memo;
 
-  const res = await fetch('/api/action/sign-and-submit', {
+  const res = await fetch(api('/api/action/sign-and-submit'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -560,7 +755,7 @@ async function submitBankWithdraw() {
   const memo = state.withdrawBps === 10000 ? 'DICE1:LP_WITHDRAW:ALL' : `DICE1:LP_WITHDRAW:BPS=${state.withdrawBps}`;
   $('lastSignedMemoText').textContent = memo;
 
-  const res = await fetch('/api/action/sign-and-submit', {
+  const res = await fetch(api('/api/action/sign-and-submit'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -578,7 +773,7 @@ async function submitBankWithdraw() {
 }
 
 async function sweepDevReserve() {
-  const res = await fetch('/api/dev/sweep', { method: 'POST' });
+  const res = await fetch(api('/api/dev/sweep'), { method: 'POST' });
   const data = await res.json();
   if (data.ok) {
     await fetchState();
@@ -586,7 +781,7 @@ async function sweepDevReserve() {
 }
 
 async function advanceEpoch() {
-  const res = await fetch('/api/epoch/advance', {
+  const res = await fetch(api('/api/epoch/advance'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ distributeIncentives: true }),
@@ -599,7 +794,7 @@ async function advanceEpoch() {
 }
 
 async function rotateAndRevealSeed() {
-  const res = await fetch('/api/seed/rotate', { method: 'POST' });
+  const res = await fetch(api('/api/seed/rotate'), { method: 'POST' });
   const data = await res.json();
   if (data.ok && data.revealed) {
     $('verifyServerSeed').value = data.revealed.serverSeed;
@@ -631,7 +826,7 @@ async function runVerifyRoll() {
     $('verifyResultPre').textContent = 'Click "Rotate & Reveal Server Seed" first to reveal the plaintext server_seed.';
     return;
   }
-  const res = await fetch('/api/verify', {
+  const res = await fetch(api('/api/verify'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -642,14 +837,58 @@ async function runVerifyRoll() {
 
 // ─── Near Real-Time SSE Stream ───────────────────────────────────────────────
 
-function connectRealtimeStream() {
+let bootGeneration = 0;
+let eventSource = null;
+let pollTimer = null;
+
+export function stopPoaDice() {
+  bootGeneration += 1;
+  if (state.rollAnimFrame) {
+    cancelAnimationFrame(state.rollAnimFrame);
+    state.rollAnimFrame = 0;
+  }
+  state.rollAnimating = false;
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+export function bootPoaDice() {
+  const myGen = ++bootGeneration;
+  const alive = () => myGen === bootGeneration && !!document.getElementById('btnRollDice');
+  bindEvents();
+  updateSliderVisuals();
+  void (async () => {
+    if (!alive()) return;
+    await initWallet(false);
+    if (!alive()) return;
+    await fetchState();
+    if (!alive()) return;
+    await refreshAllQuotes();
+    if (!alive()) return;
+    connectRealtimeStream(alive);
+  })();
+}
+
+function connectRealtimeStream(alive) {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
   try {
-    const es = new EventSource('/api/stream');
-    es.onopen = () => {
+    eventSource = new EventSource(api('/api/stream'));
+    eventSource.onopen = () => {
       state.sseConnected = true;
-      $('sseStatusText').textContent = 'LIVE SSE';
+      const label = document.getElementById('sseStatusText');
+      if (label) label.textContent = 'LIVE SSE';
     };
-    es.onmessage = (ev) => {
+    eventSource.onmessage = (ev) => {
+      if (!alive()) return;
       try {
         const msg = JSON.parse(ev.data);
         handleRealtimeEvent(msg);
@@ -657,13 +896,24 @@ function connectRealtimeStream() {
         // Ignore malformed event
       }
     };
-    es.onerror = () => {
+    eventSource.onerror = () => {
       state.sseConnected = false;
-      $('sseStatusText').textContent = 'RECONNECTING';
+      const label = document.getElementById('sseStatusText');
+      if (label) label.textContent = 'RECONNECTING';
     };
   } catch {
-    $('sseStatusText').textContent = 'OFFLINE CLI';
+    const label = document.getElementById('sseStatusText');
+    if (label) label.textContent = 'OFFLINE CLI';
   }
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => {
+    if (!alive()) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      return;
+    }
+    void fetchState();
+  }, 4000);
 }
 
 function handleRealtimeEvent(msg) {
@@ -788,7 +1038,11 @@ function bindEvents() {
   $('btnRollDice').addEventListener('click', signAndRollSingle);
   $('btnAgentAutoBurst').addEventListener('click', runAgentBurst);
 
-  $('btnNewWallet').addEventListener('click', () => initWallet(true));
+  $('btnNewWallet').addEventListener('click', async () => {
+    await initWallet(true);
+    await fetchState();
+    await refreshAllQuotes();
+  });
   $('btnToggleOfflineMode').addEventListener('click', () => {
     $('offlineBanner').classList.toggle('hidden');
   });
@@ -848,7 +1102,7 @@ function bindEvents() {
     const isAgent = $('chatIsAgentCheck').checked;
 
     textInput.value = '';
-    await fetch('/api/chat', {
+    await fetch(api('/api/chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -865,14 +1119,3 @@ function bindEvents() {
   $('btnRotateSeed').addEventListener('click', rotateAndRevealSeed);
   $('btnRunVerify').addEventListener('click', runVerifyRoll);
 }
-
-// ─── Boot ────────────────────────────────────────────────────────────────────
-
-window.addEventListener('DOMContentLoaded', async () => {
-  bindEvents();
-  updateSliderVisuals();
-  await initWallet(false);
-  await fetchState();
-  await refreshAllQuotes();
-  connectRealtimeStream();
-});

@@ -80,6 +80,9 @@ To prevent the ERC-4626 **first-depositor / donation inflation attack**, `poa-di
 # 1. Start the POA Dice Web UI + Near Real-Time SSE + Streamable HTTP MCP Server
 npm start
 # Open http://127.0.0.1:3080
+# The web server does not invent a bankroll or a welcome message.
+# It reads live balances from minepoa.com and refuses a bet the signer cannot cover.
+# Tests still pass an explicit local bankroll. Set POA_DICE_BOOTSTRAP_POA only if you intend a local seed.
 
 # 2. Run the Full Unit, Edge-Case, E2E, Python & Smoke Test Suite
 npm run test:all

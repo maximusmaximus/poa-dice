@@ -11,10 +11,12 @@ import { fileURLToPath } from 'node:url';
 import {
   buildSignedTransfer,
   formatDiceMemo,
+  fromMicros,
   genKeypair,
   isValidPoaAddress,
   redactSecrets,
   signRaw,
+  toMicros,
   verifyRaw,
   walletFromPrivkey
 } from './crypto-poa.mjs';
@@ -22,6 +24,14 @@ import { verifyRoll } from './provably-fair.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
 import { MCP_TOOLS, McpHandler } from './mcp-server.mjs';
+import {
+  fetchExplorerAddress,
+  formatMicros,
+  loadDebits,
+  rememberDebit,
+  saveDebits,
+  spendableMicros
+} from './chain-feed.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
@@ -78,7 +88,10 @@ export function createDiceServer(options = {}) {
     options.engine ||
     new BankrollEngine({
       dataDir,
-      initialBootstrapPoa: options.initialBootstrapPoa ?? '250000.000000',
+      initialBootstrapPoa:
+        options.initialBootstrapPoa !== undefined
+          ? options.initialBootstrapPoa
+          : process.env.POA_DICE_BOOTSTRAP_POA || null,
       bootstrapAddress: DEV_RESERVE_ADDRESS
     });
 
@@ -91,16 +104,47 @@ export function createDiceServer(options = {}) {
 
   const mcpHandler = new McpHandler({ engine, watcher });
   const sseClients = new Set();
+  const requireChain = watcher.mode !== 'simulated';
+  const chainCache = new Map();
+  let chainDebits = dataDir ? loadDebits(dataDir) : [];
 
-  // Seed initial welcome chat if empty
-  if (engine.chatMessages.length === 0) {
-    engine.postChatMessage({
-      address: DEV_RESERVE_ADDRESS,
-      senderName: 'Tessellate Army (House)',
-      text: 'Welcome to POA Dice! Provably fair HMAC-SHA256 rolls, ERC-4626 shared bankroll staking, full MCP service, and 100% on-chain DICE1:* memo support.',
-      isAgent: true,
-      signature: 'genesis_welcome_sig'
+  async function cachedExplorer(address) {
+    const hit = chainCache.get(address);
+    if (hit && Date.now() - hit.at < 15000) return hit.row;
+    const row = await fetchExplorerAddress(watcher.nodeUrl, address);
+    chainCache.set(address, { at: Date.now(), row });
+    return row;
+  }
+
+  async function assertChainSpendable(address, amountPoa) {
+    if (!requireChain) return;
+    let row;
+    try {
+      row = await cachedExplorer(address);
+    } catch (err) {
+      const error = new Error('minepoa.com balance is unavailable. This action was not booked.');
+      error.status = 503;
+      throw error;
+    }
+    const have = spendableMicros(row.balance, chainDebits, address);
+    const need = toMicros(amountPoa);
+    if (have < need) {
+      const error = new Error(
+        `On-chain spendable balance is ${formatMicros(have)} POA. This signer does not hold ${amountPoa} POA, so nothing was booked.`
+      );
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  function noteChainDebit(address, txid, amountPoa) {
+    if (!requireChain || !txid) return;
+    chainDebits = rememberDebit(chainDebits, {
+      txid,
+      address,
+      amountMicros: toMicros(amountPoa).toString()
     });
+    if (dataDir) saveDebits(dataDir, chainDebits);
   }
 
   // Broadcast every engine event over SSE in near real-time (<10ms)
@@ -176,7 +220,37 @@ export function createDiceServer(options = {}) {
       // 3. Full State Summary & Deterministic Invariant Audit
       if ((pathname === '/api/state' || pathname === '/api/status') && req.method === 'GET') {
         const address = urlObj.searchParams.get('address') || '';
-        return sendJson(res, 200, engine.getStateSummary(address));
+        const summary = engine.getStateSummary(address);
+        if (requireChain) {
+          try {
+            const bank = await cachedExplorer(engine.bankAddress);
+            const dev = await cachedExplorer(DEV_RESERVE_ADDRESS);
+            let player = null;
+            if (address && isValidPoaAddress(address)) {
+              const row = await cachedExplorer(address);
+              player = {
+                address: row.address,
+                balance: row.balance,
+                spendable: formatMicros(spendableMicros(row.balance, chainDebits, row.address))
+              };
+            }
+            summary.chain = {
+              ok: true,
+              node: watcher.nodeUrl,
+              bank: { address: bank.address, balance: bank.balance },
+              dev: { address: dev.address, balance: dev.balance },
+              player,
+              error: null
+            };
+          } catch (err) {
+            summary.chain = {
+              ok: false,
+              node: watcher.nodeUrl,
+              error: redactSecrets(err.message || 'chain unavailable')
+            };
+          }
+        }
+        return sendJson(res, 200, summary);
       }
 
       if (pathname === '/api/audit' && req.method === 'GET') {
@@ -254,6 +328,9 @@ export function createDiceServer(options = {}) {
           action === 'LP_WITHDRAW' || action === 'CHAT' || action === 'CLAIM'
             ? '0.000001'
             : String(body.amountPoa || '10.000000');
+        if (action === 'BET' || action === 'LP_ADD') {
+          await assertChainSpendable(wallet.address, amount);
+        }
         const signedTx = buildSignedTransfer({
           wallet,
           to: engine.bankAddress,
@@ -262,6 +339,9 @@ export function createDiceServer(options = {}) {
           nonce: Number(body.nonce || Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000))
         });
         const receipt = watcher.processSignedTransaction(signedTx);
+        if ((action === 'BET' || action === 'LP_ADD') && (receipt?.action === 'BET_SETTLED' || receipt?.action === 'LP_DEPOSIT')) {
+          noteChainDebit(wallet.address, signedTx.id, amount);
+        }
         return sendJson(res, 200, {
           ok: true,
           signerAddress: wallet.address,
@@ -273,17 +353,23 @@ export function createDiceServer(options = {}) {
       if (pathname === '/api/action/auto-bet' && req.method === 'POST') {
         const body = await readJsonBody(req);
         const wallet = body.privkey ? walletFromPrivkey(body.privkey) : genKeypair();
+        const rolls = Math.max(1, Math.min(25, Number(body.rolls ?? 5)));
+        const each = String(body.baseWagerPoa || body.amountPoa || '10.000000');
+        await assertChainSpendable(wallet.address, fromMicros(toMicros(each) * BigInt(rolls)));
         const result = watcher.executeAutoStrategy({
           wallet,
           strategy: body.strategy || 'quarter_kelly',
-          baseWagerPoa: body.baseWagerPoa || body.amountPoa || '10.000000',
+          baseWagerPoa: each,
           targetBps: Number(body.targetBps ?? 4950),
           direction: body.direction || 'under',
-          rolls: Number(body.rolls ?? 5),
+          rolls,
           clientSeed: body.clientSeed || 'web-auto-strategy',
           stopOnProfitPoa: body.stopOnProfitPoa || null,
           stopOnLossPoa: body.stopOnLossPoa || null
         });
+        for (const receipt of result.receipts || []) {
+          if (receipt?.betTxid && receipt.wagerPoa) noteChainDebit(wallet.address, receipt.betTxid, receipt.wagerPoa);
+        }
         return sendJson(res, 200, result);
       }
 
@@ -345,7 +431,8 @@ export function createDiceServer(options = {}) {
           senderName: body.senderName || body.sender_name || '',
           text: body.text || '',
           isAgent: Boolean(body.isAgent || body.is_agent),
-          signature: verified ? sig : null
+          signature: verified ? sig : null,
+          verified
         });
         return sendJson(res, 200, { ok: true, message: msg });
       }
@@ -390,7 +477,7 @@ export function createDiceServer(options = {}) {
 
       return sendJson(res, 404, { error: `Route not found: ${pathname}` });
     } catch (err) {
-      return sendJson(res, 400, {
+      return sendJson(res, err.status || 400, {
         ok: false,
         error: redactSecrets(err.message || 'Bad request')
       });
@@ -436,7 +523,11 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 if (isMain) {
   const port = Number(process.env.PORT || 3080);
   const host = process.env.HOST || '127.0.0.1';
-  const app = createDiceServer();
+  const app = createDiceServer({
+    watcherMode: process.env.POA_DICE_WATCHER_MODE || 'hybrid',
+    initialBootstrapPoa: process.env.POA_DICE_BOOTSTRAP_POA || null
+  });
+  if (app.watcher.mode !== 'simulated') app.watcher.startPolling(20000);
   app.listen(port, host).then((info) => {
     console.log(`POA Dice & Bankroll Vault live at ${info.url}`);
     console.log(`  MCP Endpoint : ${info.url}/mcp`);
