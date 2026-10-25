@@ -584,6 +584,21 @@ node bin/poa-dice-replay.mjs</pre>
     </p>
   </footer>
 
+  <!-- Stake lock-up confirmation (shown before the stake prompt is copied) -->
+  <div id="stakeConfirm" class="modal-overlay hidden" data-variant="lock">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="stakeConfirmTitle" aria-describedby="stakeConfirmBody" tabindex="-1">
+      <div id="stakeConfirmIcon" class="modal-icon" aria-hidden="true">&#128274;</div>
+      <h2 id="stakeConfirmTitle" class="modal-title">Your POA will be locked</h2>
+      <p id="stakeConfirmAmount" class="modal-amount"></p>
+      <dl id="stakeConfirmFacts" class="modal-facts"></dl>
+      <div id="stakeConfirmBody" class="modal-body"></div>
+      <div class="modal-actions">
+        <button type="button" id="stakeConfirmCancel" class="btn-modal-secondary">Cancel</button>
+        <button type="button" id="stakeConfirmOk" class="btn-action-emerald btn-modal-primary">I understand, copy stake prompt</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="/app.js"></script>
 </body>
 </html>
