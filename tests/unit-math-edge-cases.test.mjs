@@ -50,7 +50,8 @@ test('Edge Case 1 & 2: Deposit -> % of Bank -> Redeemable Return & Virtual-Offse
   assert.equal(quote.projections.length, 5);
   // At +0% bank growth, Alice gets back ~25,000 POA; at +100% bank growth (bank doubles), Alice gets ~50,000 POA
   assert.equal(quote.projections[0].projectedPositionValuePoa, '25000.000000');
-  assert.equal(quote.projections[4].projectedPositionValuePoa, '49999.800001');
+  // Exact NAV * shares / totalShares (no virtual-offset drift): bank doubles -> exactly 50,000 POA
+  assert.equal(quote.projections[4].projectedPositionValuePoa, '50000.000000');
 
   // Execute deposit
   const depReceipt = engine.applyDeposit({

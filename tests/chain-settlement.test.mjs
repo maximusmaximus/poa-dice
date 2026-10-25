@@ -204,7 +204,10 @@ test('round trip: stake 10 POA (lock 0) -> confirmed -> withdraw 100% -> payout 
     console.log(`# round trip: deposit ${depositTxid.slice(0, 12)}…, payout ${payoutTxid.slice(0, 12)}… net ${wq.netPayoutPoa} POA (fee ${wq.earlyExitFeePoa}), player ${mock.balanceOf(player.address)} POA`);
     // secrets never leak into state, health, settlement or files
     for (const p of ['/api/state', '/api/health', '/api/settlement']) assert.ok(!(await (await fetch(srv.url + p)).text()).includes(bank.privkey));
-    for (const f of fs.readdirSync(dataDir)) assert.ok(!fs.readFileSync(path.join(dataDir, f), 'utf8').includes(bank.privkey), f);
+    for (const f of fs.readdirSync(dataDir, { recursive: true })) {
+      const fp = path.join(dataDir, f);
+      if (fs.statSync(fp).isFile()) assert.ok(!fs.readFileSync(fp, 'utf8').includes(bank.privkey), f);
+    }
   } finally {
     await srv.close();
     await mock.close();

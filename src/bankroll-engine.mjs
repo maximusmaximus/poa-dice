@@ -29,7 +29,7 @@ import {
   sha256hex,
   toMicros
 } from './crypto-poa.mjs';
-import { SeedCommitManager, computeRoll, evaluateRoll, validateTarget } from './provably-fair.mjs';
+import { SeedCommitManager, computeRoll, evaluateRoll, validateTarget, hashServerSeed } from './provably-fair.mjs';
 
 export const DEV_RESERVE_ADDRESS = 'poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U';
 export const DEFAULT_BANK_ADDRESS = 'poa1BankVaultTessellateArmyDicePool1111111111111';
@@ -98,6 +98,9 @@ export class BankrollEngine {
     this.bankHistory = []; // Recent LP deposits/withdrawals/incentives
     this.chatMessages = []; // Verified human + agent chat messages
     this.batchReservations = new Map(); // batchId -> reserved bank exposure (micros), transient
+    // betTxid -> settlement ticket claimed in the shared store (transient). When present, settleBet
+    // uses the ticket's nonce / seed / roll instead of computing its own, so every instance agrees.
+    this.settlementTickets = new Map();
     this._deferSave = false; // batch execution writes state once at the end
 
     this.seedManager = new SeedCommitManager(options.seedState || null);
@@ -186,15 +189,27 @@ export class BankrollEngine {
     return true;
   }
 
+  /**
+   * Shares minted for a deposit. While real shares and real NAV exist, mint at the real price
+   * (totalShares / NAV, rounded down, so existing LPs are never diluted). The virtual offset is used
+   * only to price the first deposit (or a fully drained bank), which is what it is for.
+   */
   sharesForDepositMicros(depositMicros) {
     const d = BigInt(depositMicros);
     if (d <= 0n) return 0n;
+    if (this.totalShares > 0n && this.bankNavMicros > 0n) return (d * this.totalShares) / this.bankNavMicros;
     return (d * this.effectiveTotalShares) / this.effectiveBankMicros;
   }
 
+  /**
+   * POA value of LP shares: exactly NAV * shares / totalShares, rounded down. The sum over all LPs can
+   * never exceed NAV (the old virtual-offset formula overstated value whenever the share price fell
+   * below its initial 1.0, e.g. 9.960359 for a 9.956395 NAV after one player win).
+   */
   microsForShares(shares) {
     const s = BigInt(shares);
     if (s <= 0n) return 0n;
+    if (this.totalShares > 0n) return (s * this.bankNavMicros) / this.totalShares;
     return (s * this.effectiveBankMicros) / this.effectiveTotalShares;
   }
 
@@ -275,13 +290,13 @@ export class BankrollEngine {
     const ownershipOfLpPct = newTotalShares > 0n ? Number((newAddressShares * 1000000n) / newTotalShares) / 10000 : 0;
     const ownershipEffectivePct = Number((newAddressShares * 1000000n) / newEffectiveTotalShares) / 10000;
 
-    // Immediate redemption value if redeemed right after deposit (before exit fee)
-    const immediateRedeemableMicros = (newAddressShares * newEffectiveBankMicros) / newEffectiveTotalShares;
+    // Immediate redemption value if redeemed right after deposit (before exit fee): NAV * shares / total
+    const immediateRedeemableMicros = (newAddressShares * newBankNavMicros) / newTotalShares;
 
     // Projected redemption value at various bankroll growth levels (+0%, +10%, +25%, +50%, +100%)
     const projections = [0, 10, 25, 50, 100].map((growthPct) => {
-      const projectedBank = newEffectiveBankMicros + (newBankNavMicros * BigInt(growthPct)) / 100n;
-      const projectedValueMicros = (newAddressShares * projectedBank) / newEffectiveTotalShares;
+      const projectedBank = newBankNavMicros + (newBankNavMicros * BigInt(growthPct)) / 100n;
+      const projectedValueMicros = (newAddressShares * projectedBank) / newTotalShares;
       const netGainMicros =
         projectedValueMicros > (existingPos ? existingPos.netInvestedMicros : 0n) + amountMicros
           ? projectedValueMicros - ((existingPos ? existingPos.netInvestedMicros : 0n) + amountMicros)
@@ -843,6 +858,57 @@ export class BankrollEngine {
     return { status: 'LOCKED', ...lockedBet };
   }
 
+  /**
+   * Deterministic settlement ticket for a bet: the nonce, seed epoch and roll are fixed here, from the
+   * active committed seed. In chain mode the ticket is claimed atomically in the shared store before
+   * settling, so a second instance settling the same bet adopts the first ticket instead of re-rolling.
+   */
+  prepareBetTicket({ betTxid, address, clientSeed = 'default', targetBps, direction }) {
+    const cleanSeed = sanitizeUntrustedText(clientSeed || this.playerClientSeeds.get(address) || 'default', 64);
+    const nonce = (this.playerNonces.get(address) || 0) + 1;
+    const roll = computeRoll({ serverSeed: this.seedManager.currentSeed, clientSeed: cleanSeed, nonce, betTxid });
+    const outcome = evaluateRoll({ rollBps: roll.rollBps, targetBps: Number(targetBps), direction });
+    return {
+      v: 1,
+      betTxid,
+      address,
+      clientSeed: cleanSeed,
+      nonce,
+      seedEpochId: this.seedManager.epochId,
+      serverSeedHash: this.seedManager.currentSeedHash,
+      targetBps: outcome.targetBps,
+      direction: outcome.direction,
+      rollBps: roll.rollBps,
+      rollDisplay: roll.rollDisplay,
+      won: outcome.won,
+      message: roll.message,
+      hmacHex: roll.hmacHex
+    };
+  }
+
+  /** Seed record shared across instances (claimed per epoch in the store). */
+  seedRecord() {
+    return {
+      epochId: this.seedManager.epochId,
+      currentSeed: this.seedManager.currentSeed,
+      nextSeed: this.seedManager.nextSeed,
+      createdAt: this.seedManager.createdAt
+    };
+  }
+
+  /** Adopt the seed pair another instance committed first for this epoch. Returns true if it changed. */
+  adoptSeedRecord(rec) {
+    if (!rec || !rec.currentSeed || Number(rec.epochId) !== Number(this.seedManager.epochId)) return false;
+    if (rec.currentSeed === this.seedManager.currentSeed && rec.nextSeed === this.seedManager.nextSeed) return false;
+    const sm = this.seedManager;
+    sm.currentSeed = rec.currentSeed;
+    sm.currentSeedHash = hashServerSeed(rec.currentSeed);
+    sm.nextSeed = rec.nextSeed || sm.nextSeed;
+    sm.nextSeedHash = hashServerSeed(sm.nextSeed);
+    if (rec.createdAt) sm.createdAt = rec.createdAt;
+    return true;
+  }
+
   settleBet(betTxid, ts = Math.floor(Date.now() / 1000)) {
     if (this.processedTxids.has(betTxid)) {
       return { idempotent: true, ...this.processedTxids.get(betTxid) };
@@ -856,19 +922,35 @@ export class BankrollEngine {
     this.lockedCollateralMicros -= locked.lockAmountMicros;
     this.inFlightBets.delete(betTxid);
 
-    // 2. Increment player's provably-fair nonce and compute roll
-    const nextNonce = (this.playerNonces.get(locked.address) || 0) + 1;
-    this.playerNonces.set(locked.address, nextNonce);
+    // 2. Fix the provably-fair inputs. If a settlement ticket was claimed for this bet in the shared
+    //    store (chain mode), it is authoritative: its nonce, seed epoch and roll were fixed when the bet
+    //    was first booked, by whichever instance got there first. Otherwise compute the ticket here.
+    const claimed = this.settlementTickets.get(betTxid) || null;
+    this.settlementTickets.delete(betTxid);
+    let ticket = claimed;
+    if (ticket && (ticket.address !== locked.address || Number(ticket.targetBps) !== Number(locked.targetBps) || ticket.direction !== locked.direction)) {
+      throw new Error(`Settlement ticket for ${betTxid} does not match the locked bet; refusing to settle`);
+    }
+    if (!ticket) {
+      ticket = this.prepareBetTicket({
+        betTxid,
+        address: locked.address,
+        clientSeed: locked.clientSeed,
+        targetBps: locked.targetBps,
+        direction: locked.direction
+      });
+    }
+    const nextNonce = Number(ticket.nonce);
+    this.playerNonces.set(locked.address, Math.max(this.playerNonces.get(locked.address) || 0, nextNonce));
     this.seedManager.betsCount += 1;
 
-    const serverSeed = this.seedManager.currentSeed;
-    const serverSeedHash = this.seedManager.currentSeedHash;
-    const roll = computeRoll({
-      serverSeed,
-      clientSeed: locked.clientSeed,
-      nonce: nextNonce,
-      betTxid
-    });
+    const serverSeedHash = ticket.serverSeedHash;
+    const roll = {
+      rollBps: Number(ticket.rollBps),
+      rollDisplay: ticket.rollDisplay,
+      message: ticket.message,
+      hmacHex: ticket.hmacHex
+    };
     const outcome = evaluateRoll({
       rollBps: roll.rollBps,
       targetBps: locked.targetBps,
@@ -944,9 +1026,9 @@ export class BankrollEngine {
       availableBankrollPoa: fromMicros(this.availableBankrollMicros),
       payoutOrderId,
       provablyFair: {
-        seedEpochId: this.seedManager.epochId,
+        seedEpochId: ticket.seedEpochId,
         serverSeedHash,
-        clientSeed: locked.clientSeed,
+        clientSeed: ticket.clientSeed,
         nonce: nextNonce,
         betTxid,
         message: roll.message,

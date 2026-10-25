@@ -2,8 +2,17 @@
 /**
  * settlement-store.mjs: durable JSON document store for the vault (settlement queue + engine snapshot).
  *
- * Adapter interface:  { kind, location, durable, load(): doc|null|Promise, save(doc): void|Promise }
+ * Adapter interface:  { kind, location, durable, load(): doc|null|Promise, save(doc): void|Promise,
+ *                      claim(key, value): {claimed, value}|Promise }
  *   save must be durable when it returns / resolves.
+ *   claim is an atomic insert-if-absent shared by every server instance using the same store:
+ *   the first caller stores `value` and gets {claimed:true, value}; every later caller (any instance)
+ *   gets {claimed:false, value:<the first value>}. It is what makes a bet settle exactly once
+ *   (one roll, one payout note) and a payout get signed exactly once, even when two serverless
+ *   instances hold their own copy of the vault document at the same time.
+ *
+ * - postgres: DATABASE_URL / POSTGRES_URL (Vercel Postgres, Neon, Supabase...). Document in
+ *   poa_dice_docs, claims in poa_dice_claims via INSERT ... ON CONFLICT DO NOTHING.
  *
  * - redis (Upstash REST / Vercel KV): the right choice on serverless or container hosts whose disk
  *   and memory are recycled. Env: KV_REST_API_URL + KV_REST_API_TOKEN (Vercel KV / Upstash
@@ -40,13 +49,46 @@ export function createFileStore(dir, name = 'settlement.json') {
         fs.closeSync(fd);
       }
       fs.renameSync(tmp, file);
+    },
+    claim(key, value) {
+      const cdir = path.join(dir, 'claims');
+      fs.mkdirSync(cdir, { recursive: true });
+      const f = path.join(cdir, `${claimFileName(key)}.json`);
+      try {
+        const fd = fs.openSync(f, 'wx'); // O_CREAT|O_EXCL: atomic insert-if-absent
+        try {
+          fs.writeSync(fd, JSON.stringify(value));
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        return { claimed: true, value: JSON.parse(JSON.stringify(value)) };
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+        return { claimed: false, value: JSON.parse(fs.readFileSync(f, 'utf8')) };
+      }
     }
   };
 }
 
-export function createMemoryStore(initial = null) {
+function claimFileName(key) {
+  return String(key).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 200);
+}
+
+/** Claims table shared by every memory store built with it (tests use it to simulate two instances). */
+export function createClaimTable() {
+  return new Map();
+}
+
+export function createMemoryStore(initial = null, { claims = createClaimTable() } = {}) {
   let doc = initial ? JSON.parse(JSON.stringify(initial)) : null;
   return {
+    claims,
+    claim(key, value) {
+      if (claims.has(key)) return { claimed: false, value: JSON.parse(claims.get(key)) };
+      claims.set(key, JSON.stringify(value));
+      return { claimed: true, value: JSON.parse(JSON.stringify(value)) };
+    },
     kind: 'memory',
     location: 'memory',
     durable: true,
@@ -108,17 +150,87 @@ export function createRedisRestStore({ url, token, key, fetchImpl = globalThis.f
     },
     async save(doc) {
       await call(['SET', key, JSON.stringify(doc)]);
+    },
+    async claim(claimKey, value) {
+      const k = `${key}:claim:${claimKey}`;
+      const ok = await call(['SET', k, JSON.stringify(value), 'NX']);
+      if (ok === 'OK') return { claimed: true, value: JSON.parse(JSON.stringify(value)) };
+      const raw = await call(['GET', k]);
+      if (!raw) throw new Error(`KV claim ${claimKey}: SET NX refused but no value stored`);
+      return { claimed: false, value: JSON.parse(raw) };
+    }
+  };
+}
+
+/**
+ * Postgres adapter. `query(text, params)` -> { rows } (defaults to a lazily created node-postgres Pool).
+ * The vault document lives in poa_dice_docs; claims in poa_dice_claims (primary key = claim key), so
+ * INSERT ... ON CONFLICT DO NOTHING RETURNING is the atomic arbiter across instances.
+ */
+export function createPostgresStore({ connectionString, key, query = null }) {
+  if (!query && !connectionString) throw new Error('Postgres store needs a connection string');
+  let pool = null;
+  let ready = null;
+  const q = async (text, params) => {
+    if (query) return query(text, params);
+    if (!pool) {
+      const pg = await import('pg');
+      const Pool = pg.Pool || pg.default.Pool;
+      pool = new Pool({ connectionString, max: 3, ssl: /sslmode=disable|localhost|127\.0\.0\.1/.test(connectionString) ? false : { rejectUnauthorized: false } });
+    }
+    return pool.query(text, params);
+  };
+  const init = () => {
+    if (!ready) {
+      ready = (async () => {
+        await q('CREATE TABLE IF NOT EXISTS poa_dice_docs (key TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+        await q('CREATE TABLE IF NOT EXISTS poa_dice_claims (key TEXT PRIMARY KEY, value JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+      })();
+      ready.catch(() => {
+        ready = null;
+      });
+    }
+    return ready;
+  };
+  return {
+    kind: 'postgres',
+    async: true,
+    location: `postgres#${key}`,
+    durable: true,
+    async load() {
+      await init();
+      const r = await q('SELECT doc FROM poa_dice_docs WHERE key = $1', [key]);
+      return r.rows[0] ? (typeof r.rows[0].doc === 'string' ? JSON.parse(r.rows[0].doc) : r.rows[0].doc) : null;
+    },
+    async save(doc) {
+      await init();
+      await q('INSERT INTO poa_dice_docs (key, doc, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()', [key, JSON.stringify(doc)]);
+    },
+    async claim(claimKey, value) {
+      await init();
+      const k = `${key}:${claimKey}`;
+      const ins = await q('INSERT INTO poa_dice_claims (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO NOTHING RETURNING value', [k, JSON.stringify(value)]);
+      if (ins.rows.length) return { claimed: true, value: JSON.parse(JSON.stringify(value)) };
+      const r = await q('SELECT value FROM poa_dice_claims WHERE key = $1', [k]);
+      if (!r.rows[0]) throw new Error(`Postgres claim ${claimKey}: conflict but no row`);
+      const v = r.rows[0].value;
+      return { claimed: false, value: typeof v === 'string' ? JSON.parse(v) : v };
     }
   };
 }
 
 /**
  * Pick the vault store for this host.
+ *   env.POA_DICE_DATABASE_URL / DATABASE_URL / POSTGRES_URL -> postgres (durable)
  *   env.KV_REST_API_URL/KV_REST_API_TOKEN or UPSTASH_REDIS_REST_URL/_TOKEN -> redis (durable)
  *   explicit persistent data dir (POA_DICE_DATA_DIR, or options.dataDirIsPersistent) on a non-Vercel host -> file (durable)
  *   otherwise a writable dir -> file marked durable:false (ephemeral)
  */
 export function resolveStore({ env = process.env, dataDir, dataDirIsPersistent = false, keyPrefix = 'poa-dice', bankAddress = 'bank', fetchImpl } = {}) {
+  const pgUrl = env.POA_DICE_DATABASE_URL || env.DATABASE_URL || env.POSTGRES_URL;
+  if (pgUrl) {
+    return createPostgresStore({ connectionString: pgUrl, key: `${env.POA_DICE_KV_KEY || keyPrefix}:${bankAddress}:vault` });
+  }
   const url = env.KV_REST_API_URL || env.UPSTASH_REDIS_REST_URL;
   const token = env.KV_REST_API_TOKEN || env.UPSTASH_REDIS_REST_TOKEN;
   if (url && token) {
@@ -142,7 +254,7 @@ export function resolveStore({ env = process.env, dataDir, dataDirIsPersistent =
 export class PersistQueue {
   constructor(store) {
     this.store = store;
-    this.async = store.async === true || store.kind === 'redis';
+    this.async = store.async === true || store.kind === 'redis' || store.kind === 'postgres';
     this._chain = Promise.resolve();
     this._pending = null;
     this._error = null;
@@ -174,6 +286,12 @@ export class PersistQueue {
         if (this._pending === null) this._pending = next; // retried by the next save()/flush()
       }
     });
+  }
+
+  /** Atomic insert-if-absent across instances (see adapter docs). Always returns a promise. */
+  async claim(key, value) {
+    if (typeof this.store.claim !== 'function') return { claimed: true, value, local: true };
+    return this.store.claim(key, value);
   }
 
   /** Resolves once every save() so far is durable; rejects if the store is failing. */

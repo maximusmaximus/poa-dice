@@ -65,9 +65,10 @@ async function startFakeKv() {
       failNext -= 1;
       return send(500, { error: 'kv down' });
     }
-    const [cmd, key, val] = JSON.parse(raw);
+    const [cmd, key, val, flag] = JSON.parse(raw);
     if (cmd === 'GET') return send(200, { result: data.has(key) ? data.get(key) : null });
     if (cmd === 'SET') {
+      if (flag === 'NX' && data.has(key)) return send(200, { result: null });
       data.set(key, val);
       return send(200, { result: 'OK' });
     }

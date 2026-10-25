@@ -303,14 +303,24 @@ export function createDiceServer(options = {}) {
     if (dataDir) saveDebits(dataDir, chainDebits);
   }
 
-  // Broadcast every engine event over SSE in near real-time (<10ms)
+  // Broadcast every engine event over SSE in near real-time (<10ms).
+  // Exactly ONE frame per event: `id:` carries the event id (browsers expose it as lastEventId) and the
+  // event type travels inside the JSON, so EventSource.onmessage, curl and agents all see it once.
+  // (Previously each event was written twice: a named `event:` frame plus a generic copy.)
+  // A bounded id set also drops an event that is published twice (e.g. re-emitted after a reload).
+  const sentEventIds = new Set();
+  const sentEventOrder = [];
   engine.onEvent((evt) => {
-    const frame = `event: ${evt.type}\ndata: ${JSON.stringify(evt)}\n\n`;
-    const genericFrame = `data: ${JSON.stringify(evt)}\n\n`;
+    if (evt && evt.id) {
+      if (sentEventIds.has(evt.id)) return;
+      sentEventIds.add(evt.id);
+      sentEventOrder.push(evt.id);
+      if (sentEventOrder.length > 2000) sentEventIds.delete(sentEventOrder.shift());
+    }
+    const frame = sseFrame(evt);
     for (const client of sseClients) {
       try {
         client.write(frame);
-        client.write(genericFrame);
       } catch {
         sseClients.delete(client);
       }
@@ -838,4 +848,10 @@ if (isMain) {
     console.log(`  Dev Reserve  : ${DEV_RESERVE_ADDRESS} (0.1% reserved)`);
   });
   });
+}
+
+/** One SSE frame per event (id line + JSON data line). */
+export function sseFrame(evt) {
+  const id = evt && evt.id ? `id: ${String(evt.id).replace(/[\r\n]/g, '')}\n` : '';
+  return `${id}data: ${JSON.stringify(evt)}\n\n`;
 }
