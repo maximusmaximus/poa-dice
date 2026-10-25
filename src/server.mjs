@@ -235,8 +235,33 @@ export function createDiceServer(options = {}) {
     }
   }
 
+  /** Bets / withdrawals pause while the books are reconciled with the ledger (see chain-settlement). */
+  const tradingHold = async () => (settlement && !readOnlyState ? settlement.ensureReconciled() : null);
+  const holdBlock = (q, hold) =>
+    hold ? { ...q, valid: false, instant: false, withinLimits: false, code: hold.status, reason: hold.reason, error: hold.reason } : q;
+
+  /** Bank coverage of a worst-case payout (quotes). null when not chain-settled. */
+  const betCoverage = async (worstMicros) => {
+    if (!settlement || readOnlyState) return null;
+    await settlement.ensureFreshBalance();
+    return settlement.betCoverage(worstMicros);
+  };
+  const coverageBlock = (q, cov) => {
+    if (!cov || !q || q.valid === false) return cov && q ? { ...q, coverage: coverageView(cov) } : q;
+    if (cov.ok) return { ...q, coverage: coverageView(cov) };
+    return { ...q, valid: false, withinLimits: false, code: cov.code, reason: cov.reason, error: cov.reason, coverage: coverageView(cov) };
+  };
+  const coverageView = (cov) => ({
+    ok: cov.ok,
+    code: cov.code || 'ok',
+    freePoa: cov.freeMicros !== undefined ? fromMicros(cov.freeMicros) : null,
+    worstCasePayoutPoa: cov.worstMicros !== undefined ? fromMicros(cov.worstMicros) : null
+  });
+
   const mcpHooks = {
     readOnly,
+    tradingHold,
+    betCoverage,
     chainRequired: requireChain,
     chainContext,
     adminToken,
@@ -335,6 +360,8 @@ export function createDiceServer(options = {}) {
       mode: 'chain',
       status: 'OK',
       readOnly: false,
+      trading: sum.trading,
+      reconcile: sum.reconcile ? { status: sum.reconcile.status, reason: sum.reconcile.reason, inReview: sum.reconcile.inReview } : null,
       bankKeySource,
       confirmPolicy: sum.confirmPolicy,
       store: sum.store,
@@ -486,7 +513,8 @@ export function createDiceServer(options = {}) {
           targetBps: Number(body.targetBps ?? body.target_bps ?? 4950),
           direction: body.direction || 'under'
         });
-        return sendJson(res, 200, quote);
+        const held = holdBlock(quote, await tradingHold());
+        return sendJson(res, 200, quote.payoutOnWinMicros ? coverageBlock(held, await betCoverage(BigInt(quote.payoutOnWinMicros))) : held);
       }
 
       if (pathname === '/api/quote/batch' && req.method === 'GET') {
@@ -501,11 +529,15 @@ export function createDiceServer(options = {}) {
           maxTotalSpendPoa: p.maxTotalSpendPoa ?? null,
           chain
         };
-        const roBlock = (q) => (readOnlyState ? { ...q, valid: false, code: readOnlyState.status, reason: `Vault is read-only (${readOnlyState.status.replace(/_/g, ' ')})`, error: readOnlyState.error } : q);
-        if (p.count) return sendJson(res, 200, roBlock(quoteBatch(engine, { ...params, count: Number(p.count) })));
+        const hold = await tradingHold();
+        const roBlock = (q) => (readOnlyState ? { ...q, valid: false, code: readOnlyState.status, reason: `Vault is read-only (${readOnlyState.status.replace(/_/g, ' ')})`, error: readOnlyState.error } : holdBlock(q, hold));
+        const covBlock = async (q) => (q && q.maxPotentialPayoutPoa ? coverageBlock(q, await betCoverage(toMicros(q.maxPotentialPayoutPoa))) : q);
+        if (p.count) return sendJson(res, 200, await covBlock(roBlock(quoteBatch(engine, { ...params, count: Number(p.count) }))));
+        const counts = [];
+        for (const q of quoteAllCounts(engine, params).map(roBlock)) counts.push(await covBlock(q));
         return sendJson(res, 200, {
           chain: { required: chain.required, ok: chain.ok },
-          counts: quoteAllCounts(engine, params).map(roBlock)
+          counts
         });
       }
 
@@ -540,6 +572,8 @@ export function createDiceServer(options = {}) {
           }
         } else if (settlement) {
           out.autoBet = { ...out.autoBet, valid: false, code: 'chain_settled', reason: 'Auto-bet needs each roll settled first; use the roll builder batch instead' };
+          const hold = await tradingHold();
+          if (hold) for (const k of ['withdraw', 'claim']) out[k] = holdBlock(out[k], hold);
         }
         return sendJson(res, 200, out);
       }
@@ -562,7 +596,7 @@ export function createDiceServer(options = {}) {
           bpsToRedeem: body.bpsToRedeem ?? body.bps,
           sharesToRedeem: body.sharesToRedeem ?? body.shares
         });
-        return sendJson(res, 200, quote);
+        return sendJson(res, 200, holdBlock(quote, await tradingHold()));
       }
 
       // 5. Submit Pre-Signed POA Transaction (Self-Custody Ed25519 Verified)

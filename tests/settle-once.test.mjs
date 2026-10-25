@@ -101,6 +101,14 @@ test('root cause: without an atomic claim two instances roll the same bet differ
     const ra = a.app.engine.processedTxids.get(id);
     const rb = b.app.engine.processedTxids.get(id);
     assert.ok(ra && rb, 'both instances settled the bet');
+    if (ra.recovered || rb.recovered) {
+      // Second line of defence (reconcile PR): an instance that only sees the bet after the other one
+      // already paid it books that on-chain payout (memo roll, unverified) instead of rolling again.
+      const rec = ra.recovered ? ra : rb;
+      assert.equal(rec.rollSource, 'payout-memo');
+      assert.equal(rec.rollVerified, false);
+      return;
+    }
     assert.notEqual(ra.provablyFair.serverSeedHash, rb.provablyFair.serverSeedHash, 'different seeds');
     assert.notEqual(ra.provablyFair.nonce, rb.provablyFair.nonce, 'different nonces');
     assert.notEqual(ra.provablyFair.hmacHex, rb.provablyFair.hmacHex, 'so the HMAC (and the roll) differ');
