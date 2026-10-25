@@ -28,6 +28,7 @@ import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
 import { BATCH_COUNTS, executeBatch, quoteAllCounts, quoteBatch, VIP_NOTE } from './batch-roll.mjs';
 import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake, WITHDRAW_TRIGGER_POA } from './actions.mjs';
+import { looksLikePrivkey, walletBalance } from './wallet-balance.mjs';
 import { clampWaitSeconds, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS, TEMPLATE_TOOLS, transferTemplates } from './tx-templates.mjs';
 
 export const ROLL_FORMULA =
@@ -377,6 +378,16 @@ export const MCP_TOOLS = [
       type: 'object',
       properties: { txid: { type: 'string', description: 'Inbound txid, payout txid or payout orderId' } },
       required: ['txid']
+    }
+  },
+  {
+    name: 'wallet_balance',
+    description:
+      'Live balance of any poa1 address from the public minepoa ledger. Read-only; needs no key. The explorer\'s own "balance" is as of the last signed checkpoint and lags; this adds the transfers the checkpoint does not cover yet. Returns spendable (final balance minus pending outgoing), current (final), pending in/out, the lagging checkpoint balance and height, the last transaction time, and each transaction with its status (pending with N/5 attestations, or final via attestations or checkpoint). Unvested mining rewards may not be sendable yet; a signed dry run is the definitive send check.',
+    inputSchema: {
+      type: 'object',
+      properties: { address: { type: 'string', description: 'poa1... address (public). Never pass a private key.' } },
+      required: ['address']
     }
   },
   {
@@ -1030,6 +1041,17 @@ export class McpHandler {
           return { ...internal, ok: internal.ok && chain.ok, chain: { checked: true, ...chain } };
         } catch (err) {
           return { ...internal, ok: false, chain: { checked: false, error: redactSecrets(err.message) } };
+        }
+      }
+
+      case 'wallet_balance': {
+        const address = String(args.address || '').trim();
+        if (looksLikePrivkey(address)) return { valid: false, error: 'That looks like a private key, not an address. Never send a private key; pass the poa1 address.' };
+        const fn = this.hooks.walletBalance || ((a) => walletBalance(a, { node: this.watcher?.nodeUrl || 'https://minepoa.com' }));
+        try {
+          return await fn(address);
+        } catch (err) {
+          return { valid: false, error: err.kind === 'busy' ? 'The minepoa ledger is catching up. Retry in ~15 s.' : String(err.message || err), retryable: err.kind === 'busy' || err.kind === 'network' || err.kind === 'timeout' };
         }
       }
 
