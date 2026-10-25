@@ -20,9 +20,22 @@
  *     confirms that txid does not exist.
  *   - Strict nonce order: at most one un-acknowledged signed tx at a time.
  *   - Solvency: an order is signed only when the confirmed on-chain bank balance, less
- *     unconfirmed inbound and in-flight outbound, covers it. Otherwise it waits (WAITING_FUNDS).
+ *     in-flight outbound, covers it. Otherwise it waits (WAITING_FUNDS).
+ *
+ * Recovery (fix/settlement-recovery)
+ *   - The minepoa address page omits memos, so every bank tx's memo is read from
+ *     /api/explorer/tx/<id> (or the recent-transfers feed) before deciding whether it is DICE1.
+ *   - The ledger is the source of truth: every DICE1 transfer to the bank found on the ledger is
+ *     (re)booked once final, idempotent by txid, even if this process lost its state.
+ *   - Before signing a payout, the bank's own sent txs on the ledger are indexed by their
+ *     `:ord=<orderId12>` memo tag; an order already paid on chain is adopted, never paid again.
+ *   - Bank balance = checkpoint balance + final transfers above the checkpoint height (the
+ *     explorer's `balance` alone lags until the next checkpoint).
+ *   - State (this queue + the engine snapshot) is ONE document in the store, written in order;
+ *     a payout is broadcast only after its signed body is durable.
  */
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
+import { PersistQueue } from './settlement-store.mjs';
 
 const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
@@ -63,18 +76,59 @@ export class ChainSettlement {
     this.inboundExpireMs = inboundExpireMs;
     this.logger = logger;
     this._tickPromise = null;
+    this._tickErrors = [];
     this._timer = null;
     this._nonceCache = new Map();
     this.lastTick = null;
     this.lastError = null;
     this.lastBankBalance = null;
 
-    const doc = store.load();
-    this.state = doc && doc.version === 1 ? doc : { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, seq: 0 };
+    this._persist = new PersistQueue(store);
+    this._loaded = false;
+    this.fatalError = null;
+    this.ledgerIndexComplete = false;
+    this.state = { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, ledgerOut: {}, seq: 0, createdAt: Math.floor(now() / 1000) };
+    const loaded = store.load();
+    if (loaded && typeof loaded.then === 'function') {
+      this._loadPromise = loaded.then(
+        (doc) => this._applyDoc(doc),
+        (err) => {
+          this.fatalError = `Could not load vault state from ${store.kind}: ${err.message}`;
+          throw new Error(this.fatalError);
+        }
+      );
+      this._loadPromise.catch(() => {});
+    } else {
+      this._applyDoc(loaded);
+      this._loadPromise = Promise.resolve();
+    }
+  }
+
+  /** Resolves once state is loaded from the store (async for KV stores). */
+  ready() {
+    return this._loadPromise;
+  }
+
+  _applyDoc(doc) {
+    if (doc && doc.version === 1) {
+      this.state = doc;
+      if (this.state.createdAt === undefined) this.state.createdAt = 0; // pre-recovery doc: age unknown
+    }
+    this.state.ledgerOut = this.state.ledgerOut || {};
     if (this.state.bankAddress && this.state.bankAddress !== this.bankAddress) {
-      throw new Error(`Settlement store belongs to bank ${this.state.bankAddress}, not ${this.bankAddress}`);
+      this.fatalError = `Settlement store belongs to bank ${this.state.bankAddress}, not ${this.bankAddress}`;
+      throw new Error(this.fatalError);
     }
     this.state.bankAddress = this.bankAddress;
+    // The engine snapshot travels in the same document, so queue and books can never disagree.
+    if (doc && doc.engine) {
+      if (doc.engine.bankAddress && doc.engine.bankAddress !== this.bankAddress && !String(doc.engine.bankAddress).startsWith('poa1BankVault')) {
+        this.fatalError = `Stored vault state belongs to bank ${doc.engine.bankAddress}, not ${this.bankAddress}`;
+        throw new Error(this.fatalError);
+      }
+      this.engine.restoreState(doc.engine);
+      this.engine.bankAddress = this.bankAddress;
+    }
     // A crash mid-broadcast leaves SUBMITTING: treat as broadcast; it is booked if the ledger has it,
     // and expires (releasing its reservation) if it never shows up.
     for (const rec of Object.values(this.state.inbound)) if (rec.status === 'SUBMITTING') rec.status = 'BROADCAST';
@@ -91,11 +145,21 @@ export class ChainSettlement {
         // ignore
       }
     }
+    this._loaded = true;
+    this.engine.onStateSaved = () => this._save();
     this._save();
   }
 
   _save() {
-    this.store.save(this.state);
+    if (!this._loaded) return; // never overwrite stored state with a pre-load blank
+    this.state.engine = this.engine.serializeState();
+    this.state.savedAt = now();
+    this._persist.save(this.state);
+  }
+
+  /** Wait until everything saved so far is durable (KV stores write asynchronously). */
+  flush() {
+    return this._persist.flush();
   }
 
   _emit(type, payload) {
@@ -157,6 +221,7 @@ export class ChainSettlement {
    * opts.groupId: batch id (batch.completed fires once every member resolves).
    */
   async submitInbound(txEnvelope, { reserve = null, groupId = null } = {}) {
+    await this.ready();
     const { body, txid, parsed } = this._validateInbound(txEnvelope);
     const existing = this.state.inbound[txid];
     if (existing && existing.status !== 'FAILED' && existing.status !== 'EXPIRED') return this._inboundView(existing, { duplicate: true });
@@ -180,6 +245,12 @@ export class ChainSettlement {
     };
     this.state.inbound[txid] = rec;
     this._save();
+    try {
+      await this.flush();
+    } catch (err) {
+      delete this.state.inbound[txid];
+      throw Object.assign(new Error(`Vault store unavailable; not broadcast: ${err.message}`), { status: 503, txid });
+    }
 
     try {
       rec.attempts += 1;
@@ -276,7 +347,7 @@ export class ChainSettlement {
       try {
         tx = await this.client.getTx(rec.txid);
       } catch (err) {
-        this.lastError = err.message;
+        this._tickErrors.push(err.message);
         return; // node unreachable: try next tick
       }
       if (!tx) {
@@ -324,6 +395,17 @@ export class ChainSettlement {
       return;
     }
     this._releaseReserve(rec);
+    // A bet older than this vault state means the state was lost after it was (probably) settled.
+    // Re-rolling it with a new seed could pay an outcome that never happened, so hold it for review.
+    // Deposits, withdrawals and chat replay safely (payouts are de-duplicated by their ledger order tag).
+    if (rec.discoveredBy === 'ledger-scan' && rec.action === 'BET' && this.state.createdAt && Number(b.ts || 0) < this.state.createdAt && !this.engine.processedTxids.has(rec.txid)) {
+      rec.status = 'NEEDS_REVIEW';
+      rec.ledger = { atts: tx.atts, final: tx.final };
+      rec.error = 'Bet predates this vault state (state was lost); not re-rolled. Operator review needed.';
+      this._save();
+      this._emit('settlement.updated', this._inboundView(rec));
+      return;
+    }
     let result;
     if (this.engine.processedTxids.has(rec.txid)) {
       result = this.engine.processedTxids.get(rec.txid);
@@ -358,38 +440,163 @@ export class ChainSettlement {
     this._emit('settlement.updated', this._inboundView(rec));
   }
 
+  /**
+   * Read the bank's ledger view: discover DICE1 transfers to the bank (memo looked up per tx,
+   * because the address page omits it), index the bank's own sent txs by order tag, and compute
+   * the real spendable balance (checkpoint balance + final transfers above the checkpoint).
+   * Returns the row with .effectiveMicros (null when it cannot be trusted this tick).
+   */
   async _scanBank() {
     let row;
     try {
       row = await this.client.getAddress(this.bankAddress);
     } catch (err) {
-      this.lastError = err.message;
+      this._tickErrors.push(err.message);
       return null;
     }
-    this.lastBankBalance = { balance: row.balance, at: now() };
-    for (const t of row.txs || []) {
-      if (!t || !t.id || t.type !== 'transfer' || t.to !== this.bankAddress) continue;
-      if (!String(t.memo || '').startsWith('DICE1:')) continue;
-      if (this.state.inbound[t.id] || this.engine.processedTxids.has(t.id)) continue;
-      this.state.inbound[t.id] = {
-        txid: t.id,
-        seq: ++this.state.seq,
-        from: t.from,
-        amountPoa: t.amount,
-        memo: t.memo,
-        action: parseDiceMemo(t.memo).action || null,
-        status: 'SEEN',
-        submittedAt: now(),
-        reserve: null,
-        groupId: null,
-        attempts: 0,
-        error: null,
-        result: null,
-        ledger: null
-      };
-      this._save();
+    // Recent-transfer feed: optional, only saves memo lookups (its window is small and shifts).
+    let recent = null;
+    try {
+      recent = await this.client.getRecentTransfers(200);
+    } catch {
+      recent = null;
     }
+
+    // Union of what the address page and the recent feed know about the bank.
+    const byId = new Map();
+    for (const t of row.txs || []) if (t && t.id && t.type === 'transfer') byId.set(t.id, { ...t });
+    if (recent) {
+      for (const r of recent.values()) {
+        if (r.to !== this.bankAddress && r.from !== this.bankAddress) continue;
+        const prev = byId.get(r.id) || {};
+        byId.set(r.id, { ...r, ...prev, memo: r.memo, memoKnown: true, final: prev.final || r.final });
+      }
+    }
+    const txs = [...byId.values()].sort((x, y) => (x.height ?? 0) - (y.height ?? 0) || (x.ts || 0) - (y.ts || 0));
+
+    let outIndexComplete = true;
+    for (const t of txs) {
+      if (t.to === this.bankAddress && t.from !== this.bankAddress) {
+        if (this.state.inbound[t.id] || this.engine.processedTxids.has(t.id)) continue;
+        let memo = t.memoKnown ? String(t.memo || '') : undefined;
+        if (memo === undefined) {
+          try {
+            memo = await this.client.getMemo(t.id);
+          } catch (err) {
+            this._tickErrors.push(`memo ${t.id.slice(0, 12)}: ${err.message}`);
+            continue; // retried next tick
+          }
+        }
+        if (memo === null || !String(memo).startsWith('DICE1:')) continue; // plain donation / unknown
+        this.state.inbound[t.id] = {
+          txid: t.id,
+          seq: ++this.state.seq,
+          from: t.from,
+          amountPoa: t.amount,
+          memo,
+          action: parseDiceMemo(memo).action || null,
+          status: 'SEEN',
+          submittedAt: now(),
+          ledgerTs: t.ts || null,
+          discoveredBy: 'ledger-scan',
+          reserve: null,
+          groupId: null,
+          attempts: 0,
+          error: null,
+          result: null,
+          ledger: null
+        };
+        this._save();
+      } else if (t.from === this.bankAddress) {
+        if (this.state.ledgerOut[t.id]) continue;
+        let memo = t.memoKnown ? String(t.memo || '') : undefined;
+        if (memo === undefined) {
+          try {
+            memo = await this.client.getMemo(t.id);
+          } catch (err) {
+            this._tickErrors.push(`memo ${t.id.slice(0, 12)}: ${err.message}`);
+            outIndexComplete = false;
+            continue;
+          }
+        }
+        if (memo === null) {
+          outIndexComplete = false;
+          continue;
+        }
+        const m = /:ord=([0-9a-f]{12})/.exec(String(memo));
+        this.state.ledgerOut[t.id] = { ord: m ? m[1] : null, to: t.to, amountPoa: t.amount, memo: String(memo).slice(0, 200) };
+        this._save();
+      }
+    }
+    // Our own SIGNED/SENT txs may not be listed yet; they are covered by _inFlightOutMicros.
+    this.ledgerIndexComplete = outIndexComplete;
+
+    // Real spendable balance. minepoa's `balance` is as of the last checkpoint and the explorer
+    // gives no per-tx height on the address page, so take the larger of two LOWER bounds:
+    //   est1 = sum(final transfers in) - sum(transfers out) over the listed history
+    //          (exact for a bank created after the 2026-10-24 genesis cut: the listing is its whole history)
+    //   est2 = checkpoint balance - sum(listed transfers out)   (as if no outbound were covered yet)
+    // Our own signed/sent payouts that are not listed yet are subtracted later (_inFlightOutMicros).
+    let checkpointMicros = null;
+    try {
+      checkpointMicros = toMicros(row.balance || '0');
+    } catch {
+      checkpointMicros = null;
+    }
+    const listed = new Set();
+    let finalIn = 0n;
+    let outAll = 0n;
+    for (const t of txs) {
+      if (t.to === this.bankAddress && t.from === this.bankAddress) continue;
+      if (t.to === this.bankAddress) {
+        listed.add(t.id);
+        if (t.final) finalIn += toMicros(t.amount || '0');
+      } else if (t.from === this.bankAddress) {
+        listed.add(t.id);
+        outAll += toMicros(t.amount || '0');
+      }
+    }
+    const est1 = finalIn - outAll;
+    const est2 = checkpointMicros === null ? null : checkpointMicros - outAll;
+    const effective = est2 === null ? est1 : est1 > est2 ? est1 : est2;
+    row.effectiveMicros = effective;
+    row.listedIds = listed;
+    this.lastBankBalance = {
+      balance: fromMicros(effective < 0n ? 0n : effective),
+      checkpointBalance: row.balance,
+      checkpointHeight: row.checkpoint == null ? null : Number(row.checkpoint),
+      ledgerFinalInPoa: fromMicros(finalIn),
+      ledgerOutPoa: fromMicros(outAll),
+      source: est2 !== null && est2 >= est1 ? 'checkpoint-minus-outbound' : 'ledger-history-final',
+      at: now()
+    };
     return row;
+  }
+
+  _scanBankReadOnly() {
+    return this._scanBank();
+  }
+
+  /** Ledger lookup for a txid the vault has no record of (status endpoint fallback). */
+  async lookupLedger(txid) {
+    if (!/^[0-9a-f]{64}$/.test(String(txid))) return null;
+    const tx = await this.client.getTx(txid).catch(() => undefined);
+    if (tx === undefined) return { txid, status: 'UNKNOWN', rawStatus: 'LEDGER_UNREACHABLE', note: 'minepoa did not answer; try again' };
+    if (!tx || tx.to !== this.bankAddress) return null;
+    const memo = String(tx.memo || '');
+    this.kick();
+    return {
+      direction: 'inbound',
+      txid,
+      status: memo.startsWith('DICE1:') ? (tx.final ? 'CONFIRMED_ON_LEDGER_BOOKING' : 'PENDING_CONFIRMATION') : 'NOT_A_DICE_ACTION',
+      rawStatus: 'LEDGER_ONLY',
+      from: tx.from,
+      amountPoa: tx.amount,
+      memo,
+      ledger: { atts: tx.atts, final: tx.final },
+      explorer: this.client.explorerTxUrl(txid),
+      note: memo.startsWith('DICE1:') ? 'Found on the minepoa ledger. The vault books it on its next scan (idempotent by txid).' : 'Transfer to the bank without a DICE1 memo; not a game action.'
+    };
   }
 
   // ─── Outbound ─────────────────────────────────────────────────────────────
@@ -429,10 +636,17 @@ export class ChainSettlement {
     return adopted;
   }
 
-  _inFlightOutMicros() {
+  /**
+   * Payouts not yet reflected in the ledger view. With listedIds (from the last scan), anything of
+   * ours that is signed/sent/confirmed but not listed is counted; listed ones are already in the balance.
+   */
+  _inFlightOutMicros(listedIds = null) {
     let s = 0n;
     for (const o of Object.values(this.state.outbound)) {
-      if (o.status === 'SIGNED' || o.status === 'SENT') s += toMicros(o.amountPoa);
+      const counts = o.status === 'SIGNED' || o.status === 'SENT' || (listedIds && o.status === 'CONFIRMED' && !o.recoveredFromLedger);
+      if (!counts) continue;
+      if (listedIds && o.txid && listedIds.has(o.txid)) continue;
+      s += toMicros(o.amountPoa);
     }
     return s;
   }
@@ -535,24 +749,42 @@ export class ChainSettlement {
     const pendingSigned = recs.find((r) => r.status === 'SIGNED');
     if (pendingSigned) {
       if (now() < pendingSigned.nextAttemptAt) return;
+      try {
+        await this.flush(); // its signed body must be durable before it can leave the box
+      } catch (err) {
+        this._tickErrors.push(`store: ${err.message}`);
+        return;
+      }
       const ok = await this._broadcastSigned(pendingSigned);
       if (!ok) return;
     }
     // 3. sign + broadcast queued orders, one at a time, only from confirmed on-chain funds
-    let balanceMicros = null;
-    if (bankRow) {
-      try {
-        balanceMicros = toMicros(bankRow.balance || '0');
-      } catch {
-        balanceMicros = null;
-      }
-    }
+    const balanceMicros = bankRow && typeof bankRow.effectiveMicros === 'bigint' ? bankRow.effectiveMicros : null;
+    const listed = bankRow?.listedIds || null;
+    const tagged = new Map();
+    for (const [id, o] of Object.entries(this.state.ledgerOut || {})) if (o.ord) tagged.set(o.ord, id);
+    const claimed = new Set(Object.values(this.state.outbound).flatMap((o) => [o.txid, ...(o.superseded || []).map((x) => x.txid)]).filter(Boolean));
     for (const rec of recs) {
       if (rec.status !== 'QUEUED' && rec.status !== 'WAITING_FUNDS') continue;
+      // Already paid on chain (e.g. state was lost and the inbound replayed): adopt, never pay twice.
+      const paid = tagged.get(rec.orderId.slice(0, 12));
+      if (paid && !claimed.has(paid)) {
+        rec.txid = paid;
+        rec.recoveredFromLedger = true;
+        rec.nonce = null;
+        rec.status = 'SENT';
+        rec.sentAt = now();
+        rec.lastError = null;
+        claimed.add(paid);
+        this._save();
+        this.engine.markOutboundSent(rec.orderId, rec.txid, 'SENT');
+        this._emit('settlement.updated', this._outboundView(rec));
+        continue;
+      }
       if (now() < rec.nextAttemptAt) continue;
-      if (balanceMicros === null) return;
+      if (balanceMicros === null || !this.ledgerIndexComplete) return; // cannot prove solvency / non-payment this tick
       const amount = toMicros(rec.amountPoa);
-      const spendable = balanceMicros - this._unconfirmedInMicros() - this._inFlightOutMicros();
+      const spendable = balanceMicros - this._inFlightOutMicros(listed);
       if (spendable < amount) {
         if (rec.status !== 'WAITING_FUNDS') {
           rec.status = 'WAITING_FUNDS';
@@ -581,6 +813,12 @@ export class ChainSettlement {
       rec.signedAt = now();
       this.state.bankNonce = nonce; // reserved; advanced once the node accepts it
       this._save(); // write-ahead: the txid is durable before anything leaves the box
+      try {
+        await this.flush();
+      } catch (err) {
+        this._tickErrors.push(`store: ${err.message}`);
+        return; // stays SIGNED; rebroadcast (same txid) once the store is writable
+      }
       const ok = await this._broadcastSigned(rec);
       if (!ok) return;
     }
@@ -609,14 +847,25 @@ export class ChainSettlement {
   tick() {
     if (this._tickPromise) return this._tickPromise;
     this._tickPromise = (async () => {
+      this._tickErrors = [];
       try {
+        await this.ready();
         const row = await this._scanBank();
         await this._confirmInbound();
         this._adoptOutbound();
         await this._processOutbound(row);
+        await this.flush();
         this.lastTick = now();
+        if (this._tickErrors.length) {
+          this.lastError = this._tickErrors.join('; ');
+          this.lastErrorAt = now();
+        } else {
+          this.lastError = null; // only report errors that are still happening
+        }
+        this.lastGoodTick = this._tickErrors.length ? this.lastGoodTick : now();
       } catch (err) {
         this.lastError = String(err.message || err);
+        this.lastErrorAt = now();
         if (this.logger) this.logger(`settlement tick error: ${this.lastError}`);
       } finally {
         this._tickPromise = null;
@@ -671,9 +920,15 @@ export class ChainSettlement {
       bankAddress: this.bankAddress,
       confirmPolicy: this.confirmPolicy,
       store: this.store.kind,
+      storeDurable: this.store.durable !== false,
       lastTick: this.lastTick ? new Date(this.lastTick).toISOString() : null,
+      lastGoodTick: this.lastGoodTick ? new Date(this.lastGoodTick).toISOString() : null,
       lastError: this.lastError,
+      lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
       onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
+      bankBalance: this.lastBankBalance,
+      ledgerIndexComplete: this.ledgerIndexComplete,
+      minepoa: this.client.stats || null,
       inbound: count(ins, 'status'),
       outbound: count(outs, 'status'),
       recentOutbound: outs
@@ -686,9 +941,13 @@ export class ChainSettlement {
 
   /** Internal books vs the real on-chain bank balance. */
   async auditAgainstChain() {
-    const row = await this.client.getAddress(this.bankAddress);
-    const onChain = toMicros(row.balance || '0');
-    const unconfirmedIn = this._unconfirmedInMicros();
+    const prevErrors = this._tickErrors;
+    this._tickErrors = [];
+    const row = await this._scanBankReadOnly();
+    this._tickErrors = prevErrors;
+    if (!row || row.effectiveMicros === null) throw new Error('Could not read a trustworthy bank balance from minepoa right now');
+    const onChain = row.effectiveMicros;
+    const unconfirmedIn = 0n; // the effective balance only counts FINAL inbound
     let pendingOut = 0n;
     for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT') pendingOut += toMicros(o.amountPoa);
     for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
@@ -696,7 +955,7 @@ export class ChainSettlement {
     const required = booked + pendingOut;
     const confirmedOnChain = onChain - unconfirmedIn;
     const delta = confirmedOnChain - required;
-    const sentUnconfirmed = this._inFlightOutMicros();
+    const sentUnconfirmed = this._inFlightOutMicros(row.listedIds);
     return {
       ok: delta >= 0n,
       bankAddress: this.bankAddress,
@@ -716,7 +975,10 @@ export class ChainSettlement {
         delta >= 0n
           ? 'On-chain bank balance covers every booked liability (a surplus can be unbooked transfers or sent payouts the explorer has not reflected yet).'
           : 'SHORTFALL: the on-chain bank balance is below what the internal ledger owes. Payouts beyond the confirmed balance are held.',
-      checkpoint: row.checkpoint ?? null
+      checkpoint: row.checkpoint ?? null,
+      checkpointBalancePoa: row.balance,
+      balanceSource: this.lastBankBalance?.source || null,
+      unbookedDiceTransfers: Object.values(this.state.inbound).filter((r) => OPEN_IN.has(r.status)).map((r) => ({ txid: r.txid, from: r.from, amountPoa: r.amountPoa, status: r.status }))
     };
   }
 }

@@ -1442,59 +1442,72 @@ export class BankrollEngine {
     return sum;
   }
 
+  /** Plain-JSON snapshot of everything the vault must not lose (used by the file and KV stores). */
+  serializeState() {
+    return {
+      bankAddress: this.bankAddress,
+      currentEpoch: this.currentEpoch,
+      devFeeMode: this.devFeeMode,
+      bankNavMicros: this.bankNavMicros.toString(),
+      lockedCollateralMicros: (this.lockedCollateralMicros - this.reservedExposureMicros).toString(),
+      totalShares: this.totalShares.toString(),
+      devReserveMicros: this.devReserveMicros.toString(),
+      totalDevEarnedMicros: this.totalDevEarnedMicros.toString(),
+      totalDevSweptMicros: this.totalDevSweptMicros.toString(),
+      incentivePoolMicros: this.incentivePoolMicros.toString(),
+      totalIncentivesDistributedMicros: this.totalIncentivesDistributedMicros.toString(),
+      totalBetsCount: this.totalBetsCount,
+      totalVolumeMicros: this.totalVolumeMicros.toString(),
+      totalPlayerWinsCount: this.totalPlayerWinsCount,
+      totalPlayerLossesCount: this.totalPlayerLossesCount,
+      netHouseProfitMicros: this.netHouseProfitMicros.toString(),
+      lpPositions: [...this.lpPositions.entries()].map(([k, v]) => [
+        k,
+        {
+          ...v,
+          shares: v.shares.toString(),
+          principalDepositedMicros: v.principalDepositedMicros.toString(),
+          principalWithdrawnMicros: v.principalWithdrawnMicros.toString(),
+          netInvestedMicros: v.netInvestedMicros.toString(),
+          incentivesEarnedMicros: v.incentivesEarnedMicros.toString(),
+          referralEarnedMicros: v.referralEarnedMicros.toString()
+        }
+      ]),
+      playerNonces: [...this.playerNonces.entries()],
+      playerClientSeeds: [...this.playerClientSeeds.entries()],
+      processedTxids: [...this.processedTxids.entries()].slice(-1000),
+      withdrawalQueue: this.withdrawalQueue,
+      // Never drop an unsettled order: keep every non-final item plus recent history.
+      outboundQueue: this.outboundQueue.filter((x, i, all) => !['SENT_SIGNED', 'CONFIRMED', 'FAILED'].includes(x.status) || i >= all.length - 500),
+      betHistory: this.betHistory.slice(0, 100),
+      bankHistory: this.bankHistory.slice(0, 100),
+      chatMessages: this.chatMessages.slice(0, 100),
+      seedState: {
+        epochId: this.seedManager.epochId,
+        currentSeed: this.seedManager.currentSeed,
+        nextSeed: this.seedManager.nextSeed,
+        createdAt: this.seedManager.createdAt,
+        betsCount: this.seedManager.betsCount,
+        history: this.seedManager.history.slice(-20)
+      }
+    };
+  }
+
   _saveToDisk() {
-    if (!this.dataDir || this._deferSave) return;
+    if (this._deferSave) return;
+    if (typeof this.onStateSaved === 'function') {
+      try {
+        this.onStateSaved();
+      } catch {
+        // the settlement store reports its own errors
+      }
+    }
+    if (!this.dataDir) return;
     try {
       fs.mkdirSync(this.dataDir, { recursive: true });
       const file = path.join(this.dataDir, 'bankroll-state.json');
       const tmp = file + '.tmp';
-      const serialized = {
-        bankAddress: this.bankAddress,
-        currentEpoch: this.currentEpoch,
-        devFeeMode: this.devFeeMode,
-        bankNavMicros: this.bankNavMicros.toString(),
-        lockedCollateralMicros: (this.lockedCollateralMicros - this.reservedExposureMicros).toString(),
-        totalShares: this.totalShares.toString(),
-        devReserveMicros: this.devReserveMicros.toString(),
-        totalDevEarnedMicros: this.totalDevEarnedMicros.toString(),
-        totalDevSweptMicros: this.totalDevSweptMicros.toString(),
-        incentivePoolMicros: this.incentivePoolMicros.toString(),
-        totalIncentivesDistributedMicros: this.totalIncentivesDistributedMicros.toString(),
-        totalBetsCount: this.totalBetsCount,
-        totalVolumeMicros: this.totalVolumeMicros.toString(),
-        totalPlayerWinsCount: this.totalPlayerWinsCount,
-        totalPlayerLossesCount: this.totalPlayerLossesCount,
-        netHouseProfitMicros: this.netHouseProfitMicros.toString(),
-        lpPositions: [...this.lpPositions.entries()].map(([k, v]) => [
-          k,
-          {
-            ...v,
-            shares: v.shares.toString(),
-            principalDepositedMicros: v.principalDepositedMicros.toString(),
-            principalWithdrawnMicros: v.principalWithdrawnMicros.toString(),
-            netInvestedMicros: v.netInvestedMicros.toString(),
-            incentivesEarnedMicros: v.incentivesEarnedMicros.toString(),
-            referralEarnedMicros: v.referralEarnedMicros.toString()
-          }
-        ]),
-        playerNonces: [...this.playerNonces.entries()],
-        playerClientSeeds: [...this.playerClientSeeds.entries()],
-        processedTxids: [...this.processedTxids.entries()].slice(-1000),
-        withdrawalQueue: this.withdrawalQueue,
-        // Never drop an unsettled order: keep every non-final item plus recent history.
-        outboundQueue: this.outboundQueue.filter((x, i, all) => !['SENT_SIGNED', 'CONFIRMED', 'FAILED'].includes(x.status) || i >= all.length - 500),
-        betHistory: this.betHistory.slice(0, 100),
-        bankHistory: this.bankHistory.slice(0, 100),
-        chatMessages: this.chatMessages.slice(0, 100),
-        seedState: {
-          epochId: this.seedManager.epochId,
-          currentSeed: this.seedManager.currentSeed,
-          nextSeed: this.seedManager.nextSeed,
-          createdAt: this.seedManager.createdAt,
-          betsCount: this.seedManager.betsCount,
-          history: this.seedManager.history.slice(-20)
-        }
-      };
+      const serialized = this.serializeState();
       const jsonStr = JSON.stringify(serialized, null, 2);
       try {
         fs.writeFileSync(tmp, jsonStr, 'utf8');
@@ -1512,56 +1525,61 @@ export class BankrollEngine {
     }
   }
 
+  /** Inverse of serializeState(). */
+  restoreState(raw) {
+    if (!raw || typeof raw !== 'object') return;
+    this.bankAddress = raw.bankAddress || this.bankAddress;
+    this.currentEpoch = Number(raw.currentEpoch ?? 1);
+    this.devFeeMode = raw.devFeeMode || this.devFeeMode;
+    this.bankNavMicros = BigInt(raw.bankNavMicros || 0);
+    this.lockedCollateralMicros = BigInt(raw.lockedCollateralMicros || 0);
+    this.totalShares = BigInt(raw.totalShares || 0);
+    this.devReserveMicros = BigInt(raw.devReserveMicros || 0);
+    this.totalDevEarnedMicros = BigInt(raw.totalDevEarnedMicros || 0);
+    this.totalDevSweptMicros = BigInt(raw.totalDevSweptMicros || 0);
+    this.incentivePoolMicros = BigInt(raw.incentivePoolMicros || 0);
+    this.totalIncentivesDistributedMicros = BigInt(raw.totalIncentivesDistributedMicros || 0);
+    this.totalBetsCount = Number(raw.totalBetsCount || 0);
+    this.totalVolumeMicros = BigInt(raw.totalVolumeMicros || 0);
+    this.totalPlayerWinsCount = Number(raw.totalPlayerWinsCount || 0);
+    this.totalPlayerLossesCount = Number(raw.totalPlayerLossesCount || 0);
+    this.netHouseProfitMicros = BigInt(raw.netHouseProfitMicros || 0);
+
+    this.lpPositions = new Map(
+      (raw.lpPositions || []).map(([k, v]) => [
+        k,
+        {
+          ...v,
+          shares: BigInt(v.shares || 0),
+          principalDepositedMicros: BigInt(v.principalDepositedMicros || 0),
+          principalWithdrawnMicros: BigInt(v.principalWithdrawnMicros || 0),
+          netInvestedMicros: BigInt(v.netInvestedMicros || 0),
+          incentivesEarnedMicros: BigInt(v.incentivesEarnedMicros || 0),
+          referralEarnedMicros: BigInt(v.referralEarnedMicros || 0)
+        }
+      ])
+    );
+    this.playerNonces = new Map(raw.playerNonces || []);
+    this.playerClientSeeds = new Map(raw.playerClientSeeds || []);
+    this.processedTxids = new Map(raw.processedTxids || []);
+    this.withdrawalQueue = raw.withdrawalQueue || [];
+    this.outboundQueue = raw.outboundQueue || [];
+    this.betHistory = raw.betHistory || [];
+    this.bankHistory = raw.bankHistory || [];
+    this.chatMessages = (raw.chatMessages || []).filter(
+      (m) => m && m.signature !== 'genesis_welcome_sig' && m.text
+    );
+    if (raw.seedState) {
+      this.seedManager = new SeedCommitManager(raw.seedState);
+    }
+  }
+
   _loadFromDisk() {
     if (!this.dataDir) return;
     const file = path.join(this.dataDir, 'bankroll-state.json');
     if (!fs.existsSync(file)) return;
     try {
-      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-      this.bankAddress = raw.bankAddress || this.bankAddress;
-      this.currentEpoch = Number(raw.currentEpoch ?? 1);
-      this.devFeeMode = raw.devFeeMode || this.devFeeMode;
-      this.bankNavMicros = BigInt(raw.bankNavMicros || 0);
-      this.lockedCollateralMicros = BigInt(raw.lockedCollateralMicros || 0);
-      this.totalShares = BigInt(raw.totalShares || 0);
-      this.devReserveMicros = BigInt(raw.devReserveMicros || 0);
-      this.totalDevEarnedMicros = BigInt(raw.totalDevEarnedMicros || 0);
-      this.totalDevSweptMicros = BigInt(raw.totalDevSweptMicros || 0);
-      this.incentivePoolMicros = BigInt(raw.incentivePoolMicros || 0);
-      this.totalIncentivesDistributedMicros = BigInt(raw.totalIncentivesDistributedMicros || 0);
-      this.totalBetsCount = Number(raw.totalBetsCount || 0);
-      this.totalVolumeMicros = BigInt(raw.totalVolumeMicros || 0);
-      this.totalPlayerWinsCount = Number(raw.totalPlayerWinsCount || 0);
-      this.totalPlayerLossesCount = Number(raw.totalPlayerLossesCount || 0);
-      this.netHouseProfitMicros = BigInt(raw.netHouseProfitMicros || 0);
-
-      this.lpPositions = new Map(
-        (raw.lpPositions || []).map(([k, v]) => [
-          k,
-          {
-            ...v,
-            shares: BigInt(v.shares || 0),
-            principalDepositedMicros: BigInt(v.principalDepositedMicros || 0),
-            principalWithdrawnMicros: BigInt(v.principalWithdrawnMicros || 0),
-            netInvestedMicros: BigInt(v.netInvestedMicros || 0),
-            incentivesEarnedMicros: BigInt(v.incentivesEarnedMicros || 0),
-            referralEarnedMicros: BigInt(v.referralEarnedMicros || 0)
-          }
-        ])
-      );
-      this.playerNonces = new Map(raw.playerNonces || []);
-      this.playerClientSeeds = new Map(raw.playerClientSeeds || []);
-      this.processedTxids = new Map(raw.processedTxids || []);
-      this.withdrawalQueue = raw.withdrawalQueue || [];
-      this.outboundQueue = raw.outboundQueue || [];
-      this.betHistory = raw.betHistory || [];
-      this.bankHistory = raw.bankHistory || [];
-      this.chatMessages = (raw.chatMessages || []).filter(
-        (m) => m && m.signature !== 'genesis_welcome_sig' && m.text
-      );
-      if (raw.seedState) {
-        this.seedManager = new SeedCommitManager(raw.seedState);
-      }
+      this.restoreState(JSON.parse(fs.readFileSync(file, 'utf8')));
     } catch {
       // ignore corrupt or partial file
     }

@@ -374,7 +374,11 @@ test('solvency: payouts only from confirmed on-chain balance; audit reports a sh
   try {
     await srv.mcp('bank_stake', { amount_poa: '10.000000', max_total_spend_poa: '10.000000', privkey: player.privkey });
     await srv.settle();
-    mock.setBalance(bank.address, '1.000000'); // the on-chain bank no longer holds what the books say
+    // The on-chain bank no longer holds what the books say: someone spent 9 POA with the bank key
+    // outside the vault (a ledger can only lose funds through a signed transfer).
+    const thief = genKeypair();
+    const leak = buildSignedTransfer({ wallet: bank, to: thief.address, amount: '9.000000', memo: 'outside the vault', nonce: mock.nextNonce(bank.address), parents: mock.parents() });
+    mock.directSubmit(leak.body);
     const audit = (await srv.mcp('dice_audit_solvency')).data;
     assert.equal(audit.chain.ok, false);
     assert.match(audit.chain.note, /SHORTFALL/);
@@ -382,8 +386,12 @@ test('solvency: payouts only from confirmed on-chain balance; audit reports a sh
     await srv.settle();
     let out = srv.app.settlement.getTxStatus(wd.data.txid).payouts[0];
     assert.equal(out.rawStatus, 'WAITING_FUNDS');
-    assert.equal(mock.transfersFrom(bank.address).length, 0, 'nothing paid beyond the on-chain balance');
-    mock.setBalance(bank.address, '10.000001');
+    assert.equal(mock.transfersFrom(bank.address).length, 1, 'nothing paid beyond the on-chain balance (only the outside leak)');
+    // Topped back up by a plain (non-DICE1) transfer to the bank.
+    const donor = genKeypair();
+    mock.setBalance(donor.address, '20.000000');
+    const top = buildSignedTransfer({ wallet: donor, to: bank.address, amount: '9.000001', memo: 'top-up', nonce: mock.nextNonce(donor.address), parents: mock.parents() });
+    mock.directSubmit(top.body);
     await srv.settle();
     out = srv.app.settlement.getTxStatus(wd.data.txid).payouts[0];
     assert.equal(out.status, 'CONFIRMED');
