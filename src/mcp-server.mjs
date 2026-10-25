@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   buildSignedTransfer,
+  fromMicros,
   txidOf,
   formatDiceMemo,
   genKeypair,
@@ -359,6 +360,9 @@ export const MCP_TOOLS = [
 
 /** Tools that move POA (refused while the server is read-only, e.g. BANK KEY MISSING). */
 export const WRITE_TOOLS = new Set(['dice_place_bet', 'dice_batch_roll', 'dice_auto_strategy', 'bank_stake', 'bank_withdraw', 'bank_claim_yield']);
+/** Paused while the vault reconciles its books with the ledger (deposits stay open). */
+export const HOLD_TOOLS = new Set(['dice_place_bet', 'dice_batch_roll', 'dice_auto_strategy', 'bank_withdraw', 'bank_claim_yield']);
+export const HOLD_QUOTE_TOOLS = new Set(['dice_quote_bet', 'bank_quote_withdraw', 'dice_quote_batch']);
 
 export class McpHandler {
   /**
@@ -517,6 +521,33 @@ export class McpHandler {
       const ro = this.hooks.readOnly();
       if (ro) return { valid: false, rejected: true, code: ro.status, error: ro.error };
     }
+    // Trading hold (books being reconciled with the ledger): no new bets / withdrawals, no valid quotes.
+    if (this.hooks.tradingHold && (HOLD_TOOLS.has(toolName) || HOLD_QUOTE_TOOLS.has(toolName))) {
+      const hold = await this.hooks.tradingHold();
+      if (hold) {
+        const isQuote = HOLD_QUOTE_TOOLS.has(toolName) || (toolName === 'bank_claim_yield' && args.dry_run);
+        if (!isQuote) return { valid: false, rejected: true, code: hold.status, error: hold.reason };
+        const q = await this._callTool(toolName, args);
+        return { ...(q && typeof q === 'object' ? q : {}), valid: false, instant: false, withinLimits: false, code: hold.status, reason: hold.reason, error: hold.reason };
+      }
+    }
+    const out = await this._callTool(toolName, args);
+    // Bank coverage: a bet quote is valid only if the bank's real free funds cover its worst case.
+    if (this.hooks.betCoverage && (toolName === 'dice_quote_bet' || toolName === 'dice_quote_batch') && out && typeof out === 'object') {
+      const worst = toolName === 'dice_quote_bet' ? out.payoutOnWinMicros : out.maxPotentialPayoutPoa ? toMicros(out.maxPotentialPayoutPoa) : null;
+      if (worst !== null && worst !== undefined) {
+        const cov = await this.hooks.betCoverage(BigInt(worst));
+        if (cov) {
+          const view = { ok: cov.ok, code: cov.code || 'ok', freePoa: cov.freeMicros !== undefined ? fromMicros(cov.freeMicros) : null, worstCasePayoutPoa: cov.worstMicros !== undefined ? fromMicros(cov.worstMicros) : null };
+          if (!cov.ok && out.valid !== false) return { ...out, valid: false, withinLimits: false, code: cov.code, reason: cov.reason, error: cov.reason, coverage: view };
+          return { ...out, coverage: view };
+        }
+      }
+    }
+    return out;
+  }
+
+  async _callTool(toolName, args = {}) {
     switch (toolName) {
       case 'dice_status': {
         return this.engine.getStateSummary(args.address || '');

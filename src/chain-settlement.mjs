@@ -44,12 +44,28 @@
  *     instance books the same result and builds the same payout note from it.
  *   - A payout body is claimed per order + re-sign generation (`payout:<orderId>:<n>`) before it is
  *     broadcast, so two instances can never sign two different transfers for one order.
+ *
+ * Ledger-first reconciliation (fix/reconcile-onchain-payouts)
+ *   - After a state loss, bets found on the ledger that predate the vault state are NEEDS_REVIEW
+ *     (never re-rolled). Each tick, for every such bet the bank's own FINAL outbound transfers are
+ *     searched for its payout (`DICE1:WIN:<bet16>:roll=..`) or refund (`DICE1:REFUND:<bet16>:..`), memos
+ *     read per tx. A found payout settles the bet with the on-chain amount and the memo's roll (an
+ *     unverified claim), with the normal win-path bankroll effects (house P&L, dev fee, pool fee).
+ *     Nothing is paid again. Without a payout the bet stays in review.
+ *   - Every other FINAL bank outflow that matches no order, no recovered bet and no in-flight tx is
+ *     booked as a recovered outflow, so the internal books reconcile to the chain.
+ *   - Each decision is claimed in the store (`reconcile:<txid>`), so all instances book the same thing,
+ *     and the engine is idempotent by txid.
+ *   - Trading hold: until a reconcile pass has completed AND the books are covered by the confirmed
+ *     on-chain balance, new bets and withdrawals are refused (and deferred if they arrive on the
+ *     ledger directly), and quotes for them are not valid. Deposits stay open.
  */
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
 import { PersistQueue } from './settlement-store.mjs';
 
 const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
+const HOLD_ACTIONS = new Set(['BET', 'LP_WITHDRAW', 'WITHDRAW', 'CLAIM']);
 
 function now() {
   return Date.now();
@@ -71,6 +87,7 @@ export class ChainSettlement {
     backoffMaxMs = 5 * 60 * 1000,
     maxResign = 3,
     inboundExpireMs = 30 * 60 * 1000,
+    balanceStaleMs = 60 * 1000,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -85,6 +102,9 @@ export class ChainSettlement {
     this.backoffMaxMs = backoffMaxMs;
     this.maxResign = maxResign;
     this.inboundExpireMs = inboundExpireMs;
+    this.balanceStaleMs = balanceStaleMs;
+    this._lastRow = null;
+    this._lastRowAt = 0;
     this.logger = logger;
     this._tickPromise = null;
     this._tickErrors = [];
@@ -98,6 +118,7 @@ export class ChainSettlement {
     this._loaded = false;
     this.fatalError = null;
     this.ledgerIndexComplete = false;
+    this.reconcile = { status: 'PENDING', reason: 'Reconciling the vault with the minepoa ledger (first pass not finished yet)', at: null, inReview: [], recovered: 0, audit: null };
     this.state = { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, ledgerOut: {}, seq: 0, createdAt: Math.floor(now() / 1000) };
     const loaded = store.load();
     if (loaded && typeof loaded.then === 'function') {
@@ -231,13 +252,26 @@ export class ChainSettlement {
    * opts.reserve = {key, micros}: bank exposure held for this tx until it settles.
    * opts.groupId: batch id (batch.completed fires once every member resolves).
    */
-  async submitInbound(txEnvelope, { reserve = null, groupId = null } = {}) {
+  async submitInbound(txEnvelope, { reserve = null, groupId = null, coverage = null } = {}) {
     await this.ready();
     const { body, txid, parsed } = this._validateInbound(txEnvelope);
+    const hold = HOLD_ACTIONS.has(parsed.action) && !this.state.inbound[txid] ? await this.ensureReconciled() : null;
+    if (hold) {
+      throw Object.assign(new Error(`${hold.reason} Not broadcast; try again shortly.`), { status: 503, code: hold.status, txid });
+    }
     const existing = this.state.inbound[txid];
     if (existing && existing.status !== 'FAILED' && existing.status !== 'EXPIRED') return this._inboundView(existing, { duplicate: true });
     if (this.engine.processedTxids.has(txid)) return { txid, status: 'BOOKED', duplicate: true, result: this.engine.processedTxids.get(txid) };
 
+    // Bank coverage: a bet is broadcast only after its worst-case payout is reserved against the
+    // bank's real free funds (atomic across instances). Batches pre-reserve their combined worst case.
+    let cov = coverage;
+    if (parsed.action === 'BET' && !cov) {
+      const q = this.engine.quoteBet({ address: body.from, amountPoa: body.amount, targetBps: parsed.targetBps, direction: parsed.direction });
+      if (!q.payoutOnWinMicros) throw Object.assign(new Error(q.error || 'Bet outside allowed limits'), { status: 400, code: 'BET_LIMITS', quote: q });
+      await this.reserveBetCoverage(txid, BigInt(q.payoutOnWinMicros));
+      cov = { key: txid, micros: String(q.payoutOnWinMicros) };
+    }
     const rec = {
       txid,
       seq: ++this.state.seq,
@@ -248,6 +282,7 @@ export class ChainSettlement {
       status: 'SUBMITTING',
       submittedAt: now(),
       reserve,
+      coverage: cov ? { key: cov.key, micros: String(cov.micros) } : null,
       groupId,
       attempts: 0,
       error: null,
@@ -260,6 +295,7 @@ export class ChainSettlement {
       await this.flush();
     } catch (err) {
       delete this.state.inbound[txid];
+      this._releaseCoverage(rec);
       throw Object.assign(new Error(`Vault store unavailable; not broadcast: ${err.message}`), { status: 503, txid });
     }
 
@@ -278,6 +314,7 @@ export class ChainSettlement {
         rec.error = String(err.message || err);
         this._nonceCache.delete(body.from);
         this._releaseReserve(rec);
+        this._releaseCoverage(rec);
         this._resolveGroup(rec);
         this._save();
         this._emit('settlement.updated', this._inboundView(rec));
@@ -366,6 +403,7 @@ export class ChainSettlement {
           rec.status = 'EXPIRED';
           rec.error = 'Not seen on the minepoa ledger in time; nothing was booked';
           this._releaseReserve(rec);
+          this._releaseCoverage(rec);
           this._resolveGroup(rec);
           this._save();
           this._emit('settlement.updated', this._inboundView(rec));
@@ -376,6 +414,7 @@ export class ChainSettlement {
         rec.status = 'FAILED';
         rec.error = 'minepoa marked the tx invalid; nothing was booked';
         this._releaseReserve(rec);
+        this._releaseCoverage(rec);
         this._resolveGroup(rec);
         this._save();
         this._emit('settlement.updated', this._inboundView(rec));
@@ -449,6 +488,7 @@ export class ChainSettlement {
       rec.status = 'FAILED';
       rec.error = 'Ledger copy of the tx does not match what was submitted; not booked';
       this._releaseReserve(rec);
+      this._releaseCoverage(rec);
       this._resolveGroup(rec);
       this._save();
       return;
@@ -457,16 +497,51 @@ export class ChainSettlement {
     // A bet older than this vault state means the state was lost after it was (probably) settled.
     // Re-rolling it with a new seed could pay an outcome that never happened, so hold it for review.
     // Deposits, withdrawals and chat replay safely (payouts are de-duplicated by their ledger order tag).
-    if (rec.discoveredBy === 'ledger-scan' && rec.action === 'BET' && this.state.createdAt && Number(b.ts || 0) < this.state.createdAt && !this.engine.processedTxids.has(rec.txid)) {
+    // "Replay" = the tx predates this vault state OR the bank already paid something that references it
+    // on chain (ledger-first: the ledger, not a timestamp, says it was processed before the state loss).
+    const predates = Boolean(this.state.createdAt && Number(b.ts || 0) < this.state.createdAt);
+    const replay = rec.discoveredBy === 'ledger-scan' && (predates || this._outflowRefs().has(rec.txid.slice(0, 16)));
+    if (replay && rec.action === 'BET' && !this.engine.processedTxids.has(rec.txid)) {
       rec.status = 'NEEDS_REVIEW';
       rec.ledger = { atts: tx.atts, final: tx.final };
-      rec.error = 'Bet predates this vault state (state was lost); not re-rolled. Operator review needed.';
+      rec.error = 'Bet predates this vault state (state was lost); not re-rolled. It is settled from its on-chain payout if one exists, otherwise it stays in review.';
       this._save();
       this._emit('settlement.updated', this._inboundView(rec));
       return;
     }
+    // Trading hold: a NEW bet / withdrawal waits (stays open, booked later) until the books reconcile.
+    if (this.tradingHold() && !replay && HOLD_ACTIONS.has(rec.action) && !this.engine.processedTxids.has(rec.txid)) {
+      rec.ledger = { atts: tx.atts, final: tx.final };
+      rec.heldBy = this.reconcile.status;
+      return true;
+    }
     let result;
-    if (this.engine.processedTxids.has(rec.txid)) {
+    if (!this.engine.processedTxids.has(rec.txid) && rec.action === 'BET' && !rec.coverage) {
+      // A bet that arrived straight on the ledger (no reservation yet): reserve its worst case now.
+      const parsedBet = parseDiceMemo(b.memo || '');
+      const q = parsedBet.valid ? this.engine.quoteBet({ address: b.from, amountPoa: b.amount, targetBps: parsedBet.targetBps, direction: parsedBet.direction }) : null;
+      if (q && q.valid) {
+        const cov = await this.betCoverage(BigInt(q.payoutOnWinMicros), { reserveKey: rec.txid });
+        if (cov.unknown) {
+          // Fail closed: bank balance unknown/stale or books not reconciled -> HOLD (not rolled, not
+          // refunded); it is booked on a later tick once the balance is known again.
+          rec.ledger = { atts: tx.atts, final: tx.final };
+          rec.heldBy = cov.code;
+          rec.error = `Held: ${cov.reason}`;
+          return true;
+        }
+        if (!cov.ok) {
+          // Known balance, cannot cover: REFUND the full wager (no dust deducted); never rolled.
+          result = this.engine.queueRefund({ sourceTxid: rec.txid, to: b.from, amountPoa: b.amount, reason: `bank cannot cover worst-case payout ${q.payoutOnWinPoa} POA`, full: true, ts: b.ts || Math.floor(now() / 1000) });
+          this.watcher.flushOutboundQueueSync?.();
+        } else {
+          rec.coverage = { key: rec.txid, micros: String(q.payoutOnWinMicros) };
+        }
+      }
+    }
+    if (result) {
+      // refunded above
+    } else if (this.engine.processedTxids.has(rec.txid)) {
       result = this.engine.processedTxids.get(rec.txid);
     } else {
       const ticket = await this._claimBetTicket(rec, b);
@@ -507,6 +582,7 @@ export class ChainSettlement {
       : null;
     this._resolveGroup(rec);
     this._save();
+    this._releaseCoverage(rec); // settled: its payout (if any) is now a queued order counted as pending
     this._emit('settlement.updated', this._inboundView(rec));
   }
 
@@ -522,6 +598,7 @@ export class ChainSettlement {
       row = await this.client.getAddress(this.bankAddress);
     } catch (err) {
       this._tickErrors.push(err.message);
+      this._lastRow = null; // unknown balance: bets fail closed until the next good read
       return null;
     }
     // Recent-transfer feed: optional, only saves memo lookups (its window is small and shifts).
@@ -554,6 +631,7 @@ export class ChainSettlement {
             memo = await this.client.getMemo(t.id);
           } catch (err) {
             this._tickErrors.push(`memo ${t.id.slice(0, 12)}: ${err.message}`);
+            outIndexComplete = false; // an unindexed inbound could be what an outflow pays: don't reconcile yet
             continue; // retried next tick
           }
         }
@@ -578,7 +656,13 @@ export class ChainSettlement {
         };
         this._save();
       } else if (t.from === this.bankAddress) {
-        if (this.state.ledgerOut[t.id]) continue;
+        if (this.state.ledgerOut[t.id]) {
+          if (t.final && !this.state.ledgerOut[t.id].final) {
+            this.state.ledgerOut[t.id].final = true;
+            this._save();
+          }
+          continue;
+        }
         let memo = t.memoKnown ? String(t.memo || '') : undefined;
         if (memo === undefined) {
           try {
@@ -594,7 +678,7 @@ export class ChainSettlement {
           continue;
         }
         const m = /:ord=([0-9a-f]{12})/.exec(String(memo));
-        this.state.ledgerOut[t.id] = { ord: m ? m[1] : null, to: t.to, amountPoa: t.amount, memo: String(memo).slice(0, 200) };
+        this.state.ledgerOut[t.id] = { ord: m ? m[1] : null, to: t.to, amountPoa: t.amount, memo: String(memo).slice(0, 200), final: Boolean(t.final), ts: t.ts || null };
         this._save();
       }
     }
@@ -640,6 +724,8 @@ export class ChainSettlement {
       source: est2 !== null && est2 >= est1 ? 'checkpoint-minus-outbound' : 'ledger-history-final',
       at: now()
     };
+    this._lastRow = outIndexComplete ? row : null;
+    this._lastRowAt = now();
     return row;
   }
 
@@ -943,6 +1029,7 @@ export class ChainSettlement {
         await this._syncSeed();
         const row = await this._scanBank();
         await this._confirmInbound();
+        await this._reconcile(row);
         this._adoptOutbound();
         await this._processOutbound(row);
         await this.flush();
@@ -1002,6 +1089,306 @@ export class ChainSettlement {
     return null;
   }
 
+  // ─── Bank coverage of bets ────────────────────────────────────────────────
+
+  /**
+   * Free funds for NEW bets, from the bank's real money:
+   *   base  = min(confirmed on-chain balance - sent-but-unlisted payouts - queued/pending payouts
+   *               - dev reserve - incentive pool,  internal NAV)
+   *   limit = base - LP withdrawal liabilities (queued withdrawals + withdraw triggers in flight)
+   * Every unsettled bet's worst-case payout is reserved against `limit` in the shared store
+   * (scope "bets"), so free = limit - reserved. Fails closed (unknown) when the balance is
+   * unknown or stale, the outflow index is incomplete, or reconciliation / audit is not OK.
+   */
+  coverageLimit() {
+    const hold = this.tradingHold();
+    if (hold) return { known: false, code: hold.status, reason: hold.reason };
+    const row = this._lastRow;
+    if (!row || typeof row.effectiveMicros !== 'bigint') return { known: false, code: 'BANK_BALANCE_UNKNOWN', reason: 'The bank balance on minepoa is unknown right now; bets are paused until it can be read.' };
+    if (now() - this._lastRowAt > this.balanceStaleMs) return { known: false, code: 'BANK_BALANCE_STALE', reason: `The bank balance was last read ${Math.round((now() - this._lastRowAt) / 1000)}s ago; bets are paused until it is refreshed.` };
+    let pendingOut = 0n;
+    for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT') pendingOut += toMicros(o.amountPoa);
+    for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
+    const onChainFree = row.effectiveMicros - this._inFlightOutMicros(row.listedIds) - pendingOut - this.engine.devReserveMicros - this.engine.incentivePoolMicros;
+    const nav = this.engine.bankNavMicros;
+    const base = onChainFree < nav ? onChainFree : nav;
+    let withdrawLiab = 0n;
+    for (const w of this.engine.withdrawalQueue || []) {
+      try {
+        withdrawLiab += this.engine.microsForShares(BigInt(w.sharesToRedeem));
+      } catch {
+        // ignore malformed
+      }
+    }
+    for (const r of Object.values(this.state.inbound)) {
+      if (!OPEN_IN.has(r.status) || !['LP_WITHDRAW', 'WITHDRAW', 'CLAIM'].includes(r.action)) continue;
+      const pos = this.engine.lpPositions.get(r.from);
+      if (pos) withdrawLiab += this.engine.microsForShares(pos.shares);
+    }
+    const limit = base - withdrawLiab;
+    return { known: true, limitMicros: limit > 0n ? limit : 0n, baseMicros: base, onChainFreeMicros: onChainFree, navMicros: nav, withdrawalLiabilityMicros: withdrawLiab };
+  }
+
+  /** Refresh the bank balance (one tick) if it is missing or stale. */
+  async ensureFreshBalance() {
+    if (!this._lastRow || now() - this._lastRowAt > this.balanceStaleMs || !this.reconcile.at) await this.tick().catch(() => {});
+  }
+
+  /**
+   * Can `worstMicros` more worst-case payout be covered? With opts.reserveKey it also reserves it
+   * atomically (cross-instance). Returns { ok, unknown, code, reason, freeMicros, ... }.
+   */
+  async betCoverage(worstMicros, { reserveKey = null } = {}) {
+    const lim = this.coverageLimit();
+    if (!lim.known) return { ok: false, unknown: true, code: lim.code, reason: lim.reason };
+    const w = BigInt(worstMicros);
+    let used;
+    if (reserveKey) {
+      let r;
+      try {
+        r = await this._persist.reserveCapacity('bets', reserveKey, w.toString(), lim.limitMicros.toString(), this.inboundExpireMs + 5 * 60 * 1000);
+      } catch (err) {
+        return { ok: false, unknown: true, code: 'COVERAGE_STORE_ERROR', reason: `Could not reserve bank coverage (${err.message}); bets are paused.` };
+      }
+      used = BigInt(r.usedMicros);
+      if (r.ok) return { ok: true, reserved: true, limitMicros: lim.limitMicros, usedMicros: used, freeMicros: lim.limitMicros - used, worstMicros: w };
+    } else {
+      try {
+        used = BigInt(await this._persist.capacityUsed('bets'));
+      } catch (err) {
+        return { ok: false, unknown: true, code: 'COVERAGE_STORE_ERROR', reason: `Could not read bank coverage (${err.message}); bets are paused.` };
+      }
+      if (used + w <= lim.limitMicros) return { ok: true, limitMicros: lim.limitMicros, usedMicros: used, freeMicros: lim.limitMicros - used, worstMicros: w };
+    }
+    const free = lim.limitMicros > used ? lim.limitMicros - used : 0n;
+    return {
+      ok: false,
+      code: 'BANK_INSUFFICIENT',
+      reason: `The bank's free funds (${fromMicros(free)} POA after unsettled bets, pending payouts and withdrawals) cannot cover this worst-case payout of ${fromMicros(w)} POA.`,
+      limitMicros: lim.limitMicros,
+      usedMicros: used,
+      freeMicros: free,
+      worstMicros: w
+    };
+  }
+
+  /** Reserve or throw (API / MCP / batch paths). */
+  async reserveBetCoverage(key, worstMicros) {
+    await this.ensureFreshBalance();
+    const cov = await this.betCoverage(worstMicros, { reserveKey: key });
+    if (!cov.ok) throw Object.assign(new Error(`${cov.reason} Not broadcast.`), { status: cov.unknown ? 503 : 409, code: cov.code, coverage: cov });
+    return cov;
+  }
+
+  releaseBetCoverage(key, micros = null) {
+    return this._persist.releaseCapacity('bets', key, micros === null ? null : String(micros)).catch((err) => this._tickErrors.push(`coverage release: ${err.message}`));
+  }
+
+  _releaseCoverage(rec) {
+    if (!rec || !rec.coverage) return;
+    const { key, micros } = rec.coverage;
+    rec.coverage = null;
+    // a batch shares one reservation key: release this roll's slice only
+    this.releaseBetCoverage(key, key === rec.txid ? null : micros);
+  }
+
+  // ─── Reconciliation ───────────────────────────────────────────────────────
+
+  /** Run one tick first if no reconcile pass has finished yet (cold start), then report the hold. */
+  async ensureReconciled() {
+    if (!this.reconcile.at) await this.tick().catch(() => {});
+    return this.tradingHold();
+  }
+
+  /** null when trading is open; otherwise { status, reason } (bets / withdrawals refused). */
+  tradingHold() {
+    if (!this.reconcile || this.reconcile.status === 'OK') return null;
+    return { status: this.reconcile.status === 'SOLVENCY_HOLD' ? 'SOLVENCY_HOLD' : 'RECONCILING', reason: this.reconcile.reason };
+  }
+
+  _knownOutTxids() {
+    const known = new Set();
+    for (const o of Object.values(this.state.outbound)) {
+      if (o.txid) known.add(o.txid);
+      for (const x of o.superseded || []) if (x.txid) known.add(x.txid);
+    }
+    for (const id of this.engine.recoveredOutflows.keys()) known.add(id);
+    return known;
+  }
+
+  _knownOrderTags() {
+    const tags = new Set();
+    for (const o of Object.values(this.state.outbound)) tags.add(o.orderId.slice(0, 12));
+    for (const item of this.engine.outboundQueue) tags.add(String(item.orderId).slice(0, 12));
+    return tags;
+  }
+
+  /** Is this bank outflow final on the ledger? (index flag, else ask the node) */
+  async _outFinal(txid) {
+    const o = this.state.ledgerOut[txid];
+    if (o && o.final) return true;
+    const tx = await this.client.getTx(txid).catch(() => undefined);
+    if (tx === undefined) throw new Error('minepoa unreachable');
+    if (tx && this._confirmed(tx) && !tx.invalid) {
+      if (o) o.final = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** 16-hex txid prefixes referenced by the memos of the bank's outgoing transfers (WIN/REFUND/PAYOUT/...). */
+  _outflowRefs() {
+    const refs = new Set();
+    for (const o of Object.values(this.state.ledgerOut || {})) {
+      for (const part of String(o.memo || '').split(':')) if (/^[0-9a-f]{16}$/.test(part)) refs.add(part);
+    }
+    return refs;
+  }
+
+  /** Claim a reconciliation decision so every instance books the same one. */
+  async _claimDecision(txid, decision) {
+    const res = await this._persist.claim(`reconcile:${txid}`, decision);
+    return res.value;
+  }
+
+  _applyDecision(d) {
+    if (d.kind === 'BET_WIN') {
+      return this.engine.applyRecoveredBetWin({
+        betTxid: d.betTxid,
+        address: d.to,
+        wagerMicros: BigInt(d.wagerMicros),
+        payoutMicros: BigInt(d.amountMicros),
+        payoutTxid: d.txid,
+        targetBps: d.targetBps ?? null,
+        direction: d.direction ?? null,
+        memoRollDisplay: d.memoRoll ?? null,
+        ts: d.ts
+      });
+    }
+    if (d.kind === 'BET_REFUND') {
+      return this.engine.applyRecoveredBetRefund({ betTxid: d.betTxid, address: d.to, refundMicros: BigInt(d.amountMicros), refundTxid: d.txid, ts: d.ts });
+    }
+    return this.engine.applyRecoveredOutflow({ txid: d.txid, to: d.to, amountMicros: BigInt(d.amountMicros), memo: d.memo, ts: d.ts });
+  }
+
+  /**
+   * Ledger-first reconciliation (runs every tick, before outbound processing and before quotes are
+   * re-opened). Never signs or pays anything: it only books what is already final on chain.
+   */
+  async _reconcile(row) {
+    const prevStatus = this.reconcile.status;
+    const set = (status, reason, extra = {}) => {
+      this.reconcile = { ...this.reconcile, status, reason, at: now(), ...extra };
+      if (prevStatus !== status) this._emit('settlement.reconcile', { status, reason });
+    };
+    if (!row || row.effectiveMicros === null || row.effectiveMicros === undefined) return set('PENDING', 'Waiting for a trustworthy bank balance from minepoa before reopening bets and withdrawals.');
+    if (!this.ledgerIndexComplete) return set('PENDING', 'Still indexing the bank\'s outgoing transfers on minepoa (memos); bets and withdrawals reopen once every outflow is accounted for.');
+    try {
+      const known = this._knownOutTxids();
+      const outs = Object.entries(this.state.ledgerOut || {});
+      // 1. bets in review: match their on-chain payout / refund
+      const review = Object.values(this.state.inbound).filter((r) => r.status === 'NEEDS_REVIEW' && r.action === 'BET');
+      for (const rec of review) {
+        if (this.engine.processedTxids.has(rec.txid)) {
+          rec.status = 'BOOKED';
+          rec.result = { ...(this.engine.processedTxids.get(rec.txid) || {}), provablyFair: undefined };
+          rec.error = null;
+          this._save();
+          continue;
+        }
+        const tag = rec.txid.slice(0, 16);
+        let match = null;
+        for (const [id, o] of outs) {
+          if (known.has(id) || o.to !== rec.from) continue;
+          const memo = String(o.memo || '');
+          if (memo.startsWith(`DICE1:WIN:${tag}:`) || memo.startsWith(`DICE1:REFUND:${tag}:`)) {
+            match = { id, o, kind: memo.startsWith('DICE1:WIN:') ? 'BET_WIN' : 'BET_REFUND' };
+            break;
+          }
+        }
+        if (!match) {
+          rec.error = 'Bet predates this vault state (state was lost) and no payout or refund for it is on the ledger: treated as unresolved (a loss leaves no payout). Not re-rolled; operator review.';
+          continue;
+        }
+        if (!(await this._outFinal(match.id))) continue; // wait until the payout is final
+        const parsed = parseDiceMemo(rec.memo || '');
+        const roll = /:roll=(\d{1,2}\.\d{2})(?::|$)/.exec(match.o.memo || '');
+        const decision = await this._claimDecision(match.id, {
+          v: 1,
+          kind: match.kind,
+          txid: match.id,
+          betTxid: rec.txid,
+          to: rec.from,
+          amountMicros: toMicros(match.o.amountPoa).toString(),
+          wagerMicros: toMicros(rec.amountPoa).toString(),
+          targetBps: parsed.valid ? parsed.targetBps : null,
+          direction: parsed.valid ? parsed.direction : null,
+          memoRoll: roll ? roll[1] : null,
+          memo: String(match.o.memo || '').slice(0, 200),
+          ts: Math.floor(now() / 1000)
+        });
+        const result = this._applyDecision(decision);
+        known.add(match.id);
+        rec.status = 'BOOKED';
+        rec.bookedAt = now();
+        rec.error = null;
+        rec.recovered = true;
+        rec.result = result
+          ? { action: result.action, won: result.won, rollDisplay: result.rollDisplay, rollVerified: false, wagerPoa: result.wagerPoa, payoutPoa: result.payoutPoa || result.refundedPoa, payoutTxid: match.id }
+          : null;
+        this._save();
+        this._emit('settlement.updated', this._inboundView(rec));
+      }
+      // 2. any other final bank outflow that nothing explains (only once every replay is booked)
+      const refs = this._outflowRefs();
+      const replaying = Object.values(this.state.inbound).some((r) => OPEN_IN.has(r.status) && r.discoveredBy === 'ledger-scan' && ((this.state.createdAt && Number(r.ledgerTs || 0) < this.state.createdAt) || refs.has(r.txid.slice(0, 16))));
+      if (replaying) return set('PENDING', 'Replaying ledger deposits / withdrawals into the rebuilt vault; bets and withdrawals reopen when done.');
+      const tags = this._knownOrderTags();
+      const inboundTags = new Set(Object.keys(this.state.inbound).map((id) => id.slice(0, 16)));
+      for (const id of this.engine.processedTxids.keys()) inboundTags.add(String(id).slice(0, 16));
+      let recovered = 0;
+      for (const [id, o] of outs) {
+        if (known.has(id) || (o.ord && tags.has(o.ord))) continue;
+        const memo = String(o.memo || '');
+        const reviewTag = /^DICE1:(?:WIN|REFUND):([0-9a-f]{16}):/.exec(memo);
+        if (reviewTag && review.some((r) => r.txid.startsWith(reviewTag[1]) && r.status === 'NEEDS_REVIEW')) continue; // handled above once final
+        // An outflow that names an inbound tx we know (deposit / withdrawal / bet / chat) is that tx's payout:
+        // it is adopted by its order tag when the tx is booked, or matched in review. Never book it as "unexplained".
+        if (memo.split(':').some((part) => /^[0-9a-f]{16}$/.test(part) && inboundTags.has(part))) continue;
+        if (!(await this._outFinal(id))) continue;
+        const decision = await this._claimDecision(id, {
+          v: 1,
+          kind: 'UNMATCHED_OUTFLOW',
+          txid: id,
+          to: o.to,
+          amountMicros: toMicros(o.amountPoa).toString(),
+          memo: memo.slice(0, 200),
+          ts: Math.floor(now() / 1000)
+        });
+        this._applyDecision(decision);
+        known.add(id);
+        recovered += 1;
+        if (this.logger) this.logger(`reconcile: booked unmatched bank outflow ${id.slice(0, 16)} (${o.amountPoa} POA)`);
+      }
+      if (recovered) this._save();
+      // 3. the books must be covered by the confirmed on-chain balance
+      let pendingOut = 0n;
+      for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT') pendingOut += toMicros(o.amountPoa);
+      for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
+      const required = this.engine.bankNavMicros + this.engine.devReserveMicros + this.engine.incentivePoolMicros + pendingOut;
+      const available = row.effectiveMicros - this._inFlightOutMicros(row.listedIds);
+      const inReview = Object.values(this.state.inbound).filter((r) => r.status === 'NEEDS_REVIEW').map((r) => r.txid);
+      const audit = { onChainPoa: fromMicros(available < 0n ? 0n : available), requiredPoa: fromMicros(required), ok: available >= required };
+      if (!audit.ok) {
+        return set('SOLVENCY_HOLD', `Books (${fromMicros(required)} POA) exceed the confirmed on-chain bank balance (${fromMicros(available < 0n ? 0n : available)} POA); bets and withdrawals are paused until reconciled.`, { inReview, audit, recovered: this.reconcile.recovered + recovered });
+      }
+      return set('OK', null, { inReview, audit, recovered: this.reconcile.recovered + recovered });
+    } catch (err) {
+      this._tickErrors.push(`reconcile: ${err.message}`);
+      return set(prevStatus === 'OK' ? 'OK' : 'PENDING', prevStatus === 'OK' ? null : `Reconciliation could not finish (${err.message}); retrying.`);
+    }
+  }
+
   summary() {
     const count = (list, key) => list.reduce((m, r) => ((m[r[key]] = (m[r[key]] || 0) + 1), m), {});
     const outs = Object.values(this.state.outbound);
@@ -1019,6 +1406,9 @@ export class ChainSettlement {
       onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
       bankBalance: this.lastBankBalance,
       ledgerIndexComplete: this.ledgerIndexComplete,
+      reconcile: { status: this.reconcile.status, reason: this.reconcile.reason, at: this.reconcile.at ? new Date(this.reconcile.at).toISOString() : null, inReview: this.reconcile.inReview, audit: this.reconcile.audit },
+      trading: this.tradingHold() ? 'HOLD' : 'OPEN',
+      recoveredOutflows: [...this.engine.recoveredOutflows.entries()].slice(-20).map(([txid, r]) => ({ txid, ...r })),
       minepoa: this.client.stats || null,
       inbound: count(ins, 'status'),
       outbound: count(outs, 'status'),

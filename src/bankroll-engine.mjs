@@ -101,6 +101,9 @@ export class BankrollEngine {
     // betTxid -> settlement ticket claimed in the shared store (transient). When present, settleBet
     // uses the ticket's nonce / seed / roll instead of computing its own, so every instance agrees.
     this.settlementTickets = new Map();
+    // Ledger-first reconciliation: bank outflows found on chain that this state did not create
+    // (txid -> record). Each is booked exactly once (see applyRecoveredBetWin / applyRecoveredOutflow).
+    this.recoveredOutflows = new Map();
     this._deferSave = false; // batch execution writes state once at the end
 
     this.seedManager = new SeedCommitManager(options.seedState || null);
@@ -1047,6 +1050,122 @@ export class BankrollEngine {
     return receipt;
   }
 
+  /** Fees the normal settle path charges on a wager (same formulas as quoteBet / settleBet). */
+  feesForWager(wagerMicros, won) {
+    const w = BigInt(wagerMicros);
+    let devFeeMicros = w > 0n ? (w * DEV_FEE_BPS >= 10000n ? (w * DEV_FEE_BPS) / 10000n : 1n) : 0n;
+    if (this.devFeeMode === 'net_profit_only' && won) devFeeMicros = 0n;
+    const incentiveFeeMicros = (w * INCENTIVE_POOL_BPS) / 10000n;
+    return { devFeeMicros, incentiveFeeMicros };
+  }
+
+  /**
+   * Book a WON bet whose payout is already final on chain but whose settlement record was lost
+   * (vault state lost; the bet was marked NEEDS_REVIEW). Same bankroll effects as settleBet's win
+   * branch, using the ON-CHAIN payout amount; nothing is enqueued, so it is never paid again.
+   * The roll comes from the payout memo and is recorded as an unverified claim (its seed is gone).
+   */
+  applyRecoveredBetWin({ betTxid, address, wagerMicros, payoutMicros, payoutTxid, targetBps = null, direction = null, memoRollDisplay = null, ts = Math.floor(Date.now() / 1000) }) {
+    if (this.processedTxids.has(betTxid)) return { idempotent: true, ...this.processedTxids.get(betTxid) };
+    const wager = BigInt(wagerMicros);
+    const payout = BigInt(payoutMicros);
+    const { devFeeMicros, incentiveFeeMicros } = this.feesForWager(wager, true);
+    const profitMicros = payout - wager;
+    const bankDeduction = profitMicros + devFeeMicros + incentiveFeeMicros;
+    this.bankNavMicros -= bankDeduction;
+    this.netHouseProfitMicros -= bankDeduction;
+    this.devReserveMicros += devFeeMicros;
+    this.totalDevEarnedMicros += devFeeMicros;
+    this.incentivePoolMicros += incentiveFeeMicros;
+    this.totalPlayerWinsCount += 1;
+    this.totalBetsCount += 1;
+    this.totalVolumeMicros += wager;
+    const rollBps = memoRollDisplay && /^\d{1,2}\.\d{2}$/.test(memoRollDisplay) ? Math.round(parseFloat(memoRollDisplay) * 100) : null;
+    const receipt = {
+      action: 'BET_SETTLED',
+      recovered: true,
+      betTxid,
+      address,
+      won: true,
+      rollBps,
+      rollDisplay: memoRollDisplay,
+      rollSource: 'payout-memo',
+      rollVerified: false,
+      rollNote: 'Recovered from the on-chain payout after the vault state was lost. The roll is the payout memo\'s claim; its server seed was not preserved, so it cannot be recomputed.',
+      direction,
+      targetBps,
+      wagerPoa: fromMicros(wager),
+      payoutPoa: fromMicros(payout),
+      netPlayerDeltaPoa: fromMicros(profitMicros),
+      devFeeReservedPoa: fromMicros(devFeeMicros),
+      devReserveAddress: this.devReserveAddress,
+      devReserveTotalPoa: fromMicros(this.devReserveMicros),
+      incentiveFeePoa: fromMicros(incentiveFeeMicros),
+      bankNavPoa: fromMicros(this.bankNavMicros),
+      availableBankrollPoa: fromMicros(this.availableBankrollMicros),
+      payoutOrderId: null,
+      payoutTxid,
+      provablyFair: null,
+      ts
+    };
+    this.recoveredOutflows.set(payoutTxid, { kind: 'BET_WIN', betTxid, to: address, amountPoa: fromMicros(payout), bankDeductionPoa: fromMicros(bankDeduction), at: ts });
+    this.processedTxids.set(betTxid, receipt);
+    this.betHistory.unshift(receipt);
+    if (this.betHistory.length > 200) this.betHistory.pop();
+    this.assertAccountingInvariant();
+    this._saveToDisk();
+    this._emit('bet.settled', receipt);
+    return receipt;
+  }
+
+  /** A bet whose on-chain refund was found: no bankroll effect (wager in, refund out). */
+  applyRecoveredBetRefund({ betTxid, address, refundMicros, refundTxid, ts = Math.floor(Date.now() / 1000) }) {
+    if (this.processedTxids.has(betTxid)) return { idempotent: true, ...this.processedTxids.get(betTxid) };
+    const receipt = { action: 'REFUND_QUEUED', recovered: true, betTxid, address, refundedPoa: fromMicros(refundMicros), payoutTxid: refundTxid, reason: 'Recovered from the on-chain refund', ts };
+    this.recoveredOutflows.set(refundTxid, { kind: 'BET_REFUND', betTxid, to: address, amountPoa: fromMicros(refundMicros), bankDeductionPoa: '0.000000', at: ts });
+    this.processedTxids.set(betTxid, receipt);
+    this._saveToDisk();
+    this._emit('bet.refunded', receipt);
+    return receipt;
+  }
+
+  /**
+   * A final bank outflow that matches nothing this state knows (e.g. a payout made before the state
+   * was lost). Booked once, against the dev reserve first when it went to the dev reserve address
+   * with a sweep memo, otherwise against the LP bankroll, so the books match the chain again.
+   */
+  applyRecoveredOutflow({ txid, to, amountMicros, memo = '', ts = Math.floor(Date.now() / 1000) }) {
+    if (this.recoveredOutflows.has(txid)) return { idempotent: true, ...this.recoveredOutflows.get(txid) };
+    let remaining = BigInt(amountMicros);
+    let fromDev = 0n;
+    if (to === this.devReserveAddress && String(memo).startsWith('DICE1:DEV_RESERVE')) {
+      fromDev = remaining > this.devReserveMicros ? this.devReserveMicros : remaining;
+      this.devReserveMicros -= fromDev;
+      this.totalDevSweptMicros += fromDev;
+      remaining -= fromDev;
+    }
+    let fromNav = remaining > this.bankNavMicros ? this.bankNavMicros : remaining;
+    this.bankNavMicros -= fromNav;
+    this.netHouseProfitMicros -= fromNav;
+    const uncovered = remaining - fromNav;
+    const rec = {
+      kind: 'UNMATCHED_OUTFLOW',
+      to,
+      memo: sanitizeUntrustedText(String(memo), 160),
+      amountPoa: fromMicros(BigInt(amountMicros)),
+      fromDevReservePoa: fromMicros(fromDev),
+      bankDeductionPoa: fromMicros(fromNav),
+      uncoveredPoa: fromMicros(uncovered),
+      at: ts
+    };
+    this.recoveredOutflows.set(txid, rec);
+    if (this.lockedCollateralMicros > this.bankNavMicros) this.lockedCollateralMicros = this.bankNavMicros;
+    this.assertAccountingInvariant();
+    this._saveToDisk();
+    this._emit('bank.reconciled', { txid, ...rec });
+    return rec;
+  }
+
   placeAndSettleBet(params) {
     const lockRes = this.lockBetCollateral(params);
     if (lockRes.idempotent || lockRes.action === 'REFUND_QUEUED') {
@@ -1055,14 +1174,15 @@ export class BankrollEngine {
     return this.settleBet(params.betTxid, params.ts);
   }
 
-  queueRefund({ sourceTxid, to, amountPoa, reason, ts = Math.floor(Date.now() / 1000) }) {
+  queueRefund({ sourceTxid, to, amountPoa, reason, full = false, ts = Math.floor(Date.now() / 1000) }) {
     if (!sourceTxid) throw new Error('sourceTxid required');
     if (this.processedTxids.has(sourceTxid)) {
       return { idempotent: true, ...this.processedTxids.get(sourceTxid) };
     }
     const grossMicros = toMicros(amountPoa);
     // Deduct 1 micro-POA anti-spam dust floor if > 1 micro-POA
-    const refundMicros = grossMicros > 1n ? grossMicros - 1n : grossMicros;
+    // (full=true: uncovered bets are refunded in full, nothing deducted)
+    const refundMicros = !full && grossMicros > 1n ? grossMicros - 1n : grossMicros;
     let outboundOrderId = null;
     if (refundMicros > 0n && isValidPoaAddress(to)) {
       const outbound = this._enqueueOutboundTransfer({
@@ -1558,6 +1678,7 @@ export class BankrollEngine {
       playerNonces: [...this.playerNonces.entries()],
       playerClientSeeds: [...this.playerClientSeeds.entries()],
       processedTxids: [...this.processedTxids.entries()].slice(-1000),
+      recoveredOutflows: [...this.recoveredOutflows.entries()],
       withdrawalQueue: this.withdrawalQueue,
       // Never drop an unsettled order: keep every non-final item plus recent history.
       outboundQueue: this.outboundQueue.filter((x, i, all) => !['SENT_SIGNED', 'CONFIRMED', 'FAILED'].includes(x.status) || i >= all.length - 500),
@@ -1644,6 +1765,7 @@ export class BankrollEngine {
     this.playerNonces = new Map(raw.playerNonces || []);
     this.playerClientSeeds = new Map(raw.playerClientSeeds || []);
     this.processedTxids = new Map(raw.processedTxids || []);
+    this.recoveredOutflows = new Map(raw.recoveredOutflows || []);
     this.withdrawalQueue = raw.withdrawalQueue || [];
     this.outboundQueue = raw.outboundQueue || [];
     this.betHistory = raw.betHistory || [];

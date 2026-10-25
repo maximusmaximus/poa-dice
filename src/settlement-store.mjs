@@ -3,7 +3,13 @@
  * settlement-store.mjs: durable JSON document store for the vault (settlement queue + engine snapshot).
  *
  * Adapter interface:  { kind, location, durable, load(): doc|null|Promise, save(doc): void|Promise,
- *                      claim(key, value): {claimed, value}|Promise }
+ *                      claim(key, value): {claimed, value}|Promise,
+ *                      reserveCapacity(scope, key, micros, limitMicros, ttlMs): {ok, usedMicros}|Promise,
+ *                      releaseCapacity(scope, key, micros|null): void|Promise,
+ *                      capacityUsed(scope): micros(BigInt-able string)|Promise }
+ *   reserveCapacity atomically adds a reservation only if (sum of live reservations in scope) + micros
+ *   <= limitMicros, across every instance sharing the store. Reservations expire after ttlMs so a
+ *   crashed instance cannot leak capacity forever. Used for bank coverage of unsettled bets.
  *   save must be durable when it returns / resolves.
  *   claim is an atomic insert-if-absent shared by every server instance using the same store:
  *   the first caller stores `value` and gets {claimed:true, value}; every later caller (any instance)
@@ -67,8 +73,83 @@ export function createFileStore(dir, name = 'settlement.json') {
         if (err.code !== 'EEXIST') throw err;
         return { claimed: false, value: JSON.parse(fs.readFileSync(f, 'utf8')) };
       }
+    },
+    reserveCapacity(scope, key, micros, limitMicros, ttlMs = 30 * 60 * 1000) {
+      return withFileLock(dir, `cap-${claimFileName(scope)}`, (book) => capReserve(book, key, micros, limitMicros, ttlMs));
+    },
+    releaseCapacity(scope, key, micros = null) {
+      return withFileLock(dir, `cap-${claimFileName(scope)}`, (book) => capRelease(book, key, micros));
+    },
+    capacityUsed(scope) {
+      const f = path.join(dir, 'claims', `cap-${claimFileName(scope)}.json`);
+      return fs.existsSync(f) ? capUsed(JSON.parse(fs.readFileSync(f, 'utf8'))) : '0';
     }
   };
+}
+
+/** Read-modify-write a JSON book under an O_EXCL lock file (single host, many processes). */
+function withFileLock(dir, name, fn) {
+  const cdir = path.join(dir, 'claims');
+  fs.mkdirSync(cdir, { recursive: true });
+  const lock = path.join(cdir, `${name}.lock`);
+  const file = path.join(cdir, `${name}.json`);
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      fs.closeSync(fs.openSync(lock, 'wx'));
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > 10000) fs.unlinkSync(lock); // stale lock
+      } catch {
+        // ignore
+      }
+      if (Date.now() > deadline) throw new Error('capacity lock busy');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+  try {
+    const book = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+    const out = fn(book);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(book));
+    fs.renameSync(tmp, file);
+    return out;
+  } finally {
+    fs.unlinkSync(lock);
+  }
+}
+
+/** Capacity book on a plain object { [key]: { micros, exp } }; returns the updated book or null. */
+function capReserve(book, key, micros, limitMicros, ttlMs, nowMs = Date.now()) {
+  let used = 0n;
+  for (const [k, r] of Object.entries(book)) {
+    if (r.exp <= nowMs) {
+      delete book[k];
+      continue;
+    }
+    used += BigInt(r.micros);
+  }
+  if (book[key]) return { ok: true, usedMicros: used.toString(), existing: true };
+  const m = BigInt(micros);
+  if (used + m > BigInt(limitMicros)) return { ok: false, usedMicros: used.toString() };
+  book[key] = { micros: m.toString(), exp: nowMs + ttlMs };
+  return { ok: true, usedMicros: (used + m).toString() };
+}
+
+function capRelease(book, key, micros) {
+  const r = book[key];
+  if (!r) return;
+  const left = micros === null || micros === undefined ? 0n : BigInt(r.micros) - BigInt(micros);
+  if (left > 0n) r.micros = left.toString();
+  else delete book[key];
+}
+
+function capUsed(book, nowMs = Date.now()) {
+  let used = 0n;
+  for (const r of Object.values(book)) if (r.exp > nowMs) used += BigInt(r.micros);
+  return used.toString();
 }
 
 function claimFileName(key) {
@@ -88,6 +169,18 @@ export function createMemoryStore(initial = null, { claims = createClaimTable() 
       if (claims.has(key)) return { claimed: false, value: JSON.parse(claims.get(key)) };
       claims.set(key, JSON.stringify(value));
       return { claimed: true, value: JSON.parse(JSON.stringify(value)) };
+    },
+    reserveCapacity(scope, key, micros, limitMicros, ttlMs = 30 * 60 * 1000) {
+      const k = `__capacity__:${scope}`;
+      if (!claims.has(k)) claims.set(k, {});
+      return capReserve(claims.get(k), key, micros, limitMicros, ttlMs);
+    },
+    releaseCapacity(scope, key, micros = null) {
+      const book = claims.get(`__capacity__:${scope}`);
+      if (book) capRelease(book, key, micros);
+    },
+    capacityUsed(scope) {
+      return capUsed(claims.get(`__capacity__:${scope}`) || {});
     },
     kind: 'memory',
     location: 'memory',
@@ -158,9 +251,51 @@ export function createRedisRestStore({ url, token, key, fetchImpl = globalThis.f
       const raw = await call(['GET', k]);
       if (!raw) throw new Error(`KV claim ${claimKey}: SET NX refused but no value stored`);
       return { claimed: false, value: JSON.parse(raw) };
+    },
+    // Lua runs atomically in Redis: sum live reservations, add only if within the limit.
+    async reserveCapacity(scope, rkey, micros, limitMicros, ttlMs = 30 * 60 * 1000) {
+      const r = await call(['EVAL', REDIS_RESERVE_LUA, '1', `${key}:cap:${scope}`, rkey, String(micros), String(limitMicros), String(Date.now()), String(ttlMs)]);
+      return { ok: Number(r[0]) === 1, usedMicros: String(r[1]) };
+    },
+    async releaseCapacity(scope, rkey, micros = null) {
+      await call(['EVAL', REDIS_RELEASE_LUA, '1', `${key}:cap:${scope}`, rkey, micros === null || micros === undefined ? '' : String(micros)]);
+    },
+    async capacityUsed(scope) {
+      const r = await call(['EVAL', REDIS_USED_LUA, '1', `${key}:cap:${scope}`, String(Date.now())]);
+      return String(r);
     }
   };
 }
+
+const REDIS_RESERVE_LUA = `
+local now = tonumber(ARGV[4])
+local used = 0
+local all = redis.call('HGETALL', KEYS[1])
+for i = 1, #all, 2 do
+  local m, e = string.match(all[i + 1], '([^:]+):([^:]+)')
+  if tonumber(e) <= now then redis.call('HDEL', KEYS[1], all[i]) else used = used + tonumber(m) end
+end
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return {1, tostring(used)} end
+if used + tonumber(ARGV[2]) > tonumber(ARGV[3]) then return {0, tostring(used)} end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2] .. ':' .. tostring(now + tonumber(ARGV[5])))
+return {1, tostring(used + tonumber(ARGV[2]))}`;
+const REDIS_RELEASE_LUA = `
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if not v then return 0 end
+if ARGV[2] == '' then redis.call('HDEL', KEYS[1], ARGV[1]) return 1 end
+local m, e = string.match(v, '([^:]+):([^:]+)')
+local left = tonumber(m) - tonumber(ARGV[2])
+if left > 0 then redis.call('HSET', KEYS[1], ARGV[1], tostring(left) .. ':' .. e) else redis.call('HDEL', KEYS[1], ARGV[1]) end
+return 1`;
+const REDIS_USED_LUA = `
+local now = tonumber(ARGV[1])
+local used = 0
+local all = redis.call('HGETALL', KEYS[1])
+for i = 1, #all, 2 do
+  local m, e = string.match(all[i + 1], '([^:]+):([^:]+)')
+  if tonumber(e) > now then used = used + tonumber(m) end
+end
+return tostring(used)`;
 
 /**
  * Postgres adapter. `query(text, params)` -> { rows } (defaults to a lazily created node-postgres Pool).
@@ -171,20 +306,46 @@ export function createPostgresStore({ connectionString, key, query = null }) {
   if (!query && !connectionString) throw new Error('Postgres store needs a connection string');
   let pool = null;
   let ready = null;
-  const q = async (text, params) => {
-    if (query) return query(text, params);
+  let fakeTx = Promise.resolve(); // serializes transactions when a custom query fn is injected (tests)
+  const getPool = async () => {
     if (!pool) {
       const pg = await import('pg');
       const Pool = pg.Pool || pg.default.Pool;
       pool = new Pool({ connectionString, max: 3, ssl: /sslmode=disable|localhost|127\.0\.0\.1/.test(connectionString) ? false : { rejectUnauthorized: false } });
     }
-    return pool.query(text, params);
+    return pool;
+  };
+  const q = async (text, params) => {
+    if (query) return query(text, params);
+    return (await getPool()).query(text, params);
+  };
+  /** Run fn(query) inside one transaction (BEGIN/COMMIT) on one connection. */
+  const tx = async (fn) => {
+    if (query) {
+      const run = fakeTx.then(() => fn(query));
+      fakeTx = run.catch(() => {});
+      return run;
+    }
+    const client = await (await getPool()).connect();
+    try {
+      await client.query('BEGIN');
+      const out = await fn((t, p) => client.query(t, p));
+      await client.query('COMMIT');
+      return out;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
   };
   const init = () => {
     if (!ready) {
       ready = (async () => {
         await q('CREATE TABLE IF NOT EXISTS poa_dice_docs (key TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())');
         await q('CREATE TABLE IF NOT EXISTS poa_dice_claims (key TEXT PRIMARY KEY, value JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+        await q('CREATE TABLE IF NOT EXISTS poa_dice_capacity (scope TEXT PRIMARY KEY)');
+        await q('CREATE TABLE IF NOT EXISTS poa_dice_reservations (scope TEXT NOT NULL, key TEXT NOT NULL, micros BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (scope, key))');
       })();
       ready.catch(() => {
         ready = null;
@@ -215,6 +376,38 @@ export function createPostgresStore({ connectionString, key, query = null }) {
       if (!r.rows[0]) throw new Error(`Postgres claim ${claimKey}: conflict but no row`);
       const v = r.rows[0].value;
       return { claimed: false, value: typeof v === 'string' ? JSON.parse(v) : v };
+    },
+    // One row per scope is locked FOR UPDATE, so concurrent reservations in that scope serialize.
+    async reserveCapacity(scope, rkey, micros, limitMicros, ttlMs = 30 * 60 * 1000) {
+      await init();
+      const sc = `${key}:${scope}`;
+      return tx(async (tq) => {
+        await tq('INSERT INTO poa_dice_capacity (scope) VALUES ($1) ON CONFLICT (scope) DO NOTHING', [sc]);
+        await tq('SELECT scope FROM poa_dice_capacity WHERE scope = $1 FOR UPDATE', [sc]);
+        await tq('DELETE FROM poa_dice_reservations WHERE scope = $1 AND expires_at <= now()', [sc]);
+        const ex = await tq('SELECT micros FROM poa_dice_reservations WHERE scope = $1 AND key = $2', [sc, rkey]);
+        const u = await tq('SELECT COALESCE(SUM(micros), 0)::text AS used FROM poa_dice_reservations WHERE scope = $1', [sc]);
+        const used = BigInt(u.rows[0]?.used ?? '0');
+        if (ex.rows.length) return { ok: true, usedMicros: used.toString(), existing: true };
+        if (used + BigInt(micros) > BigInt(limitMicros)) return { ok: false, usedMicros: used.toString() };
+        await tq("INSERT INTO poa_dice_reservations (scope, key, micros, expires_at) VALUES ($1, $2, $3, now() + ($4 || ' milliseconds')::interval)", [sc, rkey, String(micros), String(ttlMs)]);
+        return { ok: true, usedMicros: (used + BigInt(micros)).toString() };
+      });
+    },
+    async releaseCapacity(scope, rkey, micros = null) {
+      await init();
+      const sc = `${key}:${scope}`;
+      if (micros === null || micros === undefined) {
+        await q('DELETE FROM poa_dice_reservations WHERE scope = $1 AND key = $2', [sc, rkey]);
+        return;
+      }
+      await q('UPDATE poa_dice_reservations SET micros = micros - $3 WHERE scope = $1 AND key = $2', [sc, rkey, String(micros)]);
+      await q('DELETE FROM poa_dice_reservations WHERE scope = $1 AND key = $2 AND micros <= 0', [sc, rkey]);
+    },
+    async capacityUsed(scope) {
+      await init();
+      const u = await q('SELECT COALESCE(SUM(micros), 0)::text AS used FROM poa_dice_reservations WHERE scope = $1 AND expires_at > now()', [`${key}:${scope}`]);
+      return String(u.rows[0]?.used ?? '0');
     }
   };
 }
@@ -292,6 +485,29 @@ export class PersistQueue {
   async claim(key, value) {
     if (typeof this.store.claim !== 'function') return { claimed: true, value, local: true };
     return this.store.claim(key, value);
+  }
+
+  /** Atomic cross-instance capacity reservation (see adapter docs). */
+  async reserveCapacity(scope, key, micros, limitMicros, ttlMs) {
+    if (typeof this.store.reserveCapacity !== 'function') {
+      this._localCap = this._localCap || {};
+      this._localCap[scope] = this._localCap[scope] || {};
+      return capReserve(this._localCap[scope], key, micros, limitMicros, ttlMs ?? 30 * 60 * 1000);
+    }
+    return this.store.reserveCapacity(scope, key, micros, limitMicros, ttlMs);
+  }
+
+  async releaseCapacity(scope, key, micros = null) {
+    if (typeof this.store.releaseCapacity !== 'function') {
+      if (this._localCap && this._localCap[scope]) capRelease(this._localCap[scope], key, micros);
+      return;
+    }
+    return this.store.releaseCapacity(scope, key, micros);
+  }
+
+  async capacityUsed(scope) {
+    if (typeof this.store.capacityUsed !== 'function') return capUsed((this._localCap && this._localCap[scope]) || {});
+    return BigInt(await this.store.capacityUsed(scope)).toString();
   }
 
   /** Resolves once every save() so far is durable; rejects if the store is failing. */
