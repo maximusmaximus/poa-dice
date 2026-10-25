@@ -19,6 +19,7 @@ import { buildSignedTransfer, formatDiceMemo, fromMicros, genKeypair, isValidPoa
 
 export const BATCH_COUNTS = Object.freeze([1, 5, 100, 1000]);
 export const CLIENT_SEED_RE = /^[A-Za-z0-9._-]{1,48}$/;
+export const VIP_NOTE = 'Quoted without a player address at the standard house edge. If the signing address is a VIP staker the final edge is lower (payout slightly higher); pass address to see the exact numbers.';
 const FULL_ROLL_LIST_LIMIT = 100;
 
 function invalid(code, reason, extra = {}) {
@@ -103,7 +104,10 @@ export function quoteBatch(engine, {
     worstCaseKellyCapPoa: fromMicros(worstKellyCap),
     maxWagerForCountPoa: maxWagerHint.toFixed(6),
     expectedValuePoa: `-${fromMicros((wagerMicros * BigInt(q.houseEdgeBps) * nBig) / 10000n)}`,
-    chainRequired: Boolean(chain?.required)
+    chainRequired: Boolean(chain?.required),
+    vipTierName: q.vipTierName,
+    addressUsed: address || null,
+    vipNote: address ? null : VIP_NOTE
   };
 
   if (avail <= 0n) return invalid('bank_empty', 'Bankroll has 0 available POA, so no rolls can be covered', base);

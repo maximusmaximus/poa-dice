@@ -128,7 +128,8 @@ node bin/poa-dice-replay.mjs
 | `chat_send` | Post an Ed25519-verified message to the live site chat via MCP. |
 | `feed_recent` | Read near real-time bets and bankroll actions. |
 | `dice_quote_batch` | Read-only: can the bank cover 1 / 5 / 100 / 1000 rolls right now (worst case: every roll wins)? Returns the reason when it can't. |
-| `dice_batch_roll` | Place exactly 1, 5, 100 or 1000 rolls in one call with a required `max_total_spend_poa`. The whole exposure is reserved upfront. Entry point: the page's **Copy prompt** button. |
+| `dice_batch_roll` | Place exactly 1, 5, 100 or 1000 rolls in one call with a required `max_total_spend_poa`. The whole exposure is reserved upfront. Waits up to `wait_seconds` (default 60, max 120) for settlement and returns wins, losses, net, each `bet_txid` with its roll, payout txids and the server seed hash (or `PENDING_CONFIRMATION` + how to poll `tx_status`). Entry point: the page's **Copy prompt** button. |
+| `tx_templates` | Read-only: the exact UNSIGNED transfer(s) an action expects (chain id, bank address, amount, exact `DICE1` memo, count) so an agent can build `signed_tx` / `signed_txs` locally without guessing. The quote tools return the same object as `transferTemplate`. |
 | `bank_claim_yield` | Redeem only the shares worth your gain above principal (principal stays staked). |
 | `offline_memo_builder` | Build a pure `DICE1:*` memo and `poa.mjs send` command for website-down operation. |
 
@@ -147,7 +148,7 @@ The page never signs and never holds a private key. Every action button copies a
 | **Copy claim-yield prompt** | `bank_claim_yield` (dry run) → `bank_claim_yield` |
 | **Copy agent chat prompt** | `chat_send` |
 
-Each prompt holds the MCP URL, the exact arguments, a total spend cap and a stop condition. It also tells the agent to sign with its own wallet (`signed_tx`/`signed_txs` preferred; `privkey` only with the user's consent). MCP `initialize` returns `instructions` naming these prompts as the entry point.
+Each prompt holds the MCP URL, the exact arguments, a total spend cap and a stop condition. It spells out every transfer the agent must sign locally — chain id, bank address, amount, the exact `DICE1` memo and the count — and tells it to stop if the quote's `transferTemplate` (or `tx_templates`) differs. It signs with the agent's own wallet (`signed_tx`/`signed_txs`; `privkey` only with the user's explicit consent). If you enter **your PoA address** (saved in this browser only), the prompt names it and the quotes use your VIP tier so quote and roll match; without it, the prompt says the final edge may be lower for VIP stakers. Roll prompts pass `wait_seconds: 60` and tell the agent to poll `tx_status` if the result is still pending. MCP `initialize` returns `instructions` naming these prompts as the entry point.
 
 ### Availability rules (enforced on both the page and the server)
 - A batch of N rolls is allowed only when `N × (profit on win + 0.15% fees) ≤ available bankroll` and the per-roll profit fits the 1% Kelly cap of the bankroll left after reserving the rest of the batch. A count that fails is disabled, and the page shows the reason.

@@ -26,6 +26,7 @@ import { LedgerWatcher } from './ledger-watcher.mjs';
 import { MCP_INSTRUCTIONS, MCP_TOOLS, McpHandler, ROLL_FORMULA } from './mcp-server.mjs';
 import { executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
 import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
+import { transferTemplates } from './tx-templates.mjs';
 import crypto from 'node:crypto';
 import { loadBankWallet } from './bank-key.mjs';
 import { ChainSettlement } from './chain-settlement.mjs';
@@ -198,6 +199,12 @@ export function createDiceServer(options = {}) {
   }
   const readOnly = () => readOnlyState;
   const publicBankAddress = () => (chainSettlement && !settlement ? null : engine.bankAddress);
+  const chainIdValue = () => settlement?.client?.chainId || options.chainId || process.env.POA_CHAIN_ID || DEFAULT_CHAIN_ID;
+  /** Exact unsigned transfer the matching action tool expects (null when not buildable). */
+  const templateFor = (tool, args, extra = {}) => {
+    const tpl = transferTemplates({ tool, args, bankAddress: publicBankAddress(), chainId: chainIdValue(), ...extra });
+    return tpl.ok ? tpl : null;
+  };
   const chainFetch = options.chainFetch || ((address) => fetchExplorerAddress(watcher.nodeUrl, address));
   const chainCacheMs = options.chainCacheMs ?? 15000;
   const devEndpoints = options.devEndpoints !== undefined ? Boolean(options.devEndpoints) : process.env.POA_DICE_DEV_ENDPOINTS === '1';
@@ -265,6 +272,9 @@ export function createDiceServer(options = {}) {
     chainRequired: requireChain,
     chainContext,
     adminToken,
+    bankAddress: () => publicBankAddress(),
+    chainId: () => chainIdValue(),
+    waitPollMs: options.mcpWaitPollMs,
     reserveSpend(address, micros) {
       pendingSpend.set(address, (pendingSpend.get(address) || 0n) + BigInt(micros));
     },
@@ -423,7 +433,7 @@ export function createDiceServer(options = {}) {
         return sendJson(res, 200, {
           ok: true,
           protocol: 'poa-dice/v1',
-          chainId: 'poa-mainnet-1',
+          chainId: chainIdValue(),
           bankAddress: publicBankAddress(),
           devReserveAddress: DEV_RESERVE_ADDRESS,
           devFeeBps: 10,
@@ -467,6 +477,7 @@ export function createDiceServer(options = {}) {
         const address = urlObj.searchParams.get('address') || '';
         const summary = engine.getStateSummary(address);
         summary.bankAddress = publicBankAddress();
+        summary.chainId = chainIdValue();
         summary.settlement = settlementBrief();
         if (requireChain) {
           try {
@@ -532,9 +543,13 @@ export function createDiceServer(options = {}) {
         const hold = await tradingHold();
         const roBlock = (q) => (readOnlyState ? { ...q, valid: false, code: readOnlyState.status, reason: `Vault is read-only (${readOnlyState.status.replace(/_/g, ' ')})`, error: readOnlyState.error } : holdBlock(q, hold));
         const covBlock = async (q) => (q && q.maxPotentialPayoutPoa ? coverageBlock(q, await betCoverage(toMicros(q.maxPotentialPayoutPoa))) : q);
-        if (p.count) return sendJson(res, 200, await covBlock(roBlock(quoteBatch(engine, { ...params, count: Number(p.count) }))));
+        const withTpl = (q) =>
+          q && q.valid
+            ? { ...q, transferTemplate: templateFor('dice_batch_roll', { count: q.count, amount_poa: params.amountPoa, target_bps: params.targetBps, direction: params.direction, client_seed: params.clientSeed ?? undefined, address: params.address || undefined }) }
+            : q;
+        if (p.count) return sendJson(res, 200, withTpl(await covBlock(roBlock(quoteBatch(engine, { ...params, count: Number(p.count) })))));
         const counts = [];
-        for (const q of quoteAllCounts(engine, params).map(roBlock)) counts.push(await covBlock(q));
+        for (const q of quoteAllCounts(engine, params).map(roBlock)) counts.push(withTpl(await covBlock(q)));
         return sendJson(res, 200, {
           chain: { required: chain.required, ok: chain.ok },
           counts
@@ -575,6 +590,10 @@ export function createDiceServer(options = {}) {
           const hold = await tradingHold();
           if (hold) for (const k of ['withdraw', 'claim']) out[k] = holdBlock(out[k], hold);
         }
+        const addr = address || undefined;
+        if (out.stake?.valid) out.stake.transferTemplate = templateFor('bank_stake', { amount_poa: out.stake.amountPoa, lock_epochs: out.stake.lockEpochs, referrer: out.stake.referrer || undefined, address: addr });
+        if (out.withdraw?.valid) out.withdraw.transferTemplate = templateFor('bank_withdraw', { mode: out.withdraw.mode, bps: out.withdraw.bps, address: addr });
+        if (out.claim?.valid && out.claim.shares) out.claim.transferTemplate = templateFor('bank_claim_yield', { address: addr }, { claimShares: out.claim.shares });
         return sendJson(res, 200, out);
       }
 
