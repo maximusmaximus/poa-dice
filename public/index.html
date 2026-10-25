@@ -26,6 +26,12 @@
     </div>
   </header>
 
+  <!-- Shown only while minepoa can't accept transactions (trading: PAUSED_LEDGER_UNAVAILABLE) -->
+  <div id="ledgerPausedBanner" class="ledger-banner hidden" role="status" aria-live="polite">
+    <span class="ledger-banner-icon" aria-hidden="true">&#9208;</span>
+    <span id="ledgerPausedText">Betting is paused: the PoA ledger isn't accepting transactions right now. It resumes automatically.</span>
+  </div>
+
   <!-- Bank telemetry strip -->
   <section class="stat-strip" aria-label="Bankroll status">
     <div class="stat-card">

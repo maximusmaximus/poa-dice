@@ -31,6 +31,7 @@ import { isAddress as isPoaAddress, looksLikePrivkey, walletBalance } from './wa
 import crypto from 'node:crypto';
 import { loadBankWallet } from './bank-key.mjs';
 import { ChainSettlement } from './chain-settlement.mjs';
+import { LedgerProbe, LEDGER_HOLD } from './ledger-probe.mjs';
 import { DEFAULT_CHAIN_ID, MinepoaClient } from './minepoa-client.mjs';
 import { resolveStore } from './settlement-store.mjs';
 import {
@@ -186,7 +187,18 @@ export function createDiceServer(options = {}) {
             confirmPolicy: options.confirmPolicy || process.env.POA_DICE_CONFIRM || 'final',
             backoffBaseMs: options.backoffBaseMs ?? 2000,
             backoffMaxMs: options.backoffMaxMs ?? 5 * 60 * 1000,
-            inboundExpireMs: options.inboundExpireMs ?? 30 * 60 * 1000
+            inboundExpireMs: options.inboundExpireMs ?? 30 * 60 * 1000,
+            // Pause trading when minepoa can't accept transactions; resumes by itself (see ledger-probe.mjs).
+            ledgerProbe:
+              options.ledgerProbe === false
+                ? null
+                : options.ledgerProbe ||
+                  new LedgerProbe({
+                    nodeUrl: client.nodeUrl || options.nodeUrl || watcher.nodeUrl,
+                    fetchImpl: client.fetch || options.minepoaFetch || globalThis.fetch,
+                    intervalMs: options.ledgerProbeIntervalMs ?? 20000,
+                    minHoldMs: options.ledgerProbeMinHoldMs ?? 30000
+                  })
           });
           watcher.bankWallet = key.wallet;
           watcher.attachSettlement(settlement);
@@ -391,6 +403,7 @@ export function createDiceServer(options = {}) {
       status: 'OK',
       readOnly: false,
       trading: sum.trading,
+      ledger: sum.ledger,
       reconcile: sum.reconcile ? { status: sum.reconcile.status, reason: sum.reconcile.reason, inReview: sum.reconcile.inReview } : null,
       bankKeySource,
       confirmPolicy: sum.confirmPolicy,
@@ -624,7 +637,8 @@ export function createDiceServer(options = {}) {
         } else if (settlement) {
           out.autoBet = { ...out.autoBet, valid: false, code: 'chain_settled', reason: 'Auto-bet needs each roll settled first; use the roll builder batch instead' };
           const hold = await tradingHold();
-          if (hold) for (const k of ['withdraw', 'claim']) out[k] = holdBlock(out[k], hold);
+          // A ledger outage also stops stakes: the deposit could not be broadcast or confirmed.
+          if (hold) for (const k of hold.status === LEDGER_HOLD ? ['stake', 'withdraw', 'claim'] : ['withdraw', 'claim']) out[k] = holdBlock(out[k], hold);
         }
         const addr = address || undefined;
         if (out.stake?.valid) out.stake.transferTemplate = templateFor('bank_stake', { amount_poa: out.stake.amountPoa, lock_epochs: out.stake.lockEpochs, referrer: out.stake.referrer || undefined, address: addr });
@@ -640,7 +654,8 @@ export function createDiceServer(options = {}) {
           amountPoa: body.amountPoa || body.amount_poa || '100.000000',
           lockEpochs: Number(body.lockEpochs ?? body.lock_epochs ?? 0)
         });
-        return sendJson(res, 200, quote);
+        const dHold = await tradingHold();
+        return sendJson(res, 200, dHold && dHold.status === LEDGER_HOLD ? holdBlock(quote, dHold) : quote);
       }
 
       if (pathname === '/api/quote/withdraw' && (req.method === 'POST' || req.method === 'GET')) {

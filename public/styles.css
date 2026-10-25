@@ -1749,3 +1749,27 @@ body.modal-open { overflow: hidden; }
   .modal-actions .btn-modal-secondary { flex: 0 0 34%; }
 }
 .modal-actions .btn-modal-primary { flex: 1.6 1 0; }
+
+/* ---------- Ledger unavailable notice (trading paused automatically) ---------- */
+.ledger-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  max-width: 760px;
+  margin: 12px auto;
+  padding: 12px 18px;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: var(--radius-md);
+  background: rgba(245, 158, 11, 0.1);
+  color: #fde68a;
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.45;
+  text-align: center;
+}
+.ledger-banner-icon { font-size: 1.1rem; }
+@media (max-width: 600px) {
+  .ledger-banner { margin: 10px 12px; font-size: 0.84rem; }
+}

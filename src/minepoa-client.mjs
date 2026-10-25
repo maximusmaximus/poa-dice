@@ -153,7 +153,13 @@ export class MinepoaClient {
   /** null when the node has never seen the tx. */
   async getTx(txid) {
     const j = await this._get(`/api/explorer/tx/${encodeURIComponent(txid)}`);
-    if (!j || !j.id) return null;
+    if (!j) return null;
+    if (!j.id) {
+      // Only an explicit "unknown / not found" means never seen. A read node that is re-deriving
+      // ("not in segments", busy) does not know: throw so callers treat it as unknown (never re-sign on it).
+      if (j.error && !/unknown txid|not found|no such|not seen/i.test(String(j.error))) throw new Error(`minepoa explorer cannot answer for ${txid}: ${String(j.error).slice(0, 120)}`);
+      return null;
+    }
     const body = j.body || {};
     const out = {
       id: j.id,
@@ -212,7 +218,8 @@ export class MinepoaClient {
     const j = await resp.json().catch(() => ({}));
     if (resp.ok) return j || {};
     const msg = String(j?.error || `HTTP ${resp.status}`);
-    const definitive = resp.status >= 400 && resp.status < 500 && ![408, 409, 425, 429].includes(resp.status);
+    // 401/403 (auth / gateway) and 404/405 (route gone) say nothing about the tx itself: not definitive.
+    const definitive = resp.status >= 400 && resp.status < 500 && ![401, 403, 404, 405, 408, 409, 425, 429].includes(resp.status);
     throw new SubmitError(`minepoa submit rejected: ${msg}`, { status: resp.status, definitive, body: j });
   }
 }
