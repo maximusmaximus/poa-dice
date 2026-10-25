@@ -27,6 +27,7 @@ import { MCP_INSTRUCTIONS, MCP_TOOLS, McpHandler, ROLL_FORMULA } from './mcp-ser
 import { executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
 import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
 import { transferTemplates } from './tx-templates.mjs';
+import { isAddress as isPoaAddress, looksLikePrivkey, walletBalance } from './wallet-balance.mjs';
 import crypto from 'node:crypto';
 import { loadBankWallet } from './bank-key.mjs';
 import { ChainSettlement } from './chain-settlement.mjs';
@@ -265,7 +266,10 @@ export function createDiceServer(options = {}) {
     worstCasePayoutPoa: cov.worstMicros !== undefined ? fromMicros(cov.worstMicros) : null
   });
 
+  // Live, read-only balance for any poa1 address (checkpoint balance + txs the checkpoint doesn't cover yet).
+  const balanceFor = (address) => walletBalance(address, { fetchImpl: options.walletFetch || globalThis.fetch, node: watcher.nodeUrl || 'https://minepoa.com' });
   const mcpHooks = {
+    walletBalance: balanceFor,
     readOnly,
     tradingHold,
     betCoverage,
@@ -425,6 +429,22 @@ export function createDiceServer(options = {}) {
           return sendJson(res, 200, { checked: true, ...(await settlement.auditAgainstChain()) });
         } catch (err) {
           return sendJson(res, 503, { checked: false, error: redactSecrets(err.message) });
+        }
+      }
+
+      // Live wallet balance (read-only, no keys): GET /api/wallet/<poa1 address>/balance
+      const walletMatch = pathname.match(/^\/api\/wallet\/([^/]+)\/balance$/);
+      if (walletMatch && req.method === 'GET') {
+        let address = '';
+        try { address = decodeURIComponent(walletMatch[1]).trim(); } catch { address = ''; }
+        if (looksLikePrivkey(address)) return sendJson(res, 400, { error: 'That looks like a private key, not an address. Never send a private key; use the poa1 address.' });
+        if (!isPoaAddress(address)) return sendJson(res, 400, { error: 'Not a valid poa1 address' });
+        try {
+          return sendJson(res, 200, await balanceFor(address));
+        } catch (err) {
+          if (err.kind === 'busy') return sendJson(res, 503, { error: 'The minepoa ledger is catching up. Retry shortly.', retryAfterSeconds: err.retryAfter || 15 });
+          if (err.kind === 'network' || err.kind === 'timeout') return sendJson(res, 502, { error: 'Could not reach minepoa.com. Retry shortly.' });
+          return sendJson(res, 502, { error: redactSecrets(String(err.message || err)) });
         }
       }
 

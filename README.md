@@ -131,6 +131,7 @@ node bin/poa-dice-replay.mjs
 | `dice_batch_roll` | Place exactly 1, 5, 100 or 1000 rolls in one call with a required `max_total_spend_poa`. The whole exposure is reserved upfront. Waits up to `wait_seconds` (default 60, max 120) for settlement and returns wins, losses, net, each `bet_txid` with its roll, payout txids and the server seed hash (or `PENDING_CONFIRMATION` + how to poll `tx_status`). Entry point: the page's **Copy prompt** button. |
 | `tx_templates` | Read-only: the exact UNSIGNED transfer(s) an action expects (chain id, bank address, amount, exact `DICE1` memo, count) so an agent can build `signed_tx` / `signed_txs` locally without guessing. The quote tools return the same object as `transferTemplate`. |
 | `bank_claim_yield` | Redeem only the shares worth your gain above principal (principal stays staked). |
+| `wallet_balance` | Read-only, no key: the live balance of any `poa1` address. minepoa's explorer `balance` lags at the last checkpoint, so this adds the transfers the checkpoint doesn't cover yet. Returns `spendable` (final balance minus pending outgoing), `current`, pending in and out, the checkpoint balance and height, the last tx time, and per-tx status (pending N/5, or final by attestations or checkpoint). Same as `GET /api/wallet/<poa1>/balance`. |
 | `offline_memo_builder` | Build a pure `DICE1:*` memo and `poa.mjs send` command for website-down operation. |
 
 ---
@@ -188,6 +189,7 @@ When `POA_DICE_WATCHER_MODE` is not `simulated` (the default for `npm start` is 
 - **Outbound** (payouts, withdrawals, refunds, dev sweeps): a durable queue. Each order is signed with the bank key and persisted before broadcast. Retries use backoff and rebroadcast the **same** signed tx, so there is no double-pay across retries or restarts. Status goes QUEUED → SIGNED → SENT → CONFIRMED (or FAILED, or WAITING_FUNDS).
 - **Solvency:** orders are signed only when the on-chain bank balance covers them. That balance counts final inbound only and subtracts in-flight outbound; see Ledger recovery. `dice_audit_solvency` and `GET /api/audit/chain` compare the internal books with the on-chain balance.
 - **Status:** `GET /api/tx/<txid>/status`, MCP `tx_status`, `GET /api/settlement`, and `settlement` in `/api/state` and `/api/health`.
+- **Wallet balance:** `GET /api/wallet/<poa1 address>/balance` (CORS `*`) and MCP `wallet_balance`. These are read-only and never take a key. The result is cached for 5 s, and checkpoint-covered tx lookups are cached for good. It returns `503` with `retryAfterSeconds` while the minepoa ledger is catching up, and `400` for anything that isn't a `poa1` address, including a pasted private key. The browser version is the PoA key generator's balance checker at https://maximusmaximus.github.io/poa-keygen/check.html.
 - **Not in chain mode:** `dice_auto_strategy`, and batch `stop_on_*`. Both need each roll settled before the next. Batches broadcast all N rolls at once, and each settles as it confirms.
 
 ### Storage

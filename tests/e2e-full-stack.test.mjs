@@ -67,7 +67,7 @@ test('E2E 1: HTTP API + Near Real-Time SSE Stream + Streamable HTTP MCP (14 Tool
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
     }).then((r) => r.json());
-    assert.equal(listMcp.result.tools.length, 21);
+    assert.equal(listMcp.result.tools.length, 22);
 
     // 4. Call MCP tool bank_stake to add 5,000 POA to the bankroll
     const stakeCall = await fetch(`${info.url}/mcp`, {
