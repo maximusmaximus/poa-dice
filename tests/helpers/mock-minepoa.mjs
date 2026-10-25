@@ -60,9 +60,26 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     res.end(JSON.stringify(obj));
   };
 
+  let outage = 0; // when set, these paths answer this HTTP status (minepoa can't accept txs)
+  let outagePaths = ['/api/txs', '/api/submit'];
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
+    // Ledger probe traffic (poa-dice-probe UA, /api/submit?dry=1) never consumes injected faults or counts as a submit.
+    const isProbe = String(req.headers['user-agent'] || '').startsWith('poa-dice-probe');
+    if (isProbe || (req.method === 'POST' && p === '/api/submit' && url.searchParams.get('dry') === '1')) {
+      if (outage && outagePaths.includes(p)) return json(res, outage, { error: 'outage' });
+      if (req.method === 'POST') {
+        let raw = '';
+        for await (const c of req) raw += c;
+        const { kind, body } = JSON.parse(raw || '{}');
+        if (kind !== 'tx') return json(res, 400, { error: 'kind must be tx|att' });
+        if (!body || !body.type) return json(res, 400, { error: 'bad tx type' });
+        const err = check(body);
+        return err ? json(res, 400, { error: err }) : json(res, 200, { ok: true, dry: true, would_accept: true });
+      }
+    }
+    if (outage && outagePaths.includes(p)) return json(res, outage, { error: 'outage' });
     if (req.method === 'GET' && timeoutsLeft > 0) {
       timeoutsLeft -= 1;
       return; // never answer: the client's timeout fires
@@ -131,6 +148,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
   return {
     url,
     submits,
+    setOutage: (status, paths = ['/api/txs', '/api/submit']) => { outage = status || 0; outagePaths = paths; },
     balanceOf: (a) => fromMicros(bal.get(a) || 0n),
     setBalance: (a, v) => bal.set(a, toMicros(v)),
     /** Sign a checkpoint covering everything so far (realistic mode balances catch up). */

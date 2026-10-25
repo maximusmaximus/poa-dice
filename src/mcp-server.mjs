@@ -406,6 +406,9 @@ export const WRITE_TOOLS = new Set(['dice_place_bet', 'dice_batch_roll', 'dice_a
 /** Paused while the vault reconciles its books with the ledger (deposits stay open). */
 export const HOLD_TOOLS = new Set(['dice_place_bet', 'dice_batch_roll', 'dice_auto_strategy', 'bank_withdraw', 'bank_claim_yield']);
 export const HOLD_QUOTE_TOOLS = new Set(['dice_quote_bet', 'bank_quote_withdraw', 'dice_quote_batch']);
+// Also refused / invalid while the ledger can't accept transactions (LEDGER_UNAVAILABLE).
+export const LEDGER_HOLD_TOOLS = new Set(['bank_stake']);
+export const LEDGER_HOLD_QUOTE_TOOLS = new Set(['bank_quote_deposit']);
 
 export class McpHandler {
   /**
@@ -565,10 +568,12 @@ export class McpHandler {
       if (ro) return { valid: false, rejected: true, code: ro.status, error: ro.error };
     }
     // Trading hold (books being reconciled with the ledger): no new bets / withdrawals, no valid quotes.
-    if (this.hooks.tradingHold && (HOLD_TOOLS.has(toolName) || HOLD_QUOTE_TOOLS.has(toolName))) {
-      const hold = await this.hooks.tradingHold();
+    const ledgerOnly = LEDGER_HOLD_TOOLS.has(toolName) || LEDGER_HOLD_QUOTE_TOOLS.has(toolName);
+    if (this.hooks.tradingHold && (HOLD_TOOLS.has(toolName) || HOLD_QUOTE_TOOLS.has(toolName) || ledgerOnly)) {
+      const found = await this.hooks.tradingHold();
+      const hold = found && (!ledgerOnly || found.status === 'LEDGER_UNAVAILABLE') ? found : null;
       if (hold) {
-        const isQuote = HOLD_QUOTE_TOOLS.has(toolName) || (toolName === 'bank_claim_yield' && args.dry_run);
+        const isQuote = HOLD_QUOTE_TOOLS.has(toolName) || LEDGER_HOLD_QUOTE_TOOLS.has(toolName) || (toolName === 'bank_claim_yield' && args.dry_run);
         if (!isQuote) return { valid: false, rejected: true, code: hold.status, error: hold.reason };
         const q = await this._callTool(toolName, args);
         return { ...(q && typeof q === 'object' ? q : {}), valid: false, instant: false, withinLimits: false, code: hold.status, reason: hold.reason, error: hold.reason };

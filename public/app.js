@@ -15,6 +15,7 @@ const SEED_RE = /^[A-Za-z0-9._-]{1,48}$/;
 const AMOUNT_RE = /^\d+(?:\.\d{1,6})?$/;
 const ADDR_RE = /^poa1[1-9A-HJ-NP-Za-km-z]{30,60}$/;
 const POLL_MS = 4000;
+export const LEDGER_PAUSED_TEXT = "Betting is paused: the PoA ledger isn't accepting transactions right now. It resumes automatically.";
 const POLL_MS_DISCONNECTED = 2000;
 
 const state = {
@@ -24,6 +25,7 @@ const state = {
   withdrawBps: 10000,
   playerAddress: '',
   summary: null,
+  ledgerPaused: false,
   lastBetQuote: null,
   batchQuotes: null,
   actionQuotes: null,
@@ -368,7 +370,7 @@ function renderRollAvailability() {
   document.querySelectorAll('[data-roll-count]').forEach((btn) => {
     const n = Number(btn.getAttribute('data-roll-count'));
     const q = quotes?.find((x) => x.count === n);
-    const ok = !local && q && q.valid;
+    const ok = !state.ledgerPaused && !local && q && q.valid;
     btn.disabled = !ok;
     btn.title = ok ? `${n} roll(s): bank can cover every win` : local || q?.reason || 'Checking bank…';
     btn.classList.toggle('active', n === state.rollCount);
@@ -378,7 +380,7 @@ function renderRollAvailability() {
   $('batchTotalWager').textContent = sel ? `${formatNum(sel.totalWagerPoa, 2)} POA` : '—';
   $('batchExposure').textContent = sel ? `${formatNum(sel.maxBankExposurePoa, 2)} POA` : '—';
   $('batchBankAvail').textContent = sel ? `${formatNum(sel.availableBankrollPoa, 2)} POA` : '—';
-  let reason = local;
+  let reason = state.ledgerPaused ? LEDGER_PAUSED_TEXT : local;
   if (!reason && !quotes) reason = 'Waiting for the bank quote…';
   if (!reason && sel && !sel.valid) reason = sel.reason;
   if (!reason && quotes && !quotes.some((q) => q.valid)) reason = quotes[0]?.reason;
@@ -426,7 +428,8 @@ function renderActionAvailability() {
   for (const a of ACTIONS) {
     const aq = q?.[a.kind];
     let reason = null;
-    if (!q) reason = 'Checking availability…';
+    if (state.ledgerPaused && a.kind !== 'chat') reason = LEDGER_PAUSED_TEXT;
+    else if (!q) reason = 'Checking availability…';
     else if (q.addressError && a.kind !== 'chat') reason = q.addressError;
     else if (!aq?.valid) reason = aq?.reason || 'Unavailable';
     if (a.kind === 'autoBet' && !reason) {
@@ -547,6 +550,13 @@ function setStatus(text, st) {
 
 function applyStateSnapshot(data) {
   state.summary = data;
+  const paused = data?.settlement ? data.settlement.trading === 'PAUSED_LEDGER_UNAVAILABLE' : state.ledgerPaused;
+  if (paused !== state.ledgerPaused) {
+    state.ledgerPaused = paused;
+    $('ledgerPausedBanner').classList.toggle('hidden', !paused);
+    renderRollAvailability();
+    renderActionAvailability();
+  }
   const b = data.bankroll;
   if (b) {
     $('topBankNav').textContent = `${formatNum(b.bankNavPoa, 4)} POA`;

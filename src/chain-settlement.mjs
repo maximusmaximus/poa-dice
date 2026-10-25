@@ -62,10 +62,17 @@
  */
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
 import { PersistQueue } from './settlement-store.mjs';
+import { isLedgerOutage, LEDGER_HOLD } from './ledger-probe.mjs';
 
 const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
 const HOLD_ACTIONS = new Set(['BET', 'LP_WITHDRAW', 'WITHDRAW', 'CLAIM']);
+
+/** Public trading state: OPEN, HOLD (reconciling / solvency) or PAUSED_LEDGER_UNAVAILABLE. */
+export function tradingLabel(hold) {
+  if (!hold) return 'OPEN';
+  return hold.status === LEDGER_HOLD ? 'PAUSED_LEDGER_UNAVAILABLE' : 'HOLD';
+}
 
 function now() {
   return Date.now();
@@ -88,6 +95,7 @@ export class ChainSettlement {
     maxResign = 3,
     inboundExpireMs = 30 * 60 * 1000,
     balanceStaleMs = 60 * 1000,
+    ledgerProbe = null,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -106,6 +114,9 @@ export class ChainSettlement {
     this._lastRow = null;
     this._lastRowAt = 0;
     this.logger = logger;
+    // minepoa writability (see ledger-probe.mjs): when it cannot accept txs, trading pauses (LEDGER_UNAVAILABLE).
+    this.ledgerProbe = ledgerProbe;
+    if (ledgerProbe && !ledgerProbe.onChange) ledgerProbe.onChange = (view) => this._emit('ledger.status', view);
     this._tickPromise = null;
     this._tickErrors = [];
     this._timer = null;
@@ -255,6 +266,12 @@ export class ChainSettlement {
   async submitInbound(txEnvelope, { reserve = null, groupId = null, coverage = null } = {}) {
     await this.ready();
     const { body, txid, parsed } = this._validateInbound(txEnvelope);
+    // Ledger can't accept transactions: refuse every NEW broadcast (bets, stakes, withdrawals, chat) up front.
+    if (this.ledgerProbe && !this.state.inbound[txid] && !this.engine.processedTxids.has(txid)) {
+      await this.ledgerProbe.maybeProbe().catch(() => {});
+      const lh = this.ledgerProbe.hold();
+      if (lh) throw Object.assign(new Error(`${lh.reason} Not broadcast; nothing was booked.`), { status: 503, code: LEDGER_HOLD, txid });
+    }
     const hold = HOLD_ACTIONS.has(parsed.action) && !this.state.inbound[txid] ? await this.ensureReconciled() : null;
     if (hold) {
       throw Object.assign(new Error(`${hold.reason} Not broadcast; try again shortly.`), { status: 503, code: hold.status, txid });
@@ -305,6 +322,7 @@ export class ChainSettlement {
       if (resp && Number.isInteger(Number(resp.next_nonce))) this._nonceCache.set(body.from, { next: Number(resp.next_nonce), at: now() });
       rec.status = 'BROADCAST';
     } catch (err) {
+      this.ledgerProbe?.reportFailure('player broadcast', err);
       // The node may have taken it anyway (e.g. timeout after accept): ask the explorer.
       const seen = await this.client.getTx(txid).catch(() => null);
       if (seen) {
@@ -512,7 +530,7 @@ export class ChainSettlement {
     // Trading hold: a NEW bet / withdrawal waits (stays open, booked later) until the books reconcile.
     if (this.tradingHold() && !replay && HOLD_ACTIONS.has(rec.action) && !this.engine.processedTxids.has(rec.txid)) {
       rec.ledger = { atts: tx.atts, final: tx.final };
-      rec.heldBy = this.reconcile.status;
+      rec.heldBy = this.tradingHold()?.status || this.reconcile.status;
       return true;
     }
     let result;
@@ -835,6 +853,8 @@ export class ChainSettlement {
       return this._markSent(rec, resp || {});
     } catch (err) {
       rec.lastError = String(err.message || err);
+      // Stays queued and retries with backoff (same signed body, same txid: never paid twice).
+      this.ledgerProbe?.reportFailure('payout broadcast', err);
       if (err.definitive) {
         const again = await this.client.getTx(rec.txid).catch(() => undefined);
         if (again) return this._markSent(rec, {});
@@ -957,6 +977,7 @@ export class ChainSettlement {
         parents = await this._parents();
       } catch (err) {
         rec.lastError = err.message;
+        this.ledgerProbe?.reportFailure('payout parents (/api/txs)', err);
         rec.nextAttemptAt = now() + this._backoff(++rec.attempts);
         this._save();
         return;
@@ -1026,6 +1047,7 @@ export class ChainSettlement {
       this._tickErrors = [];
       try {
         await this.ready();
+        if (this.ledgerProbe) await this.ledgerProbe.maybeProbe().catch(() => {});
         await this._syncSeed();
         const row = await this._scanBank();
         await this._confirmInbound();
@@ -1197,13 +1219,19 @@ export class ChainSettlement {
   /** Run one tick first if no reconcile pass has finished yet (cold start), then report the hold. */
   async ensureReconciled() {
     if (!this.reconcile.at) await this.tick().catch(() => {});
+    if (this.ledgerProbe) await this.ledgerProbe.maybeProbe().catch(() => {});
     return this.tradingHold();
   }
 
-  /** null when trading is open; otherwise { status, reason } (bets / withdrawals refused). */
+  /**
+   * null when trading is open; otherwise { status, reason } (bets / withdrawals refused).
+   * RECONCILING / SOLVENCY_HOLD (books vs ledger) take precedence over LEDGER_UNAVAILABLE.
+   */
   tradingHold() {
-    if (!this.reconcile || this.reconcile.status === 'OK') return null;
-    return { status: this.reconcile.status === 'SOLVENCY_HOLD' ? 'SOLVENCY_HOLD' : 'RECONCILING', reason: this.reconcile.reason };
+    if (this.reconcile && this.reconcile.status !== 'OK') {
+      return { status: this.reconcile.status === 'SOLVENCY_HOLD' ? 'SOLVENCY_HOLD' : 'RECONCILING', reason: this.reconcile.reason };
+    }
+    return this.ledgerProbe ? this.ledgerProbe.hold() : null;
   }
 
   _knownOutTxids() {
@@ -1407,7 +1435,8 @@ export class ChainSettlement {
       bankBalance: this.lastBankBalance,
       ledgerIndexComplete: this.ledgerIndexComplete,
       reconcile: { status: this.reconcile.status, reason: this.reconcile.reason, at: this.reconcile.at ? new Date(this.reconcile.at).toISOString() : null, inReview: this.reconcile.inReview, audit: this.reconcile.audit },
-      trading: this.tradingHold() ? 'HOLD' : 'OPEN',
+      trading: tradingLabel(this.tradingHold()),
+      ledger: this.ledgerProbe ? this.ledgerProbe.view() : null,
       recoveredOutflows: [...this.engine.recoveredOutflows.entries()].slice(-20).map(([txid, r]) => ({ txid, ...r })),
       minepoa: this.client.stats || null,
       inbound: count(ins, 'status'),
