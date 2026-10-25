@@ -266,7 +266,36 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       await page.dispatchEvent('#lockEpochsInput', 'change');
       await setInput(page, '#referrerInput', staker.address);
       await page.waitForFunction(() => !document.getElementById('btnSubmitDeposit').disabled);
+      // Lock-up warning: nothing is copied until the user confirms; Esc, Cancel and the backdrop close it
+      await page.evaluate(() => navigator.clipboard.writeText('untouched'));
+      for (const how of ['escape', 'cancel', 'backdrop']) {
+        await page.click('#btnSubmitDeposit');
+        await page.waitForSelector('#stakeConfirm:not(.hidden)');
+        if (how === 'escape') await page.keyboard.press('Escape');
+        if (how === 'cancel') await page.click('#stakeConfirmCancel');
+        if (how === 'backdrop') await page.mouse.click(5, 5);
+        await page.waitForSelector('#stakeConfirm.hidden', { state: 'attached' });
+        assert.equal(await clipboard(page), 'untouched', `${how} must not copy the prompt`);
+      }
       await page.click('#btnSubmitDeposit');
+      await page.waitForSelector('#stakeConfirm:not(.hidden)');
+      const dialog = await page.$eval('#stakeConfirm [role="dialog"]', (d) => ({ modal: d.getAttribute('aria-modal'), label: document.getElementById(d.getAttribute('aria-labelledby')).textContent }));
+      assert.deepEqual(dialog, { modal: 'true', label: 'Your POA will be locked' });
+      const modalText = await page.textContent('#stakeConfirm');
+      assert.match(modalText, /Staking 1,000\.000000 POA/);
+      assert.match(modalText, /3 epochs · about 18 hours/);
+      assert.match(modalText, /Epoch 4 · about /);
+      assert.match(modalText, /No early exit\. Until epoch 4 the vault refuses every withdrawal/);
+      assert.match(modalText, /From epoch 4 you can withdraw your tokens again/);
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'stakeConfirmOk', 'focus moves into the dialog');
+      await page.keyboard.press('Tab');
+      assert.equal(await page.evaluate(() => document.getElementById('stakeConfirm').contains(document.activeElement)), true, 'focus is trapped');
+      await page.keyboard.press('Tab');
+      assert.equal(await page.evaluate(() => document.getElementById('stakeConfirm').contains(document.activeElement)), true, 'focus is trapped');
+      if (shotsDir) await page.screenshot({ path: path.join(shotsDir, 'stake-lock-modal.png'), fullPage: false });
+      await page.click('#stakeConfirmOk');
+      await page.waitForSelector('#stakeConfirm.hidden', { state: 'attached' });
+      await page.waitForFunction(() => navigator.clipboard.readText().then((t) => t !== 'untouched'));
       let text = await clipboard(page);
       assert.match(text, /bank_quote_deposit/);
       assert.match(text, /bank_stake/);
@@ -299,6 +328,24 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       latency.stakeNavMs = Date.now() - t0;
       await page.waitForFunction(() => !document.getElementById('btnSubmitWithdraw').disabled, null, { timeout: 5000 });
       assert.notEqual(await page.textContent('#userRedeemablePoa'), '0.000000 POA');
+
+      // With a position, a locked stake warns that the existing shares get locked too
+      await page.click('[data-bank-tab="deposit"]');
+      await page.waitForFunction(() => !document.getElementById('btnSubmitDeposit').disabled);
+      await page.click('#btnSubmitDeposit');
+      await page.waitForSelector('#stakeConfirm:not(.hidden)');
+      assert.match(await page.textContent('#stakeConfirmBody'), /This also locks your existing [\d,.]+ POA in the vault until epoch 4\. A lock covers your whole position/);
+      await page.keyboard.press('Escape');
+      // Lock 0 into an unlocked position: lighter confirmation
+      await page.fill('#lockEpochsInput', '0');
+      await page.dispatchEvent('#lockEpochsInput', 'change');
+      await page.waitForFunction(() => !document.getElementById('btnSubmitDeposit').disabled);
+      await page.click('#btnSubmitDeposit');
+      await page.waitForSelector('#stakeConfirm:not(.hidden)');
+      assert.equal(await page.textContent('#stakeConfirmTitle'), 'Confirm your stake');
+      assert.match(await page.textContent('#stakeConfirmBody'), /No lock: you can withdraw whenever you like/);
+      await page.click('#stakeConfirmCancel');
+      await page.click('[data-bank-tab="withdraw"]');
 
       await page.click('[data-withdraw-bps="5000"]');
       await page.waitForFunction(() => !document.getElementById('btnSubmitWithdraw').disabled);

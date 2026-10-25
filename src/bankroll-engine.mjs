@@ -64,6 +64,10 @@ export class BankrollEngine {
     this.maxBankrollCapMicros = toMicros(options.maxBankrollCapPoa ?? '500000000.000000');
     this.kellyMaxProfitBps = BigInt(options.kellyMaxProfitBps ?? KELLY_MAX_PROFIT_BPS);
     this.currentEpoch = Number(options.currentEpoch ?? 1);
+    // Nominal epoch length (seconds). Epochs advance only when the operator calls advanceEpoch
+    // (POST /api/epoch/advance); this length is what lock-up estimates use.
+    this.epochLengthSeconds = Math.max(1, Number(options.epochLengthSeconds ?? process.env.POA_DICE_EPOCH_SECONDS ?? 21600));
+    this.epochStartedAt = Math.floor(Date.now() / 1000); // unix seconds; null when unknown (restored legacy state)
 
     // Core accounting buckets (all in BigInt micro-POA or share units)
     this.bankNavMicros = 0n; // Net LP equity (excluding devReserve, incentivePool, and pending payouts)
@@ -1255,8 +1259,22 @@ export class BankrollEngine {
   // -------------------------------------------------------------------------
   // Epoch Progression & 4-Pillar Agent Staking Incentive Distribution
   // -------------------------------------------------------------------------
+  /** Epoch clock facts for lock-up warnings (what is live: operator-advanced, nominal length). */
+  epochInfo() {
+    return {
+      current: this.currentEpoch,
+      lengthSeconds: this.epochLengthSeconds,
+      startedAt: this.epochStartedAt,
+      advancedBy: 'operator',
+      lockRule: 'position',
+      withdrawWhileLocked: false,
+      earlyExitFeePercent: (Number(EARLY_EXIT_FEE_BPS) / 100).toFixed(2)
+    };
+  }
+
   advanceEpoch({ distributeIncentives = true, ts = Math.floor(Date.now() / 1000) } = {}) {
     this.currentEpoch += 1;
+    this.epochStartedAt = ts;
     let distribution = null;
     if (distributeIncentives && this.incentivePoolMicros > 0n && this.totalShares > 0n) {
       distribution = this.distributeEpochIncentives({ ts });
@@ -1534,6 +1552,7 @@ export class BankrollEngine {
       chainId: 'poa-mainnet-1',
       bankAddress: this.bankAddress,
       currentEpoch: this.currentEpoch,
+      epoch: this.epochInfo(),
       stateRootSha256: this.computeStateRoot(),
       bankroll: {
         bankNavPoa: fromMicros(this.bankNavMicros),
@@ -1649,6 +1668,7 @@ export class BankrollEngine {
     return {
       bankAddress: this.bankAddress,
       currentEpoch: this.currentEpoch,
+      epochStartedAt: this.epochStartedAt,
       devFeeMode: this.devFeeMode,
       bankNavMicros: this.bankNavMicros.toString(),
       lockedCollateralMicros: (this.lockedCollateralMicros - this.reservedExposureMicros).toString(),
@@ -1733,6 +1753,7 @@ export class BankrollEngine {
     if (!raw || typeof raw !== 'object') return;
     this.bankAddress = raw.bankAddress || this.bankAddress;
     this.currentEpoch = Number(raw.currentEpoch ?? 1);
+    this.epochStartedAt = raw.epochStartedAt === undefined || raw.epochStartedAt === null ? null : Number(raw.epochStartedAt);
     this.devFeeMode = raw.devFeeMode || this.devFeeMode;
     this.bankNavMicros = BigInt(raw.bankNavMicros || 0);
     this.lockedCollateralMicros = BigInt(raw.lockedCollateralMicros || 0);

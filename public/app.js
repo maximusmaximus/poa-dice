@@ -829,6 +829,203 @@ let reconnectTimer = null;
 let reconnectDelay = 1000;
 const refreshStateSoon = debounce(() => fetchState(), 120);
 
+const DEFAULT_EPOCH_SECONDS = 21600;
+
+/**
+ * What a stake of `amountPoa` with `lockEpochs` does to the staker's lock, mirroring
+ * BankrollEngine.deposit: the lock is per position, so lockUntil = max(existing lock,
+ * currentEpoch + lockEpochs) and it covers every share in the position.
+ */
+export function stakeLockPlan({ amountPoa, lockEpochs, epoch, position, addressKnown = false, nowMs = Date.now() }) {
+  const current = Number(epoch?.current ?? 1);
+  const lengthSeconds = Number(epoch?.lengthSeconds) > 0 ? Number(epoch.lengthSeconds) : DEFAULT_EPOCH_SECONDS;
+  const lock = Math.max(0, Math.min(1000, Math.floor(Number(lockEpochs) || 0)));
+  let shares = 0n;
+  try { shares = BigInt(position?.shares || 0); } catch { shares = 0n; }
+  const hasShares = Boolean(position?.hasPosition) && shares > 0n;
+  const existingLock = hasShares ? Number(position.lockUntilEpoch || 0) : 0;
+  const newLock = current + lock;
+  const lockUntil = Math.max(hasShares ? existingLock : 0, lock > 0 ? newLock : 0);
+  const locked = lockUntil > current;
+  const epochsLeft = locked ? lockUntil - current : 0;
+  const startedAtMs = Number(epoch?.startedAt) > 0 ? Math.min(Number(epoch.startedAt) * 1000, nowMs) : null;
+  const unlockAtMs = locked ? Math.max(nowMs, (startedAtMs ?? nowMs) + epochsLeft * lengthSeconds * 1000) : null;
+  return {
+    amountPoa: String(amountPoa || '0'),
+    lockEpochs: lock,
+    currentEpoch: current,
+    lengthSeconds,
+    lockUntil,
+    locked,
+    epochsLeft,
+    unlockAtMs,
+    hasShares,
+    shares: shares.toString(),
+    existingValuePoa: hasShares ? String(position.currentValuePoa ?? '0') : '0',
+    existingLock,
+    existingLocked: hasShares && existingLock > current,
+    relocksExisting: hasShares && lock > 0 && newLock > existingLock,
+    joinsExistingLock: hasShares && existingLock > current && existingLock >= newLock,
+    addressKnown: Boolean(addressKnown),
+    earlyExitFeePercent: String(epoch?.earlyExitFeePercent ?? '0.10')
+  };
+}
+
+export function formatLockDuration(seconds) {
+  const hours = Math.round(seconds / 3600);
+  if (hours < 1) return `about ${Math.max(1, Math.round(seconds / 60))} minutes`;
+  if (hours < 48) return `about ${hours} hour${hours === 1 ? '' : 's'}`;
+  const days = Math.round((hours / 24) * 10) / 10;
+  return `about ${days} days (${hours} hours)`;
+}
+
+function formatLocalDateTime(ms) {
+  return new Date(ms).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+}
+
+/** Exact modal copy for a plan (kept pure so tests can assert the wording). */
+export function stakeLockCopy(plan, { formatDate = formatLocalDateTime } = {}) {
+  const amount = `${formatNum(plan.amountPoa, 6)} POA`;
+  const epochHours = formatLockDuration(plan.lengthSeconds).replace(/^about /, '');
+  const n = plan.lockUntil;
+  const ep = (k) => `${k} epoch${k === 1 ? '' : 's'}`;
+  if (!plan.locked) {
+    const body = [`No lock: you can withdraw whenever you like. A ${plan.earlyExitFeePercent}% early-exit fee applies if you withdraw in the same epoch as your latest deposit (now epoch ${plan.currentEpoch}).`];
+    if (!plan.addressKnown) body.push({ warn: true, text: 'If your address already holds a locked stake in the vault, this deposit joins that lock. Enter your PoA address above to check before you stake.' });
+    return {
+      variant: 'open',
+      title: 'Confirm your stake',
+      amount: `Staking ${amount}`,
+      facts: [['Lock', 'None'], ['Withdraw', 'Any time'], ['Current epoch', `Epoch ${plan.currentEpoch}`]],
+      body,
+      confirm: 'Copy stake prompt'
+    };
+  }
+  const facts = [
+    ['Locked for', `${ep(plan.epochsLeft)} · ${formatLockDuration(plan.epochsLeft * plan.lengthSeconds)}`],
+    ['Unlocks', `Epoch ${n} · about ${formatDate(plan.unlockAtMs)}`],
+    ['Current epoch', `Epoch ${plan.currentEpoch}`]
+  ];
+  const body = [
+    { strong: 'No early exit.', text: ` Until epoch ${n} the vault refuses every withdrawal and yield claim from this position, in full or in part.` },
+    `From epoch ${n} you can withdraw your tokens again. You get back the redeemable value of your shares at that time, which moves with the bankroll's results, so it can be more or less than you staked.`
+  ];
+  if (plan.relocksExisting) {
+    const was = plan.existingLocked ? ` (currently locked until epoch ${plan.existingLock})` : '';
+    body.push({ warn: true, text: `This also locks your existing ${formatNum(plan.existingValuePoa, 6)} POA in the vault${was} until epoch ${n}. A lock covers your whole position, not just this deposit.` });
+  } else if (plan.joinsExistingLock) {
+    body.push({ warn: true, text: `Your position is already locked until epoch ${n}, so this deposit is locked until epoch ${n} too. A lock covers your whole position.` });
+  } else if (!plan.addressKnown) {
+    body.push({ warn: true, text: `If your address already holds shares in the vault, they are locked until epoch ${n} too: a lock covers your whole position. Enter your PoA address above to see it here.` });
+  }
+  body.push({ note: true, text: `Epochs are nominally ${epochHours} long and are advanced by the vault operator, so the real unlock time can differ from this estimate. Epoch ${n} is what counts.` });
+  return {
+    variant: 'lock',
+    title: plan.lockEpochs > 0 ? 'Your POA will be locked' : 'This stake joins a locked position',
+    amount: `Staking ${amount}`,
+    facts,
+    body,
+    confirm: 'I understand, copy stake prompt'
+  };
+}
+
+let stakeConfirmOpen = null;
+
+function renderStakeConfirm(copy) {
+  const root = $('stakeConfirm');
+  root.dataset.variant = copy.variant;
+  $('stakeConfirmTitle').textContent = copy.title;
+  $('stakeConfirmAmount').textContent = copy.amount;
+  const dl = $('stakeConfirmFacts');
+  dl.replaceChildren();
+  for (const [k, v] of copy.facts) {
+    const dt = document.createElement('dt');
+    dt.textContent = k;
+    const dd = document.createElement('dd');
+    dd.textContent = v;
+    dl.append(dt, dd);
+  }
+  const body = $('stakeConfirmBody');
+  body.replaceChildren();
+  for (const item of copy.body) {
+    const p = document.createElement('p');
+    const it = typeof item === 'string' ? { text: item } : item;
+    if (it.warn) p.className = 'modal-warn';
+    if (it.note) p.className = 'modal-note';
+    if (it.strong) {
+      const b = document.createElement('strong');
+      b.textContent = it.strong;
+      p.append(b);
+    }
+    p.append(document.createTextNode(it.text));
+    body.append(p);
+  }
+  $('stakeConfirmOk').textContent = copy.confirm;
+  $('stakeConfirmIcon')?.replaceChildren(document.createTextNode(copy.variant === 'lock' ? '\u{1F512}' : '\u{2705}'));
+}
+
+/** Show the lock-up confirmation; resolves true on Confirm, false on Cancel / Esc / backdrop. */
+async function confirmStake() {
+  if (stakeConfirmOpen) return false;
+  let snapshot = state.summary;
+  try {
+    const res = await fetch(api(`/api/state?address=${encodeURIComponent(state.playerAddress)}`));
+    const data = await res.json();
+    if (data && data.bankroll) {
+      applyStateSnapshot(data);
+      snapshot = data;
+    }
+  } catch {
+    // fall back to the last snapshot
+  }
+  const plan = stakeLockPlan({
+    amountPoa: $('depositAmountInput').value,
+    lockEpochs: $('lockEpochsInput').value,
+    epoch: snapshot?.epoch || { current: snapshot?.currentEpoch },
+    position: state.playerAddress ? snapshot?.userPosition : null,
+    addressKnown: Boolean(state.playerAddress)
+  });
+  renderStakeConfirm(stakeLockCopy(plan));
+  const root = $('stakeConfirm');
+  const card = root.querySelector('.modal-card');
+  const opener = document.activeElement;
+  root.classList.remove('hidden');
+  document.body.classList.add('modal-open');
+  return new Promise((resolve) => {
+    const focusables = () => [...card.querySelectorAll('button:not([disabled]), [href], input, [tabindex]:not([tabindex="-1"])')];
+    const close = (ok) => {
+      root.classList.add('hidden');
+      document.body.classList.remove('modal-open');
+      document.removeEventListener('keydown', onKey, true);
+      root.removeEventListener('mousedown', onBackdrop);
+      $('stakeConfirmOk').removeEventListener('click', onOk);
+      $('stakeConfirmCancel').removeEventListener('click', onCancel);
+      stakeConfirmOpen = null;
+      if (opener && typeof opener.focus === 'function') opener.focus();
+      resolve(ok);
+    };
+    const onOk = () => close(true);
+    const onCancel = () => close(false);
+    const onBackdrop = (e) => { if (e.target === root) close(false); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(false); return; }
+      if (e.key !== 'Tab') return;
+      const f = focusables();
+      if (!f.length) { e.preventDefault(); return; }
+      const first = f[0];
+      const last = f[f.length - 1];
+      if (e.shiftKey && (document.activeElement === first || !card.contains(document.activeElement))) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || !card.contains(document.activeElement))) { e.preventDefault(); first.focus(); }
+    };
+    stakeConfirmOpen = close;
+    document.addEventListener('keydown', onKey, true);
+    root.addEventListener('mousedown', onBackdrop);
+    $('stakeConfirmOk').addEventListener('click', onOk);
+    $('stakeConfirmCancel').addEventListener('click', onCancel);
+    $('stakeConfirmOk').focus();
+  });
+}
+
 export function stopPoaDice() {
   bootGeneration += 1;
   if (eventSource) eventSource.close();
@@ -1027,6 +1224,7 @@ function bindEvents() {
     $(a.btn).addEventListener('click', async (e) => {
       if (e.currentTarget.tagName === 'BUTTON' && e.currentTarget.form) e.preventDefault();
       if ($(a.btn).disabled) return;
+      if (a.kind === 'stake' && !(await confirmStake())) return;
       const text = actionPrompt(a.kind);
       $(a.btn).dataset.prompt = text;
       if (await copyText(text)) flashCopied($(a.btn), null, a.label);
