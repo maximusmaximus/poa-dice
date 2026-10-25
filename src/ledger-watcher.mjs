@@ -55,7 +55,36 @@ export class LedgerWatcher {
    * Process a signed POA transfer transaction (submitted either via POST /api/tx/submit,
    * MCP tool, CLI, or polled from GET /api/explorer/address/<bankAddress>).
    */
+  /** Attach real minepoa settlement (chain mode). From then on nothing is booked from a signed body. */
+  attachSettlement(settlement) {
+    this.settlement = settlement;
+  }
+
+  /**
+   * Submit a player-signed tx. Simulated mode books it immediately (local demo ledger).
+   * Chain mode broadcasts it to minepoa and books it only once the ledger confirms it.
+   */
+  async submitSignedTransaction(txEnvelope, opts = {}) {
+    if (this.settlement) return this.settlement.submitInbound(txEnvelope, opts);
+    return this.processSignedTransaction(txEnvelope);
+  }
+
+  /** Sign a player transfer to the bank with the right nonce/parents for the active mode. */
+  async buildPlayerTransfer(wallet, { amount, memo, nonce = null }) {
+    if (this.settlement) return this.settlement.buildSignedFor(wallet, { amount, memo });
+    return buildSignedTransfer({
+      wallet,
+      to: this.engine.bankAddress,
+      amount,
+      memo,
+      nonce: nonce ?? Math.floor(Date.now() / 1000) * 1000 + Math.floor(Math.random() * 1000)
+    });
+  }
+
   processSignedTransaction(txEnvelope, { requireSignature = true, requireRecipient = true } = {}) {
+    if (this.settlement) {
+      throw Object.assign(new Error('Chain-settled server: signed txs are broadcast to minepoa and booked only after confirmation'), { status: 409 });
+    }
     const body = txEnvelope?.body || txEnvelope;
     if (!body || typeof body !== 'object') {
       throw new Error('Transaction body must be an object');
@@ -264,6 +293,12 @@ export class LedgerWatcher {
     maxTotalSpendPoa = null,
     onRoll = null
   }) {
+    if (this.settlement) {
+      throw Object.assign(
+        new Error('Auto-strategies need each roll settled before sizing the next; on a chain-settled server use dice_batch_roll (flat batches) instead'),
+        { status: 409 }
+      );
+    }
     if (!wallet || !wallet.address) {
       throw new Error('Valid Ed25519 wallet required for executeAutoStrategy');
     }
@@ -389,6 +424,10 @@ export class LedgerWatcher {
    * ensuring every payout, withdrawal, refund, and 0.1% dev sweep produces a verifiable POA tx.
    */
   flushOutboundQueueSync() {
+    if (this.settlement) {
+      this.settlement.kick();
+      return []; // chain mode: the durable settlement queue signs AND broadcasts
+    }
     if (this._dispatchLock) return [];
     this._dispatchLock = true;
     const dispatched = [];
@@ -434,6 +473,10 @@ export class LedgerWatcher {
    * Poll keyless explorer on minepoa.com for new incoming DICE1:* transfers to bankAddress.
    */
   async pollExplorerOnce(fetchImpl = globalThis.fetch) {
+    if (this.settlement) {
+      await this.settlement.tick();
+      return { polled: true, processed: [], via: 'settlement' };
+    }
     if (!fetchImpl || this.mode === 'simulated') return { polled: false, processed: [] };
     const url = `${this.nodeUrl}/api/explorer/address/${this.engine.bankAddress}?sort=new`;
     try {

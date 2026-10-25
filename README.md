@@ -173,3 +173,30 @@ Each prompt holds the MCP URL, the exact arguments, a total spend cap and a stop
 ## 🛠 Built with
 
 Grok (app builder) · Node.js 20 · Model Context Protocol · [Proof of Agent / minepoa.com](https://minepoa.com) · Source: [github.com/maximusmaximus/poa-dice](https://github.com/maximusmaximus/poa-dice) (MIT)
+
+---
+
+## 🏦 Real on-chain settlement (chain mode)
+
+When `POA_DICE_WATCHER_MODE` is not `simulated` (the default for `npm start` is `live`), the vault settles on the real minepoa ledger:
+
+- **Bank key from a secret.** `POA_DICE_BANK_PRIVKEY` (Base58 Ed25519) or `POA_DICE_BANK_KEY_FILE` (path to the key, or a `poa.mjs` `wallet.json`). The optional `POA_DICE_BANK_ADDRESS` pins the expected address. The server never generates a bank key in chain mode. If the key is missing or invalid, it starts **read-only**: no bank address is advertised, every money-moving endpoint and MCP tool returns `503`/rejected, and the UI shows `BANK KEY MISSING`. Set `POA_DICE_REQUIRE_BANK_KEY=1` to refuse to start instead. The key is never logged or serialized. It is removed from `process.env` after loading.
+- **Inbound** (deposits, bets, withdraw triggers): signed txs from MCP or `/api/tx/submit` are broadcast to minepoa with `POST /api/submit`. They are booked **only once the ledger confirms them** (`POA_DICE_CONFIRM=final` by default: K=5 attestations or checkpoint coverage), using the ledger's copy of the body. Transfers sent straight to the bank with `poa.mjs send` are picked up from the bank's explorer page. Booking is idempotent by txid.
+- **Outbound** (payouts, withdrawals, refunds, dev sweeps): a durable queue. Each order is signed with the bank key and persisted before broadcast. Retries use backoff and rebroadcast the **same** signed tx, so there is no double-pay across retries or restarts. Status goes QUEUED → SIGNED → SENT → CONFIRMED (or FAILED, or WAITING_FUNDS).
+- **Solvency:** orders are signed only when the on-chain bank balance (less unconfirmed inbound and in-flight outbound) covers them. `dice_audit_solvency` and `GET /api/audit/chain` compare the internal books with the on-chain balance.
+- **Status:** `GET /api/tx/<txid>/status`, MCP `tx_status`, `GET /api/settlement`, and `settlement` in `/api/state` and `/api/health`.
+- **Not in chain mode:** `dice_auto_strategy`, and batch `stop_on_*`. Both need each roll settled before the next. Batches broadcast all N rolls at once, and each settles as it confirms.
+
+### Storage
+Chain mode needs **durable storage** for `bankroll-state.json`, `settlement.json` and `chain-debits.json`. Set `POA_DICE_DATA_DIR` to a persistent writable directory. Without one, the server is read-only (`STORAGE_UNAVAILABLE`). Serverless hosts with ephemeral disks or memory (e.g. Vercel functions) are **not** sufficient. Run on a host with a persistent volume, or implement the two-method store adapter in `src/settlement-store.mjs` (and the engine state) on a durable KV/DB.
+
+### Env summary
+| Variable | Purpose |
+|---|---|
+| `POA_DICE_BANK_PRIVKEY` / `POA_DICE_BANK_KEY_FILE` | House bank key (secret). Use a **new dedicated wallet**. |
+| `POA_DICE_BANK_ADDRESS` | Optional: expected bank address (refuses any other key) |
+| `POA_DICE_DATA_DIR` | Persistent state directory (required in chain mode) |
+| `POA_DICE_ADMIN_TOKEN` | Admin/house actions |
+| `POA_DICE_CONFIRM` | `final` (default) or `included` |
+| `POA_DICE_REQUIRE_BANK_KEY=1` | Exit instead of running read-only |
+| `POA_BASE_URL` | minepoa node (default `https://minepoa.com`) |

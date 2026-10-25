@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   buildSignedTransfer,
+  txidOf,
   formatDiceMemo,
   genKeypair,
   isValidPoaAddress,
@@ -336,15 +337,28 @@ export const MCP_TOOLS = [
     }
   },
   {
+    name: 'tx_status',
+    description:
+      'Settlement status of a txid on a chain-settled server: an inbound deposit/bet/withdraw trigger (PENDING_CONFIRMATION until the minepoa ledger confirms it, then CONFIRMED with the booked result and any payouts) or an outbound payout/refund (PENDING / SENT / CONFIRMED / FAILED with its minepoa txid). Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: { txid: { type: 'string', description: 'Inbound txid, payout txid or payout orderId' } },
+      required: ['txid']
+    }
+  },
+  {
     name: 'dice_audit_solvency',
     description:
-      'Run the deterministic cryptographic state & solvency audit: verifies LP share sum conservation, bankroll solvency, 0.1% dev reserve accounting conservation (poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U), commit-reveal seed chain, and SHA-256 state root.',
+      'Compares the internal ledger with the real on-chain bank balance when chain-settled. Run the deterministic cryptographic state & solvency audit: verifies LP share sum conservation, bankroll solvency, 0.1% dev reserve accounting conservation (poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U), commit-reveal seed chain, and SHA-256 state root.',
     inputSchema: {
       type: 'object',
       properties: {}
     }
   }
 ];
+
+/** Tools that move POA (refused while the server is read-only, e.g. BANK KEY MISSING). */
+export const WRITE_TOOLS = new Set(['dice_place_bet', 'dice_batch_roll', 'dice_auto_strategy', 'bank_stake', 'bank_withdraw', 'bank_claim_yield']);
 
 export class McpHandler {
   /**
@@ -369,6 +383,41 @@ export class McpHandler {
       throw new Error('This server is chain-backed: pass signed_tx (preferred) or privkey for your own PoA wallet.');
     }
     return this._ephemeralAgentWallet;
+  }
+
+  /**
+   * Submit a player-signed tx. Simulated: books now. Chain-settled: broadcasts to minepoa and
+   * returns PENDING_CONFIRMATION; booking happens when the ledger confirms it.
+   * lockPoa: bank exposure to hold while a bet is pending (so the bank cannot be oversubscribed).
+   */
+  async _submitPlayerTx(tx, { lockPoa = null } = {}) {
+    const settlement = this.watcher.settlement;
+    if (!settlement) return this.watcher.processSignedTransaction(tx);
+    const body = tx.body || tx;
+    const txid = txidOf(body);
+    const prior = settlement.state.inbound[txid];
+    if (prior && prior.status !== 'FAILED' && prior.status !== 'EXPIRED') return settlement.getTxStatus(txid);
+    let reserve = null;
+    if (lockPoa) {
+      const key = `pending_${txid}`;
+      const micros = toMicros(String(lockPoa));
+      this.engine.reserveExposure(key, micros);
+      reserve = { key, micros: micros.toString() };
+    }
+    try {
+      const view = await settlement.submitInbound(tx, { reserve });
+      return { ...view, note: 'Broadcast to minepoa. It is booked only after the ledger confirms it; poll tx_status with this txid.' };
+    } catch (err) {
+      const rec = settlement.state.inbound[txid];
+      if (reserve && (!rec || rec.status === 'FAILED')) this.engine.releaseExposure(reserve.key, null);
+      throw err;
+    }
+  }
+
+  async _playerTx(args, { amount, memo }) {
+    if (args.signed_tx) return args.signed_tx;
+    const wallet = this._resolveWallet(args, { needOwnKey: true });
+    return this.watcher.buildPlayerTransfer(wallet, { amount, memo });
   }
 
   async _chain(address) {
@@ -464,6 +513,10 @@ export class McpHandler {
   }
 
   async callTool(toolName, args = {}) {
+    if (WRITE_TOOLS.has(toolName) && !(toolName === 'bank_claim_yield' && args.dry_run) && this.hooks.readOnly) {
+      const ro = this.hooks.readOnly();
+      if (ro) return { valid: false, rejected: true, code: ro.status, error: ro.error };
+    }
     switch (toolName) {
       case 'dice_status': {
         return this.engine.getStateSummary(args.address || '');
@@ -498,15 +551,9 @@ export class McpHandler {
             targetBps: Number(args.target_bps),
             clientSeed: args.client_seed || 'mcp-agent'
           });
-          txEnvelope = buildSignedTransfer({
-            wallet,
-            to: this.engine.bankAddress,
-            amount: args.amount_poa,
-            memo,
-            nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
-          });
+          txEnvelope = await this.watcher.buildPlayerTransfer(wallet, { amount: args.amount_poa, memo });
         }
-        const betReceipt = this.watcher.processSignedTransaction(txEnvelope);
+        const betReceipt = await this._submitPlayerTx(txEnvelope, { lockPoa: single.exposurePerRollPoa });
         if (betReceipt?.action === 'BET_SETTLED' && this.hooks.noteDebit) this.hooks.noteDebit(from, betReceipt.betTxid, betReceipt.wagerPoa);
         return betReceipt;
       }
@@ -544,18 +591,8 @@ export class McpHandler {
         const q = quoteClaimYield(this.engine, { address, chain: await this._chain(address) });
         if (args.dry_run) return q;
         if (!q.valid || q.needsPositionCheck) return this._rejected(q.valid ? { ...q, reason: 'Pass privkey or signed_tx so the server knows whose yield to claim' } : q);
-        let tx = env;
-        if (!tx) {
-          const wallet = this._resolveWallet(args, { needOwnKey: true });
-          tx = buildSignedTransfer({
-            wallet,
-            to: this.engine.bankAddress,
-            amount: WITHDRAW_TRIGGER_POA,
-            memo: q.memo,
-            nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
-          });
-        }
-        const r = this.watcher.processSignedTransaction(tx);
+        const tx = await this._playerTx(args, { amount: WITHDRAW_TRIGGER_POA, memo: q.memo });
+        const r = await this._submitPlayerTx(tx);
         return { ...r, claimedYieldPoa: q.yieldPoa };
       }
 
@@ -600,15 +637,9 @@ export class McpHandler {
             lockEpochs: Number(args.lock_epochs || 0),
             referrer: args.referrer || null
           });
-          txEnvelope = buildSignedTransfer({
-            wallet,
-            to: this.engine.bankAddress,
-            amount: args.amount_poa,
-            memo,
-            nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
-          });
+          txEnvelope = await this.watcher.buildPlayerTransfer(wallet, { amount: args.amount_poa, memo });
         }
-        const stakeReceipt = this.watcher.processSignedTransaction(txEnvelope);
+        const stakeReceipt = await this._submitPlayerTx(txEnvelope);
         if (stakeReceipt?.action === 'LP_DEPOSIT' && this.hooks.noteDebit) this.hooks.noteDebit(stakeFrom, txEnvelope.id, sq.amountPoa);
         return stakeReceipt;
       }
@@ -638,15 +669,9 @@ export class McpHandler {
             shares: args.shares || null,
             bps: args.bps || (args.mode === 'ALL' ? 10000 : null)
           });
-          txEnvelope = buildSignedTransfer({
-            wallet,
-            to: this.engine.bankAddress,
-            amount: '0.000001',
-            memo,
-            nonce: Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1000)
-          });
+          txEnvelope = await this.watcher.buildPlayerTransfer(wallet, { amount: '0.000001', memo });
         }
-        return this.watcher.processSignedTransaction(txEnvelope);
+        return this._submitPlayerTx(txEnvelope);
       }
 
       case 'bank_position': {
@@ -786,7 +811,22 @@ export class McpHandler {
       }
 
       case 'dice_audit_solvency': {
-        return this.engine.verifySystemInvariants();
+        const internal = this.engine.verifySystemInvariants();
+        if (!this.watcher.settlement) return { ...internal, chain: { checked: false, reason: 'simulated mode: no on-chain bank' } };
+        try {
+          const chain = await this.watcher.settlement.auditAgainstChain();
+          return { ...internal, ok: internal.ok && chain.ok, chain: { checked: true, ...chain } };
+        } catch (err) {
+          return { ...internal, ok: false, chain: { checked: false, error: redactSecrets(err.message) } };
+        }
+      }
+
+      case 'tx_status': {
+        if (!this.watcher.settlement) {
+          const r = this.engine.processedTxids.get(String(args.txid || ''));
+          return r ? { txid: args.txid, status: 'CONFIRMED', mode: 'simulated', result: r } : { valid: false, error: 'Unknown txid', mode: 'simulated' };
+        }
+        return this.watcher.settlement.getTxStatus(String(args.txid || '')) || { valid: false, error: 'Unknown txid' };
       }
 
       default:
