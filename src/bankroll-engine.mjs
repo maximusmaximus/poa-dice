@@ -128,14 +128,6 @@ export class BankrollEngine {
       ts: Math.floor(Date.now() / 1000),
       payload
     };
-    if (this.dataDir) {
-      try {
-        fs.mkdirSync(this.dataDir, { recursive: true });
-        fs.appendFileSync(path.join(this.dataDir, 'audit-log.jsonl'), JSON.stringify(evt) + '\n', 'utf8');
-      } catch {
-        // ignore log write errors in read-only environments
-      }
-    }
     for (const fn of this.eventListeners) {
       try {
         fn(evt);
@@ -370,6 +362,7 @@ export class BankrollEngine {
         incentivesEarnedMicros: 0n,
         referralEarnedMicros: 0n,
         stakedAtEpoch: this.currentEpoch,
+        lastDepositEpoch: this.currentEpoch,
         lockUntilEpoch: this.currentEpoch + lockE,
         referrer: referrer && isValidPoaAddress(referrer) && referrer !== address ? referrer : null,
         isPoaMiner: Boolean(isPoaMiner),
@@ -377,11 +370,17 @@ export class BankrollEngine {
       };
       this.lpPositions.set(address, pos);
     } else {
-      // Weighted epoch age adjustment so adding tiny dust doesn't reset conviction completely,
-      // while adding fresh large capital blends conviction fairly.
+      // Share-weighted conviction epoch blending + strict anti-JIT lastDepositEpoch stamp
       if (pos.shares === 0n) {
         pos.stakedAtEpoch = this.currentEpoch;
+      } else {
+        const weightedEpoch =
+          (pos.shares * BigInt(pos.stakedAtEpoch || this.currentEpoch) +
+            mintedShares * BigInt(this.currentEpoch)) /
+          (pos.shares + mintedShares);
+        pos.stakedAtEpoch = Number(weightedEpoch);
       }
+      pos.lastDepositEpoch = this.currentEpoch;
       if (this.currentEpoch + lockE > pos.lockUntilEpoch) {
         pos.lockUntilEpoch = this.currentEpoch + lockE;
       }
@@ -459,7 +458,8 @@ export class BankrollEngine {
       return { valid: false, error: 'Redeemable value rounds to 0 micro-POA' };
     }
 
-    const sameEpochExit = this.currentEpoch <= (pos.stakedAtEpoch || this.currentEpoch);
+    const lastDepEpoch = pos.lastDepositEpoch ?? pos.stakedAtEpoch ?? this.currentEpoch;
+    const sameEpochExit = this.currentEpoch <= lastDepEpoch;
     const exitFeeBps = sameEpochExit ? EARLY_EXIT_FEE_BPS : 0n;
     const exitFeeMicros = (grossMicros * exitFeeBps) / 10000n;
     const netPayoutMicros = grossMicros - exitFeeMicros;
@@ -541,7 +541,8 @@ export class BankrollEngine {
   _executeImmediateWithdraw({ txid, address, redeemShares, triggerRefundMicros = 0n, ts }) {
     const pos = this.lpPositions.get(address);
     const grossMicros = this.microsForShares(redeemShares);
-    const sameEpochExit = this.currentEpoch <= (pos.stakedAtEpoch || this.currentEpoch);
+    const lastDepEpoch = pos.lastDepositEpoch ?? pos.stakedAtEpoch ?? this.currentEpoch;
+    const sameEpochExit = this.currentEpoch <= lastDepEpoch;
     const exitFeeBps = sameEpochExit ? EARLY_EXIT_FEE_BPS : 0n;
     const exitFeeMicros = (grossMicros * exitFeeBps) / 10000n;
     const netPayoutMicros = grossMicros - exitFeeMicros;
@@ -714,6 +715,10 @@ export class BankrollEngine {
       limitReason = `Bet profit (${fromMicros(profitMicros)} POA) exceeds Kelly max profit cap (${fromMicros(maxProfitMicros)} POA; max wager ${fromMicros(maxWagerMicros)} POA at ${multiplierDisplay}x)`;
     }
 
+    const expectedLossMicros = (amountMicros * houseEdgeBps) / 10000n;
+    const quarterKellyMicros = maxWagerMicros / 4n >= MIN_BET_MICROS ? maxWagerMicros / 4n : MIN_BET_MICROS;
+    const halfKellyMicros = maxWagerMicros / 2n >= MIN_BET_MICROS ? maxWagerMicros / 2n : MIN_BET_MICROS;
+
     return {
       valid: withinLimits,
       withinLimits,
@@ -734,12 +739,18 @@ export class BankrollEngine {
       payoutOnWinMicros: payoutMicros.toString(),
       profitOnWinPoa: fromMicros(profitMicros),
       profitOnWinMicros: profitMicros.toString(),
+      expectedValuePoa: `-${fromMicros(expectedLossMicros)}`,
       devReserveFeePoa: fromMicros(devFeeMicros),
       devReserveAddress: this.devReserveAddress,
       incentivePoolFeePoa: fromMicros(incentiveFeeMicros),
       maxAllowedWagerPoa: fromMicros(maxWagerMicros),
       maxAllowedProfitPoa: fromMicros(maxProfitMicros),
       minAllowedWagerPoa: fromMicros(MIN_BET_MICROS),
+      kellySizing: {
+        quarterKellyPoa: fromMicros(quarterKellyMicros),
+        halfKellyPoa: fromMicros(halfKellyMicros),
+        fullKellyCapPoa: fromMicros(maxWagerMicros)
+      },
       availableBankrollPoa: fromMicros(availMicros)
     };
   }
@@ -1231,6 +1242,71 @@ export class BankrollEngine {
       lpPositions: lpSnapshot
     };
     return sha256hex(canonical(canonicalState));
+  }
+
+  verifySystemInvariants() {
+    let sumStakerShares = 0n;
+    for (const [, pos] of this.lpPositions.entries()) {
+      sumStakerShares += pos.shares;
+    }
+    const shareInvariantPassed = sumStakerShares === this.totalShares;
+
+    const solvencyPassed =
+      this.bankNavMicros >= this.lockedCollateralMicros &&
+      this.lockedCollateralMicros >= 0n &&
+      this.devReserveMicros >= 0n &&
+      this.incentivePoolMicros >= 0n &&
+      this.assertAccountingInvariant();
+
+    const devReservePinnedPassed =
+      this.devReserveAddress === DEV_RESERVE_ADDRESS &&
+      DEV_RESERVE_ADDRESS === 'poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U' &&
+      this.devReserveMicros + this.totalDevSweptMicros === this.totalDevEarnedMicros;
+
+    let seedAuditPassed = true;
+    const seedAuditDetails = [];
+    for (const item of this.seedManager.history) {
+      const computedHash = sha256hex(item.serverSeed);
+      const match = computedHash === item.serverSeedHash;
+      if (!match) seedAuditPassed = false;
+      seedAuditDetails.push({
+        seedEpochId: item.seedEpochId,
+        serverSeedHash: item.serverSeedHash,
+        computedHash,
+        match
+      });
+    }
+
+    const allPassed =
+      shareInvariantPassed &&
+      solvencyPassed &&
+      devReservePinnedPassed &&
+      seedAuditPassed;
+
+    return {
+      ok: allPassed,
+      auditedAt: new Date().toISOString(),
+      stateRootSha256: this.computeStateRoot(),
+      invariants: {
+        shareInvariantPassed,
+        totalShares: this.totalShares.toString(),
+        sumStakerShares: sumStakerShares.toString(),
+        solvencyPassed,
+        bankNavPoa: fromMicros(this.bankNavMicros),
+        availableBankrollPoa: fromMicros(this.availableBankrollMicros),
+        lockedCollateralPoa: fromMicros(this.lockedCollateralMicros),
+        devReservePinnedPassed,
+        devReserveAddress: this.devReserveAddress,
+        devReserveFeeBps: Number(DEV_FEE_BPS),
+        devReserveAccruedPoa: fromMicros(this.devReserveMicros),
+        devReserveTotalSweptPoa: fromMicros(this.totalDevSweptMicros),
+        devReserveTotalEarnedPoa: fromMicros(this.totalDevEarnedMicros),
+        seedAuditPassed,
+        revealedSeedEpochsAudited: seedAuditDetails.length
+      },
+      stakersCount: [...this.lpPositions.values()].filter((p) => p.shares > 0n).length,
+      recentBetsCount: this.betHistory.length
+    };
   }
 
   getStateSummary(queryAddress = '') {

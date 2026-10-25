@@ -235,6 +235,38 @@ export const MCP_TOOLS = [
       },
       required: ['action']
     }
+  },
+  {
+    name: 'dice_auto_strategy',
+    description:
+      'Execute a bounded (1..25 rolls) Ed25519-signed autonomous agent betting strategy (flat, quarter_kelly, martingale_capped, or paroli) with automatic Kelly cap clamping and stop-loss / take-profit circuit breakers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy: {
+          type: 'string',
+          enum: ['flat', 'quarter_kelly', 'martingale_capped', 'paroli'],
+          description: 'Bet sizing strategy (default quarter_kelly)'
+        },
+        base_wager_poa: { type: 'string', description: 'Base wager in POA (default "10.000000")' },
+        target_bps: { type: 'integer', description: 'Slider target in basis points (100..9899, default 4950)' },
+        direction: { type: 'string', enum: ['under', 'over'], description: 'Roll under or over target' },
+        rolls: { type: 'integer', description: 'Number of rolls to execute (1..25, default 5)' },
+        stop_on_profit_poa: { type: 'string', description: 'Optional take-profit threshold in POA' },
+        stop_on_loss_poa: { type: 'string', description: 'Optional stop-loss threshold in POA' },
+        client_seed: { type: 'string', description: 'Base client seed prefix' },
+        privkey: { type: 'string', description: 'Optional Base58 Ed25519 private key to sign locally' }
+      }
+    }
+  },
+  {
+    name: 'dice_audit_solvency',
+    description:
+      'Run the deterministic cryptographic state & solvency audit: verifies LP share sum conservation, bankroll solvency, 0.1% dev reserve accounting conservation (poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U), commit-reveal seed chain, and SHA-256 state root.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
   }
 ];
 
@@ -531,6 +563,25 @@ export class McpHandler {
           poaDiceCliCommand: `node bin/poa-dice-cli.mjs offline-tx --action ${action} --amount ${amount} --memo "${memo}"`,
           note: 'This transaction executes directly on the minepoa.com ledger even if the POA Dice website is completely offline.'
         };
+      }
+
+      case 'dice_auto_strategy': {
+        const wallet = this._resolveWallet(args);
+        return this.watcher.executeAutoStrategy({
+          wallet,
+          strategy: args.strategy || 'quarter_kelly',
+          baseWagerPoa: args.base_wager_poa || '10.000000',
+          targetBps: Number(args.target_bps || 4950),
+          direction: args.direction || 'under',
+          rolls: Number(args.rolls || 5),
+          clientSeed: args.client_seed || 'mcp-auto-strategy',
+          stopOnProfitPoa: args.stop_on_profit_poa || null,
+          stopOnLossPoa: args.stop_on_loss_poa || null
+        });
+      }
+
+      case 'dice_audit_solvency': {
+        return this.engine.verifySystemInvariants();
       }
 
       default:

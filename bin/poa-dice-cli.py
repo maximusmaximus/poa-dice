@@ -14,13 +14,9 @@ import argparse
 import hashlib
 import hmac
 import json
-import os
 import re
 import subprocess
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,10 +28,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 DEV_RESERVE_ADDRESS = "poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U"
 DEV_FEE_BPS = 10  # 0.1% (10 bps)
+UNBIASED_UINT64_MAX = 18446744073709550000
 
 SECRET_PATTERNS = [
-    re.compile(r"\bpk_[A-Za-z0-9]{16,}\b"),
-    re.compile(r"\bpsk_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bpk_[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bpsk_[A-Za-z0-9_-]{8,}\b"),
 ]
 
 
@@ -45,7 +42,6 @@ def redact_secrets(text: str) -> str:
     out = str(text)
     for pat in SECRET_PATTERNS:
         out = pat.sub("[REDACTED_SECRET]", out)
-    # Redact ~/.poa/key if loaded
     key_path = Path.home() / ".poa" / "key"
     if key_path.is_file():
         try:
@@ -63,23 +59,27 @@ def verify_roll_local(
     nonce: int,
     bet_txid: str,
 ) -> Dict[str, Any]:
-    """Standalone Python implementation of POA Dice HMAC-SHA256 unbiased roll."""
-    unbiased_max = 18446744073709550000
-    attempt = 0
-    while True:
-        suffix = "" if attempt == 0 else f":{attempt}"
-        msg = f"{client_seed}:{nonce}:{bet_txid}{suffix}".encode("utf-8")
-        digest = hmac.new(server_seed.encode("utf-8"), msg, hashlib.sha256).digest()
-        val = int.from_bytes(digest[:8], byteorder="big", signed=False)
-        if val < unbiased_max:
-            roll_bps = val % 10000
-            return {
-                "rollBps": roll_bps,
-                "rollDisplay": f"{roll_bps / 100:.2f}",
-                "serverSeedHash": hashlib.sha256(server_seed.encode("utf-8")).hexdigest(),
-                "hmacHex": digest.hex(),
-            }
-        attempt += 1
+    """
+    Standalone Python implementation of POA Dice HMAC-SHA256 unbiased roll.
+    Matches src/provably-fair.mjs computeRoll() byte-for-byte.
+    """
+    msg = f"{client_seed}:{nonce}:{bet_txid}".encode("utf-8")
+    digest = hmac.new(server_seed.encode("utf-8"), msg, hashlib.sha256).digest()
+    selected_val = None
+    for offset in (0, 8, 16, 24):
+        candidate = int.from_bytes(digest[offset : offset + 8], byteorder="big", signed=False)
+        if candidate < UNBIASED_UINT64_MAX:
+            selected_val = candidate
+            break
+    if selected_val is None:
+        selected_val = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    roll_bps = selected_val % 10000
+    return {
+        "rollBps": roll_bps,
+        "rollDisplay": f"{roll_bps // 100:02d}.{roll_bps % 100:02d}",
+        "serverSeedHash": hashlib.sha256(server_seed.encode("utf-8")).hexdigest(),
+        "hmacHex": digest.hex(),
+    }
 
 
 def run_node_cli(args_list: List[str]) -> Dict[str, Any]:
@@ -134,13 +134,20 @@ def run_self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="POA Dice Zero-Leak Python CLI")
     parser.add_argument("--self-test", action="store_true", help="Run built-in security & math self-test")
-    parser.add_argument("command", nargs="?", default="status", help="Command: status, quote-bet, bet, stake, withdraw, chat, memo")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="status",
+        help="Command: status, quote-bet, bet, auto-bet, quote-deposit, stake, withdraw, chat, sweep-dev, audit, offline-tx",
+    )
     parser.add_argument("--amount", default="10.000000", help="Amount in POA")
     parser.add_argument("--under", type=float, default=49.50, help="Roll Under target")
     parser.add_argument("--over", type=float, default=None, help="Roll Over target")
     parser.add_argument("--epochs", type=int, default=4, help="Conviction lock epochs")
     parser.add_argument("--bps", type=int, default=10000, help="Withdraw share basis points (1..10000)")
     parser.add_argument("--seed", default="py-agent-seed-01", help="Client seed")
+    parser.add_argument("--strategy", default="quarter_kelly", help="Auto-bet strategy")
+    parser.add_argument("--rolls", type=int, default=5, help="Auto-bet roll count")
     parser.add_argument("--message", default="GM from Python agent", help="Chat message")
     parser.add_argument("--offline", action="store_true", help="Force website-independent offline execution")
 
@@ -160,6 +167,10 @@ def main() -> int:
         str(args.bps),
         "--seed",
         str(args.seed),
+        "--strategy",
+        str(args.strategy),
+        "--rolls",
+        str(args.rolls),
         "--message",
         str(args.message),
     ]

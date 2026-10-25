@@ -191,27 +191,30 @@ export function verifyRaw(msgUtf8, sigB58, signerAddr) {
 
 export function buildSignedTransfer({
   wallet,
+  privkey,
   to,
   amount,
+  amountPoa,
   memo = '',
   nonce = 1,
   parents = [],
   ts = Math.floor(Date.now() / 1000),
   cid = MAINNET_CHAIN_ID
 }) {
-  if (!wallet || !wallet.address || (!wallet.privkey && !wallet.privRaw)) {
+  const resolvedWallet = wallet || (privkey ? walletFromPrivkey(privkey) : null);
+  if (!resolvedWallet || !resolvedWallet.address || (!resolvedWallet.privkey && !resolvedWallet.privRaw)) {
     throw new Error('Wallet with address and privkey required to sign transfer');
   }
   if (!isValidPoaAddress(to)) {
     throw new Error(`Invalid recipient POA address: ${to}`);
   }
-  const amountMicros = toMicros(amount);
+  const amountMicros = toMicros(amount ?? amountPoa);
   if (amountMicros <= 0n) {
     throw new Error('Transfer amount must be positive');
   }
   const body = {
     type: 'transfer',
-    from: wallet.address,
+    from: resolvedWallet.address,
     to,
     amount: fromMicros(amountMicros),
     memo: String(memo ?? '').slice(0, 500),
@@ -220,7 +223,7 @@ export function buildSignedTransfer({
     ts: Number(ts),
     cid: String(cid || MAINNET_CHAIN_ID)
   };
-  body.sig = signBody(body, wallet.privRaw || wallet.privkey);
+  body.sig = signBody(body, resolvedWallet.privRaw || resolvedWallet.privkey);
   return {
     id: txidOf(body),
     kind: 'tx',
@@ -306,8 +309,9 @@ export function parseDiceMemo(memoStr) {
     let lockEpochs = 0;
     let referrer = null;
     for (const kv of parts.slice(2)) {
-      if (kv.startsWith('epochs=')) {
-        const e = parseInt(kv.slice(7), 10);
+      if (kv.startsWith('epochs=') || kv.startsWith('lock=')) {
+        const eqIdx = kv.indexOf('=');
+        const e = parseInt(kv.slice(eqIdx + 1), 10);
         if (Number.isInteger(e) && e >= 0 && e <= 1000) lockEpochs = e;
       } else if (kv.startsWith('ref=')) {
         const r = kv.slice(4).trim();
@@ -324,7 +328,7 @@ export function parseDiceMemo(memoStr) {
 
   if (action === 'LP_WITHDRAW' || action === 'UNSTAKE') {
     const spec = (parts[2] || 'ALL').trim();
-    if (spec.toUpperCase() === 'ALL') {
+    if (spec.toUpperCase() === 'ALL' || spec === '10000') {
       return { valid: true, action: 'LP_WITHDRAW', mode: 'ALL', shares: null, bps: 10000 };
     }
     if (spec.toUpperCase().startsWith('BPS=')) {
@@ -335,7 +339,11 @@ export function parseDiceMemo(memoStr) {
       return { valid: true, action: 'LP_WITHDRAW', mode: 'BPS', shares: null, bps };
     }
     if (/^\d+$/.test(spec)) {
-      return { valid: true, action: 'LP_WITHDRAW', mode: 'SHARES', shares: BigInt(spec), bps: null };
+      const n = BigInt(spec);
+      if (n >= 1n && n <= 10000n) {
+        return { valid: true, action: 'LP_WITHDRAW', mode: 'BPS', shares: null, bps: Number(n) };
+      }
+      return { valid: true, action: 'LP_WITHDRAW', mode: 'SHARES', shares: n, bps: null };
     }
     return { valid: false, action: 'LP_WITHDRAW', reason: 'invalid_withdraw_spec' };
   }

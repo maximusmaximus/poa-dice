@@ -225,8 +225,9 @@ async function fetchBetQuote() {
     $('maxWagerHint').textContent = `Max: ${formatNum(q.maxAllowedWagerPoa, 2)} POA`;
     $('edgeHintBadge').textContent = `${q.houseEdgePercent}% Edge`;
     $('walletVipBadge').textContent = `${q.vipTierName} (${q.houseEdgePercent}% Edge)`;
+    const qKelly = q.kellySizing?.quarterKellyPoa ? ` • 1/4 Kelly: ${formatNum(q.kellySizing.quarterKellyPoa, 2)} POA` : '';
     $('payoutPreviewText').textContent =
-      `Total Payout: ${formatNum(q.payoutOnWinPoa, 6)} POA (0.1% Dev Reserve: ${q.devReserveFeePoa} POA)`;
+      `Payout: ${formatNum(q.payoutOnWinPoa, 4)} POA • EV: ${q.expectedValuePoa || '-0.100000'} POA • 0.1% Dev: ${q.devReserveFeePoa} POA${qKelly}`;
 
     if (!q.valid) {
       alertEl.textContent = `⚠️ ${q.error}`;
@@ -329,7 +330,7 @@ function renderUserLpPosition(pos) {
   $('userRedeemablePoa').textContent = `${formatNum(pos.currentValuePoa, 6)} POA`;
   const pnlNum = Number(pos.netPnlPoa || 0);
   $('userNetPnlPoa').textContent = `${pnlNum >= 0 ? '+' : ''}${formatNum(pos.netPnlPoa, 6)} POA`;
-  $('userNetPnlPoa').className = `lp-pos-val ${pnlNum >= 0 ? 'highlight-emerald' : 'highlight-rose'}`;
+  $('userNetPnlPoa').className = `lp-pos-val ${pnlNum >= 0 ? 'highlight-emerald' : 'highlight-crimson'}`;
   $('userConvictionBadge').textContent = `Conviction: ${pos.convictionMultiplier} (${pos.vipTier?.tierName || 'Standard'})`;
 }
 
@@ -403,16 +404,16 @@ function renderChatMessages() {
     .map((m) => {
       const time = m.ts ? new Date(m.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
       return `
-        <div class="chat-msg-item">
-          <div class="chat-msg-meta">
+        <div class="chat-msg">
+          <div class="chat-msg-header">
             <div>
-              <span class="chat-msg-author">${escapeHtml(m.senderName || shortAddr(m.address))}</span>
+              <span class="chat-sender">${escapeHtml(m.senderName || shortAddr(m.address))}</span>
               ${m.isAgent ? '<span class="badge badge-cyan">AGENT</span>' : '<span class="badge">HUMAN</span>'}
               ${m.verified ? '<span class="badge badge-emerald" title="Ed25519 Signature Verified">✓ SIG</span>' : ''}
             </div>
             <span>${escapeHtml(time)}</span>
           </div>
-          <div class="chat-msg-text">${escapeHtml(m.text)}</div>
+          <div class="chat-text">${escapeHtml(m.text)}</div>
         </div>
       `;
     })
@@ -499,14 +500,30 @@ function animateRollResult(bet) {
 }
 
 async function runAgentBurst() {
+  if (!state._demoPrivkey) await initWallet(true);
   const btn = $('btnAgentAutoBurst');
   btn.disabled = true;
   const origText = btn.textContent;
   try {
-    for (let i = 1; i <= 5; i++) {
-      btn.textContent = `🤖 Rolling ${i}/5...`;
-      await signAndRollSingle();
-      await new Promise((r) => setTimeout(r, 200));
+    btn.textContent = '🤖 Running 5-Roll Kelly Strategy...';
+    const res = await fetch('/api/action/auto-bet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        privkey: state._demoPrivkey,
+        strategy: 'flat',
+        baseWagerPoa: $('wagerInput').value || '10.000000',
+        targetBps: state.targetBps,
+        direction: state.direction,
+        rolls: 5,
+        clientSeed: ($('clientSeedInput').value || 'agent-seed-01').trim(),
+      }),
+    });
+    const data = await res.json();
+    if (data.ok && Array.isArray(data.receipts) && data.receipts.length > 0) {
+      animateRollResult(data.receipts[data.receipts.length - 1]);
+      await fetchState();
+      await refreshAllQuotes();
     }
   } finally {
     btn.textContent = origText;

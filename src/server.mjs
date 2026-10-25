@@ -173,10 +173,14 @@ export function createDiceServer(options = {}) {
         return;
       }
 
-      // 3. Full State Summary
-      if (pathname === '/api/state' && req.method === 'GET') {
+      // 3. Full State Summary & Deterministic Invariant Audit
+      if ((pathname === '/api/state' || pathname === '/api/status') && req.method === 'GET') {
         const address = urlObj.searchParams.get('address') || '';
         return sendJson(res, 200, engine.getStateSummary(address));
+      }
+
+      if (pathname === '/api/audit' && req.method === 'GET') {
+        return sendJson(res, 200, engine.verifySystemInvariants());
       }
 
       // 4. Quote Endpoints
@@ -264,6 +268,23 @@ export function createDiceServer(options = {}) {
           signedTx,
           receipt
         });
+      }
+
+      if (pathname === '/api/action/auto-bet' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        const wallet = body.privkey ? walletFromPrivkey(body.privkey) : genKeypair();
+        const result = watcher.executeAutoStrategy({
+          wallet,
+          strategy: body.strategy || 'quarter_kelly',
+          baseWagerPoa: body.baseWagerPoa || body.amountPoa || '10.000000',
+          targetBps: Number(body.targetBps ?? 4950),
+          direction: body.direction || 'under',
+          rolls: Number(body.rolls ?? 5),
+          clientSeed: body.clientSeed || 'web-auto-strategy',
+          stopOnProfitPoa: body.stopOnProfitPoa || null,
+          stopOnLossPoa: body.stopOnLossPoa || null
+        });
+        return sendJson(res, 200, result);
       }
 
       // 7. Provably Fair Verification & Seed Rotation

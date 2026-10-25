@@ -85,6 +85,10 @@ test('Edge Case 3: Kelly Criterion 1.00% Max Profit Cap across 1% to 98% Win Pro
   });
   assert.equal(q50.multiplierDisplay, '2.0000x');
   assert.equal(q50.withinLimits, true);
+  assert.equal(q50.expectedValuePoa, '-5.000000');
+  assert.equal(q50.kellySizing.quarterKellyPoa, '250.000000');
+  assert.equal(q50.kellySizing.halfKellyPoa, '500.000000');
+  assert.equal(q50.kellySizing.fullKellyCapPoa, '1000.000000');
 
   // A 1,500 POA wager at 2.0000x would risk 1,500 POA profit (> 1,000 POA Kelly cap) -> flagged & rejected on bet
   const qOver = engine.quoteBet({
@@ -197,6 +201,20 @@ test('Edge Case 6: Anti-JIT Early-Exit Fee (0.10% if <1 epoch vs 0.00% if >=1 ep
   assert.equal(qNextEpoch.earlyExitFeeBps, 0);
   assert.equal(qNextEpoch.earlyExitFeePoa, '0.000000');
   assert.equal(qNextEpoch.netPayoutPoa, '10000.000000');
+
+  // Aged-Shell Anti-JIT Defense: if jitStaker deposits fresh capital in Epoch 2 and immediately
+  // attempts to withdraw in Epoch 2, lastDepositEpoch === 2 re-enables the 10 bps anti-JIT fee!
+  engine.applyDeposit({
+    txid: '3b'.padEnd(64, '0'),
+    address: jitStaker.address,
+    amountPoa: '50000.000000',
+    lockEpochs: 0,
+  });
+  const qAgedShell = engine.quoteWithdraw({
+    address: jitStaker.address,
+    mode: 'ALL',
+  });
+  assert.equal(qAgedShell.earlyExitFeeBps, 10);
 });
 
 test('Edge Case 7: 0.1% (10 bps) Dev Reserve Isolation & Sweep for poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U', () => {

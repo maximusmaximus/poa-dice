@@ -49,6 +49,8 @@ code, pre {
 .highlight-cyan { color: var(--cyan) !important; }
 .highlight-amber { color: var(--amber) !important; }
 .highlight-crimson { color: var(--crimson) !important; }
+.win-text, .bet-win-pill { color: var(--emerald) !important; font-weight: 800; }
+.loss-text, .bet-loss-pill { color: var(--crimson) !important; font-weight: 800; }
 
 /* Topbar */
 .topbar {

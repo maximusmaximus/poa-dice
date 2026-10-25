@@ -283,6 +283,53 @@ async function main() {
         ...engine.sweepDevReserve(),
       })
     );
+  } else if (cmd === 'auto-bet') {
+    const baseWagerPoa = String(args.amount || '10.000000');
+    const direction = args.over ? 'over' : 'under';
+    const targetBps = Math.round(Number(args.over || args.under || 49.5) * 100);
+    const strategy = String(args.strategy || 'quarter_kelly');
+    const rolls = Number(args.rolls || 5);
+    const clientSeed = String(args.seed || 'cli-auto-strategy');
+    output = await withOfflineFallback(
+      () =>
+        tryHttp(serverUrl, '/api/action/auto-bet', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            privkey: wallet.privkey,
+            strategy,
+            baseWagerPoa,
+            targetBps,
+            direction,
+            rolls,
+            clientSeed,
+            stopOnProfitPoa: args.takeProfit || null,
+            stopOnLossPoa: args.stopLoss || null,
+          }),
+        }),
+      (engine, watcher) => ({
+        mode: 'offline-direct-engine',
+        ...watcher.executeAutoStrategy({
+          wallet,
+          strategy,
+          baseWagerPoa,
+          targetBps,
+          direction,
+          rolls,
+          clientSeed,
+          stopOnProfitPoa: args.takeProfit || null,
+          stopOnLossPoa: args.stopLoss || null,
+        }),
+      })
+    );
+  } else if (cmd === 'audit') {
+    output = await withOfflineFallback(
+      () => tryHttp(serverUrl, '/api/audit'),
+      (engine) => ({
+        mode: 'offline-direct-engine',
+        ...engine.verifySystemInvariants(),
+      })
+    );
   } else if (cmd === 'offline-tx') {
     const action = String(args.action || 'BET').toUpperCase();
     const amountPoa = String(args.amount || '10.000000');

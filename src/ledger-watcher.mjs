@@ -13,6 +13,8 @@
 
 import {
   buildSignedTransfer,
+  formatDiceMemo,
+  fromMicros,
   genKeypair,
   isValidPoaAddress,
   parseDiceMemo,
@@ -21,7 +23,7 @@ import {
   txidOf,
   verifyBody
 } from './crypto-poa.mjs';
-import { DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
+import { DEV_RESERVE_ADDRESS, MIN_BET_MICROS } from './bankroll-engine.mjs';
 
 export class LedgerWatcher {
   constructor({
@@ -240,6 +242,132 @@ export class LedgerWatcher {
     }
 
     return { error: 'unhandled_memo_action' };
+  }
+
+  /**
+   * Execute a bounded, Ed25519-signed autonomous multi-roll agent strategy with
+   * Kelly sizing, Martingale/Paroli progression, and hard stop-loss / take-profit guards.
+   */
+  executeAutoStrategy({
+    wallet,
+    strategy = 'flat', // 'flat' | 'quarter_kelly' | 'martingale_capped' | 'paroli'
+    baseWagerPoa = '10.000000',
+    targetBps = 4950,
+    direction = 'under',
+    rolls = 5,
+    clientSeed = 'agent-auto-strategy',
+    stopOnProfitPoa = null,
+    stopOnLossPoa = null
+  }) {
+    if (!wallet || !wallet.address) {
+      throw new Error('Valid Ed25519 wallet required for executeAutoStrategy');
+    }
+    const maxRolls = Math.max(1, Math.min(25, Number(rolls || 5)));
+    const strat = String(strategy || 'flat').toLowerCase();
+    const baseMicros = toMicros(baseWagerPoa);
+    const stopProfitMicros = stopOnProfitPoa ? toMicros(stopOnProfitPoa) : null;
+    const stopLossMicros = stopOnLossPoa ? toMicros(stopOnLossPoa) : null;
+
+    let currentMicros = baseMicros;
+    let cumulativeNetMicros = 0n;
+    let winStreak = 0;
+    let wins = 0;
+    let losses = 0;
+    let stoppedReason = 'completed_all_rolls';
+    const receipts = [];
+    const baseNonce = Math.floor(Date.now() / 1000) * 100 + Math.floor(Math.random() * 50);
+
+    for (let i = 0; i < maxRolls; i++) {
+      const q = this.engine.quoteBet({
+        address: wallet.address,
+        amountPoa: fromMicros(currentMicros),
+        targetBps,
+        direction
+      });
+      const maxAllowedMicros = toMicros(q.maxAllowedWagerPoa || '1.000000');
+      if (maxAllowedMicros < MIN_BET_MICROS) {
+        stoppedReason = 'bankroll_kelly_limit_reached';
+        break;
+      }
+
+      if (strat === 'quarter_kelly') {
+        currentMicros = toMicros(q.kellySizing.quarterKellyPoa);
+      }
+      if (currentMicros > maxAllowedMicros) {
+        currentMicros = maxAllowedMicros;
+      }
+      if (currentMicros < MIN_BET_MICROS) {
+        currentMicros = MIN_BET_MICROS;
+      }
+
+      const wagerPoa = fromMicros(currentMicros);
+      const memo = formatDiceMemo({
+        action: 'BET',
+        direction,
+        targetBps,
+        clientSeed: `${clientSeed}-r${i + 1}`
+      });
+      const signedTx = buildSignedTransfer({
+        wallet,
+        to: this.engine.bankAddress,
+        amount: wagerPoa,
+        memo,
+        nonce: baseNonce + i
+      });
+      const receipt = this.processSignedTransaction(signedTx);
+      receipts.push(receipt);
+
+      if (receipt.action !== 'BET_SETTLED') {
+        stoppedReason = receipt.reason || 'bet_not_settled';
+        break;
+      }
+
+      const deltaMicros = receipt.won
+        ? toMicros(receipt.payoutPoa) - toMicros(receipt.wagerPoa)
+        : -toMicros(receipt.wagerPoa);
+      cumulativeNetMicros += deltaMicros;
+
+      if (receipt.won) {
+        wins += 1;
+        winStreak += 1;
+        if (strat === 'martingale_capped') {
+          currentMicros = baseMicros;
+        } else if (strat === 'paroli') {
+          currentMicros = winStreak < 3 ? currentMicros * 2n : baseMicros;
+        }
+      } else {
+        losses += 1;
+        winStreak = 0;
+        if (strat === 'martingale_capped') {
+          currentMicros = currentMicros * 2n;
+        } else if (strat === 'paroli') {
+          currentMicros = baseMicros;
+        }
+      }
+
+      if (stopProfitMicros !== null && cumulativeNetMicros >= stopProfitMicros) {
+        stoppedReason = 'take_profit_reached';
+        break;
+      }
+      if (stopLossMicros !== null && cumulativeNetMicros <= -stopLossMicros) {
+        stoppedReason = 'stop_loss_reached';
+        break;
+      }
+    }
+
+    return {
+      ok: true,
+      action: 'AUTO_STRATEGY_COMPLETED',
+      playerAddress: wallet.address,
+      strategy: strat,
+      rollsRequested: maxRolls,
+      rollsExecuted: receipts.length,
+      wins,
+      losses,
+      cumulativeNetPoa: fromMicros(cumulativeNetMicros),
+      stoppedReason,
+      receipts
+    };
   }
 
   /**

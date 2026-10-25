@@ -67,7 +67,7 @@ test('E2E 1: HTTP API + Near Real-Time SSE Stream + Streamable HTTP MCP (14 Tool
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
     }).then((r) => r.json());
-    assert.equal(listMcp.result.tools.length, 14);
+    assert.equal(listMcp.result.tools.length, 16);
 
     // 4. Call MCP tool bank_stake to add 5,000 POA to the bankroll
     const stakeCall = await fetch(`${info.url}/mcp`, {
@@ -147,6 +147,47 @@ test('E2E 1: HTTP API + Near Real-Time SSE Stream + Streamable HTTP MCP (14 Tool
       chatReadData.messages.some((m) => m.text.includes('Staked 5000 POA')),
       true
     );
+
+    // 7. Call MCP tools dice_auto_strategy and dice_audit_solvency
+    const autoCall = await fetch(`${info.url}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: {
+          name: 'dice_auto_strategy',
+          arguments: {
+            strategy: 'quarter_kelly',
+            base_wager_poa: '10.000000',
+            target_bps: 4950,
+            direction: 'under',
+            rolls: 3,
+          },
+        },
+      }),
+    }).then((r) => r.json());
+    const autoData = JSON.parse(autoCall.result.content[0].text);
+    assert.equal(autoData.ok, true);
+    assert.equal(autoData.rollsExecuted, 3);
+
+    const auditCall = await fetch(`${info.url}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 8,
+        method: 'tools/call',
+        params: {
+          name: 'dice_audit_solvency',
+          arguments: {},
+        },
+      }),
+    }).then((r) => r.json());
+    const auditData = JSON.parse(auditCall.result.content[0].text);
+    assert.equal(auditData.ok, true);
+    assert.equal(auditData.invariants.solvencyPassed, true);
 
     // Wait briefly for SSE delivery and verify near real-time events arrived
     await new Promise((r) => setTimeout(r, 80));

@@ -104,9 +104,29 @@ async function main() {
     ]);
     assert.equal(sweepOut.ok, true);
     assert.equal(sweepOut.devReserveAddress, DEV_RESERVE_ADDRESS);
+
+    const autoOut = await runCliJson([
+      'bin/poa-dice-cli.mjs',
+      'auto-bet',
+      '--server',
+      srv.url,
+      '--wallet',
+      walletDir,
+      '--strategy',
+      'martingale_capped',
+      '--rolls',
+      '3',
+      '--amount',
+      '5.000000',
+    ]);
+    assert.equal(autoOut.ok, true);
+    assert.equal(autoOut.rollsExecuted, 3);
   } finally {
     await app.close();
   }
+
+  // Verify no leftover unbounded audit-log.jsonl file was created
+  assert.equal(fs.existsSync(path.join(dataDir, 'audit-log.jsonl')), false);
 
   // 3. Server is now CLOSED (Simulating Website Down / Hacked!)
   // Verify that CLI still works 100% offline against the local state & DICE1:* memos
