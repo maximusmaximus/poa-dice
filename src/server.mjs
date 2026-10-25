@@ -38,8 +38,10 @@ import {
   formatMicros,
   loadDebits,
   rememberDebit,
-  saveDebits,
-  spendableMicros
+  fetchExplorerTx,
+  loadTxDetails,
+  playerSpendableMicros,
+  saveDebits
 } from './chain-feed.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -207,6 +209,8 @@ export function createDiceServer(options = {}) {
     return tpl.ok ? tpl : null;
   };
   const chainFetch = options.chainFetch || ((address) => fetchExplorerAddress(watcher.nodeUrl, address));
+  const chainTxFetch = options.chainTxFetch || ((txid) => fetchExplorerTx(watcher.nodeUrl, txid));
+  const coveredTxCache = new Map(); // txid -> explorer detail; checkpoint coverage is permanent
   const chainCacheMs = options.chainCacheMs ?? 15000;
   const devEndpoints = options.devEndpoints !== undefined ? Boolean(options.devEndpoints) : process.env.POA_DICE_DEV_ENDPOINTS === '1';
   const adminToken = options.adminToken !== undefined ? options.adminToken : process.env.POA_DICE_ADMIN_TOKEN || null;
@@ -214,18 +218,30 @@ export function createDiceServer(options = {}) {
   const pendingSpend = new Map(); // address -> micros reserved by in-flight batches
   let chainDebits = dataDir ? loadDebits(dataDir) : [];
 
-  async function cachedExplorer(address) {
+  async function cachedExplorer(address, { withTxDetails = false } = {}) {
     const hit = chainCache.get(address);
-    if (hit && Date.now() - hit.at < chainCacheMs) return hit.row;
-    const row = await chainFetch(address);
-    chainCache.set(address, { at: Date.now(), row });
+    let row;
+    if (hit && Date.now() - hit.at < chainCacheMs) row = hit.row;
+    else {
+      row = await chainFetch(address);
+      chainCache.set(address, { at: Date.now(), row });
+    }
+    if (withTxDetails && !row.txDetails) {
+      row.txDetails = (row.txs || []).length ? await loadTxDetails(row, chainTxFetch, { cache: coveredTxCache }) : {};
+      if (coveredTxCache.size > 5000) coveredTxCache.clear();
+    }
     return row;
   }
+  const playerRow = (address) => cachedExplorer(address, { withTxDetails: true });
 
   function playerSpendable(row) {
-    const pending = pendingSpend.get(row.address) || 0n;
-    const have = spendableMicros(row.balance, chainDebits, row.address) - pending;
-    return have > 0n ? have : 0n;
+    return playerSpendableMicros({
+      address: row.address,
+      row,
+      details: row.txDetails || {},
+      debits: chainDebits,
+      pendingMicros: pendingSpend.get(row.address) || 0n
+    }).spendableMicros;
   }
 
   /** Live chain context used by every quote/action validator. */
@@ -235,7 +251,7 @@ export function createDiceServer(options = {}) {
       const bank = await cachedExplorer(engine.bankAddress);
       const ctx = { required: true, ok: true, bankMicros: toMicros(bank.balance || '0') };
       if (address && isValidPoaAddress(address)) {
-        ctx.playerSpendableMicros = playerSpendable(await cachedExplorer(address));
+        ctx.playerSpendableMicros = playerSpendable(await playerRow(address));
       }
       return ctx;
     } catch {
@@ -315,7 +331,7 @@ export function createDiceServer(options = {}) {
     if (!requireChain) return;
     let row;
     try {
-      row = await cachedExplorer(address);
+      row = await playerRow(address);
     } catch (err) {
       const error = new Error('minepoa.com balance is unavailable. This action was not booked.');
       error.status = 503;
@@ -505,7 +521,7 @@ export function createDiceServer(options = {}) {
             const dev = await cachedExplorer(DEV_RESERVE_ADDRESS);
             let player = null;
             if (address && isValidPoaAddress(address)) {
-              const row = await cachedExplorer(address);
+              const row = await playerRow(address);
               player = {
                 address: row.address,
                 balance: row.balance,
