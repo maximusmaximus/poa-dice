@@ -499,7 +499,14 @@ export class LedgerWatcher {
       for (const t of txs) {
         const txid = t.id || t.txid;
         if (!txid || this.engine.processedTxids.has(txid)) continue;
-        const memo = String(t.memo || '');
+        let memo = String(t.memo || '');
+        if (!memo && t.type === 'transfer' && t.to === this.engine.bankAddress) {
+          // minepoa address pages omit memos: read it from the tx itself.
+          const r = await fetchImpl(`${this.nodeUrl}/api/explorer/tx/${txid}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000) }).catch(() => null);
+          const j = r && r.ok ? await r.json().catch(() => null) : null;
+          memo = String(j?.memo ?? j?.body?.memo ?? '');
+          t.memo = memo;
+        }
         if (t.type === 'transfer' && t.to === this.engine.bankAddress && memo.startsWith('DICE1:')) {
           const res = this.executeMemoAction({
             txid,

@@ -11,8 +11,14 @@
 import http from 'node:http';
 import { fromMicros, toMicros, txidOf, verifyBody } from '../../src/crypto-poa.mjs';
 
-export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1', autoFinal = false } = {}) {
+export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1', autoFinal = false, realistic = false } = {}) {
   const bal = new Map(Object.entries(balances).map(([a, v]) => [a, toMicros(v)]));
+  // realistic=true mimics minepoa.com read-node v0.2 (observed 2026-10-25):
+  //   address pages omit memos, `balance` is as of the last checkpoint, and
+  //   /api/explorer/txs?type=transfer lists recent transfers with memo + height.
+  let cpBal = new Map(bal);
+  let cpHeight = -1;
+  let timeoutsLeft = 0;
   const nonces = new Map();
   const txs = new Map(); // id -> {id, body, final, atts, seq}
   let seq = 0;
@@ -57,6 +63,10 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
+    if (req.method === 'GET' && timeoutsLeft > 0) {
+      timeoutsLeft -= 1;
+      return; // never answer: the client's timeout fires
+    }
     if (req.method === 'POST' && p === '/api/submit') {
       let raw = '';
       for await (const c of req) raw += c;
@@ -86,8 +96,24 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       const list = [...txs.values()]
         .filter((t) => t.body.from === a || t.body.to === a)
         .sort((x, y) => y.seq - x.seq)
-        .map((t) => ({ id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo, ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0 }));
+        .map((t) => {
+          const row = { id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo, ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0 };
+          if (realistic) delete row.memo;
+          return row;
+        });
+      if (realistic) return json(res, 200, { address: a, balance: fromMicros(cpBal.get(a) || 0n), balance_as_of: { checkpoint_height: cpHeight }, txs: list, checkpoint_height: cpHeight });
       return json(res, 200, { address: a, balance: fromMicros(bal.get(a) || 0n), txs: list, checkpoint_height: seq });
+    }
+    if (p === '/api/explorer/txs') {
+      if (!realistic) return json(res, 404, { error: 'mock: not enabled' });
+      const limit = Math.min(200, Number(url.searchParams.get('limit') || 50));
+      const type = url.searchParams.get('type');
+      const list = [...txs.values()]
+        .filter((t) => !type || t.body.type === type)
+        .sort((x, y) => y.seq - x.seq)
+        .slice(0, limit)
+        .map((t) => ({ id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo || '', ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0, height: t.seq }));
+      return json(res, 200, list);
     }
     if ((m = p.match(/^\/api\/receipt\/(.+)$/))) {
       const t = txs.get(m[1]);
@@ -107,6 +133,16 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     submits,
     balanceOf: (a) => fromMicros(bal.get(a) || 0n),
     setBalance: (a, v) => bal.set(a, toMicros(v)),
+    /** Sign a checkpoint covering everything so far (realistic mode balances catch up). */
+    checkpoint: () => {
+      cpBal = new Map(bal);
+      cpHeight = seq - 1;
+    },
+    checkpointBalanceOf: (a) => fromMicros(cpBal.get(a) || 0n),
+    /** The next n GET requests hang (client timeout path). */
+    hangNext: (n = 1) => {
+      timeoutsLeft = n;
+    },
     finalizeAll: () => {
       for (const t of txs.values()) {
         t.final = true;

@@ -183,19 +183,34 @@ When `POA_DICE_WATCHER_MODE` is not `simulated` (the default for `npm start` is 
 - **Bank key from a secret.** `POA_DICE_BANK_PRIVKEY` (Base58 Ed25519) or `POA_DICE_BANK_KEY_FILE` (path to the key, or a `poa.mjs` `wallet.json`). The optional `POA_DICE_BANK_ADDRESS` pins the expected address. The server never generates a bank key in chain mode. If the key is missing or invalid, it starts **read-only**: no bank address is advertised, every money-moving endpoint and MCP tool returns `503`/rejected, and the UI shows `BANK KEY MISSING`. Set `POA_DICE_REQUIRE_BANK_KEY=1` to refuse to start instead. The key is never logged or serialized. It is removed from `process.env` after loading.
 - **Inbound** (deposits, bets, withdraw triggers): signed txs from MCP or `/api/tx/submit` are broadcast to minepoa with `POST /api/submit`. They are booked **only once the ledger confirms them** (`POA_DICE_CONFIRM=final` by default: K=5 attestations or checkpoint coverage), using the ledger's copy of the body. Transfers sent straight to the bank with `poa.mjs send` are picked up from the bank's explorer page. Booking is idempotent by txid.
 - **Outbound** (payouts, withdrawals, refunds, dev sweeps): a durable queue. Each order is signed with the bank key and persisted before broadcast. Retries use backoff and rebroadcast the **same** signed tx, so there is no double-pay across retries or restarts. Status goes QUEUED → SIGNED → SENT → CONFIRMED (or FAILED, or WAITING_FUNDS).
-- **Solvency:** orders are signed only when the on-chain bank balance (less unconfirmed inbound and in-flight outbound) covers them. `dice_audit_solvency` and `GET /api/audit/chain` compare the internal books with the on-chain balance.
+- **Solvency:** orders are signed only when the on-chain bank balance covers them. That balance counts final inbound only and subtracts in-flight outbound; see Ledger recovery. `dice_audit_solvency` and `GET /api/audit/chain` compare the internal books with the on-chain balance.
 - **Status:** `GET /api/tx/<txid>/status`, MCP `tx_status`, `GET /api/settlement`, and `settlement` in `/api/state` and `/api/health`.
 - **Not in chain mode:** `dice_auto_strategy`, and batch `stop_on_*`. Both need each roll settled before the next. Batches broadcast all N rolls at once, and each settles as it confirms.
 
 ### Storage
-Chain mode needs **durable storage** for `bankroll-state.json`, `settlement.json` and `chain-debits.json`. Set `POA_DICE_DATA_DIR` to a persistent writable directory. Without one, the server is read-only (`STORAGE_UNAVAILABLE`). Serverless hosts with ephemeral disks or memory (e.g. Vercel functions) are **not** sufficient. Run on a host with a persistent volume, or implement the two-method store adapter in `src/settlement-store.mjs` (and the engine state) on a durable KV/DB.
+All vault state (the settlement queue **and** the engine's books) is one JSON document, written in order. A payout is broadcast only after its signed body is durable.
+
+- **Vercel / Grok app-builder / any host that recycles instances:** use Redis over REST. Add the Vercel KV (Upstash) integration, or set `KV_REST_API_URL` + `KV_REST_API_TOKEN` (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` also work). The key is `poa-dice:<bankAddress>:vault` (prefix: `POA_DICE_KV_KEY`).
+- **VM or container with a persistent volume:** set `POA_DICE_DATA_DIR` to it.
+- **Anything else** (the default `data/` dir, or any file on Vercel) is **ephemeral**. The server goes read-only (`STORAGE_EPHEMERAL`) and advertises no bank address. `POA_DICE_ALLOW_EPHEMERAL=1` overrides this, at your own risk.
+
+### Ledger recovery (state lost or never written)
+The minepoa ledger is the source of truth, and every tick rescans the bank address:
+- Address pages on minepoa omit memos, so each bank tx's memo is read from `/api/explorer/tx/<id>`. Every final `DICE1:*` transfer to the bank gets booked once, by txid, even if the vault has no record of it. A lost deposit is credited automatically on the next tick after deploy, with no admin step.
+- The bank's own sent txs are indexed by their `:ord=<orderId>` memo tag. An order already paid on chain is adopted and never paid twice.
+- A **bet** older than the vault state is not re-rolled. A new seed could pay an outcome that never happened. It is held as `NEEDS_REVIEW`.
+- **Balance:** the explorer `balance` is the balance at the last checkpoint, which can lag by hours. Spendable funds are computed as the larger of two lower bounds: final inbound minus outbound over the bank's ledger history, or the checkpoint balance minus outbound. In-flight payouts are then subtracted.
+- minepoa reads use a 25 s timeout per attempt with 3 attempts and backoff, and honor `retry_after`. Set them with `POA_MINEPOA_TIMEOUT_MS` and `POA_MINEPOA_RETRIES`. `GET /api/tx/<txid>/status` falls back to a ledger lookup for txids the vault has not booked yet.
 
 ### Env summary
 | Variable | Purpose |
 |---|---|
 | `POA_DICE_BANK_PRIVKEY` / `POA_DICE_BANK_KEY_FILE` | House bank key (secret). Use a **new dedicated wallet**. |
 | `POA_DICE_BANK_ADDRESS` | Optional: expected bank address (refuses any other key) |
-| `POA_DICE_DATA_DIR` | Persistent state directory (required in chain mode) |
+| `KV_REST_API_URL` + `KV_REST_API_TOKEN` | Durable vault store (Vercel KV / Upstash Redis REST). **Required on Vercel / Grok app-builder.** |
+| `POA_DICE_DATA_DIR` | Persistent state directory (alternative on hosts with a real disk) |
+| `POA_DICE_ALLOW_EPHEMERAL=1` | Run with an ephemeral store anyway (relies on ledger replay; not recommended) |
+| `POA_MINEPOA_TIMEOUT_MS` / `POA_MINEPOA_RETRIES` | minepoa read timeout per attempt (25000) / attempts (3) |
 | `POA_DICE_ADMIN_TOKEN` | Admin/house actions |
 | `POA_DICE_CONFIRM` | `final` (default) or `included` |
 | `POA_DICE_REQUIRE_BANK_KEY=1` | Exit instead of running read-only |

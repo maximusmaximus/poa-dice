@@ -30,7 +30,7 @@ import crypto from 'node:crypto';
 import { loadBankWallet } from './bank-key.mjs';
 import { ChainSettlement } from './chain-settlement.mjs';
 import { DEFAULT_CHAIN_ID, MinepoaClient } from './minepoa-client.mjs';
-import { createFileStore, isWritableDir } from './settlement-store.mjs';
+import { resolveStore } from './settlement-store.mjs';
 import {
   fetchExplorerAddress,
   formatMicros,
@@ -129,13 +129,24 @@ export function createDiceServer(options = {}) {
   if (chainSettlement) {
     const key = loadBankWallet({ env: options.bankEnv || process.env, allowEphemeral: false });
     bankKeySource = key.source;
-    const store = options.settlementStore || (dataDir && isWritableDir(dataDir) ? createFileStore(dataDir) : null);
+    const storeEnv = options.storeEnv || process.env;
+    const store =
+      options.settlementStore ||
+      (key.status === 'OK'
+        ? resolveStore({ env: storeEnv, dataDir, dataDirIsPersistent: options.dataDir !== undefined && options.dataDirIsPersistent !== false, bankAddress: key.wallet.address })
+        : null);
+    const allowEphemeral = options.allowEphemeralStore ?? storeEnv.POA_DICE_ALLOW_EPHEMERAL === '1';
     if (key.status !== 'OK') {
       readOnlyState = { status: key.status, error: key.error };
     } else if (!store) {
       readOnlyState = {
         status: 'STORAGE_UNAVAILABLE',
-        error: 'Chain mode needs durable storage: set POA_DICE_DATA_DIR to a persistent writable directory (or plug in a KV store adapter).'
+        error: 'Chain mode needs durable storage: set KV_REST_API_URL + KV_REST_API_TOKEN (Vercel KV / Upstash Redis) or POA_DICE_DATA_DIR on a persistent disk.'
+      };
+    } else if (store.durable === false && !allowEphemeral) {
+      readOnlyState = {
+        status: 'STORAGE_EPHEMERAL',
+        error: `Vault state would be kept in ${store.location}, which this host wipes on restart. Set KV_REST_API_URL + KV_REST_API_TOKEN (Vercel KV / Upstash Redis). Funds already on the ledger are safe: they are re-read from minepoa once storage is configured.`
       };
     } else {
       const fresh =
@@ -175,6 +186,10 @@ export function createDiceServer(options = {}) {
           });
           watcher.bankWallet = key.wallet;
           watcher.attachSettlement(settlement);
+          settlement.ready().catch((err) => {
+            readOnlyState = { status: 'SETTLEMENT_STORE_ERROR', error: redactSecrets(err.message) };
+            settlement.stop();
+          });
         } catch (err) {
           readOnlyState = { status: 'SETTLEMENT_STORE_MISMATCH', error: redactSecrets(err.message) };
         }
@@ -313,9 +328,12 @@ export function createDiceServer(options = {}) {
       bankKeySource,
       confirmPolicy: sum.confirmPolicy,
       store: sum.store,
+      storeDurable: sum.storeDurable,
       lastTick: sum.lastTick,
       lastError: sum.lastError,
+      lastErrorAt: sum.lastErrorAt,
       onChainBankBalancePoa: sum.onChainBankBalancePoa,
+      bankBalance: sum.bankBalance,
       inbound: sum.inbound,
       outbound: sum.outbound
     };
@@ -335,6 +353,8 @@ export function createDiceServer(options = {}) {
 
       const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       const pathname = urlObj.pathname;
+      // Hosts that freeze idle instances stall setInterval; any request nudges a stale settlement loop.
+      if (settlement && !readOnlyState && settlement._timer && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
 
       if (readOnlyState && req.method === 'POST' && WRITE_PATHS.has(pathname)) {
         return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });
@@ -347,7 +367,8 @@ export function createDiceServer(options = {}) {
       const txStatusMatch = pathname.match(/^\/api\/tx\/([0-9a-f]{64}|[0-9a-f]{24})\/status$/);
       if (txStatusMatch && req.method === 'GET') {
         const id = txStatusMatch[1];
-        const st = settlement ? settlement.getTxStatus(id) : engine.processedTxids.has(id) ? { txid: id, status: 'CONFIRMED', mode: 'simulated' } : null;
+        let st = settlement ? settlement.getTxStatus(id) : engine.processedTxids.has(id) ? { txid: id, status: 'CONFIRMED', mode: 'simulated' } : null;
+        if (!st && settlement) st = await settlement.lookupLedger(id);
         return st ? sendJson(res, 200, st) : sendJson(res, 404, { error: 'Unknown txid' });
       }
 
@@ -755,7 +776,10 @@ export function createDiceServer(options = {}) {
     mcpHandler,
     settlement,
     readOnly,
+    /** Resolves once vault state is loaded (KV stores load asynchronously). */
+    ready: () => (settlement ? settlement.ready().catch(() => {}) : Promise.resolve()),
     async listen(port = Number(process.env.PORT || 3080), host = '127.0.0.1') {
+      if (settlement) await settlement.ready().catch(() => {});
       await new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(port, host, resolve);
@@ -796,6 +820,7 @@ if (isMain) {
     dataDir: process.env.POA_DICE_DATA_DIR || undefined,
     initialBootstrapPoa: watcherMode === 'simulated' ? process.env.POA_DICE_BOOTSTRAP_POA || null : null
   });
+  app.ready().then(() => {
   const ro = app.readOnly();
   if (ro) {
     console.error(`POA Dice is READ-ONLY: ${ro.status}. ${ro.error}`);
@@ -803,12 +828,14 @@ if (isMain) {
   } else if (app.settlement) {
     app.settlement.start(Number(process.env.POA_DICE_SETTLE_MS || 5000));
   }
-  app.listen(port, host).then((info) => {
+  return app.listen(port, host).then((info) => {
     console.log(`POA Dice & Bankroll Vault live at ${info.url}`);
     console.log(`  MCP Endpoint : ${info.url}/mcp`);
     console.log(`  SSE Stream   : ${info.url}/api/stream`);
     console.log(`  Bank Address : ${ro ? `(none: ${ro.status})` : app.engine.bankAddress}`);
     console.log(`  Settlement   : ${app.settlement ? 'minepoa chain (real deposits + payouts)' : ro ? 'read-only' : 'simulated'}`);
+    console.log(`  Store        : ${app.settlement ? `${app.settlement.store.kind} (${app.settlement.store.durable === false ? 'EPHEMERAL' : 'durable'})` : '-'}`);
     console.log(`  Dev Reserve  : ${DEV_RESERVE_ADDRESS} (0.1% reserved)`);
+  });
   });
 }
