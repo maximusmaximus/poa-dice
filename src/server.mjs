@@ -192,6 +192,16 @@ export function createDiceServer(options = {}) {
           const bindTarget = options.bindStore !== undefined ? (options.bindStore ? key.wallet.address : null) : signerEnv.POA_DICE_BIND_STORE || null;
           settlement = new ChainSettlement({
             writer,
+            // A failed vault load is retried on later ticks; read-only (fail-closed) until one succeeds.
+            onLoadStateChange: (v) => {
+              if (v.status === 'LOADED') {
+                if (readOnlyState && readOnlyState.retrying) readOnlyState = null;
+              } else if (v.status === 'FAILED' && (!readOnlyState || readOnlyState.retrying)) {
+                readOnlyState = { status: 'SETTLEMENT_STORE_ERROR', error: redactSecrets(v.lastError || 'vault load failed'), retrying: true };
+              }
+            },
+            loadRetryBaseMs: options.loadRetryBaseMs ?? 2000,
+            loadRetryMaxMs: options.loadRetryMaxMs ?? 60000,
             bindOnBoot: bindTarget === key.wallet.address,
             engine,
             watcher,
@@ -222,8 +232,14 @@ export function createDiceServer(options = {}) {
           watcher.bankWallet = key.wallet;
           watcher.attachSettlement(settlement);
           settlement.ready().catch((err) => {
-            readOnlyState = { status: 'SETTLEMENT_STORE_ERROR', error: redactSecrets(err.message) };
-            settlement.stop();
+            if (settlement.fatalError) {
+              // The stored vault belongs to another bank: permanent, never retried.
+              readOnlyState = { status: 'SETTLEMENT_STORE_MISMATCH', error: redactSecrets(settlement.fatalError) };
+              settlement.stop();
+              return;
+            }
+            // Store error: stay read-only and keep retrying the load on later ticks (see ChainSettlement).
+            readOnlyState = { status: 'SETTLEMENT_STORE_ERROR', error: redactSecrets(err.message), retrying: true };
           });
         } catch (err) {
           readOnlyState = { status: 'SETTLEMENT_STORE_MISMATCH', error: redactSecrets(err.message) };
@@ -415,7 +431,15 @@ export function createDiceServer(options = {}) {
 
   function settlementBrief() {
     if (!chainSettlement) return { mode: 'simulated', status: 'SIMULATED', readOnly: false, note: 'Local demo ledger: nothing moves on minepoa' };
-    if (readOnlyState) return { mode: 'chain', status: readOnlyState.status, readOnly: true, error: readOnlyState.error };
+    if (readOnlyState) {
+      return {
+        mode: 'chain',
+        status: readOnlyState.status,
+        readOnly: true,
+        error: readOnlyState.error,
+        ...(settlement ? { trading: 'READ_ONLY', vaultLoad: settlement.loadView(), writer: settlement.writer.view() } : {})
+      };
+    }
     const sum = settlement.summary();
     return {
       mode: 'chain',
@@ -437,7 +461,8 @@ export function createDiceServer(options = {}) {
       outbound: sum.outbound,
       stuckPayouts: sum.stuckPayouts,
       writer: sum.writer,
-      foreignOutflows: sum.foreignOutflows
+      foreignOutflows: sum.foreignOutflows,
+      vaultLoad: sum.vaultLoad
     };
   }
 
@@ -456,7 +481,7 @@ export function createDiceServer(options = {}) {
       const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       const pathname = urlObj.pathname;
       // Hosts that freeze idle instances stall setInterval; any request nudges a stale settlement loop.
-      if (settlement && !readOnlyState && settlement._timer && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
+      if (settlement && (!readOnlyState || readOnlyState.retrying) && settlement._timer && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
 
       if (readOnlyState && req.method === 'POST' && WRITE_PATHS.has(pathname)) {
         return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });
