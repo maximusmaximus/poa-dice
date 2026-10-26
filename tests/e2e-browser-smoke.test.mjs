@@ -119,6 +119,38 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       if (shotsDir) await page.screenshot({ path: path.join(shotsDir, 'top.png'), clip: { x: 0, y: 0, width: 1400, height: 1000 } });
     });
 
+    await t.test('MCP has its own panel below the feed (no tab) and the emoji logo changes on every load', async () => {
+      assert.equal(await page.$('[data-feed-tab="mcp"]'), null, 'MCP is no longer a feed tab');
+      assert.equal(await page.$('#feedTabMcp'), null);
+      assert.ok(await page.isVisible('#mcpPanel.panel'), 'MCP panel visible without clicking anything');
+      assert.match(await page.textContent('#mcpPanel .panel-title'), /MCP/);
+      for (const id of ['mcpEndpointPre', 'offlineBanner', 'liveOfflineCommand', 'btnCopyOfflineCmd']) {
+        assert.ok(await page.isVisible(`#mcpPanel #${id}`), `#${id} lives in the MCP panel`);
+      }
+      const feedBox = await page.locator('.panel-feed').boundingBox();
+      const mcpBox = await page.locator('#mcpPanel').boundingBox();
+      assert.ok(mcpBox.y >= feedBox.y + feedBox.height - 1, 'MCP panel sits below the feed');
+      // Feed tabs still switch (chat/bets/verify only)
+      await page.click('[data-feed-tab="bets"]');
+      assert.ok(await page.isVisible('#feedTabBets'));
+      await page.click('[data-feed-tab="chat"]');
+      assert.ok(await page.isVisible('#feedTabChat'));
+      // Logo: a new emoji combo each load, never the same as the previous load
+      const seen = [];
+      for (let i = 0; i < 4; i += 1) {
+        const logo = (await page.textContent('#brandLogo')).trim();
+        assert.ok(logo.length > 0 && /\p{Extended_Pictographic}/u.test(logo), `emoji logo: ${logo}`);
+        assert.equal(await page.evaluate(() => localStorage.getItem('poaDice.brandLogo')), logo);
+        if (seen.length) assert.notEqual(logo, seen[seen.length - 1], 'logo changes on reload');
+        seen.push(logo);
+        if (i < 3) {
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          await page.waitForFunction((prev) => document.getElementById('brandLogo').textContent.trim() !== prev, logo, { timeout: 5000 });
+        }
+      }
+      assert.equal(await page.getAttribute('#brandLogo', 'aria-hidden'), 'true');
+    });
+
     await t.test('/api/wallet/dev and /api/wallet/generate are not publicly served; the browser never sends privkeys', async () => {
       for (const [method, p] of [['GET', '/api/wallet/dev'], ['POST', '/api/wallet/dev'], ['POST', '/api/wallet/generate']]) {
         const r = await fetch(srv.url + p, { method });

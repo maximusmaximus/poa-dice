@@ -1773,3 +1773,42 @@ body.modal-open { overflow: hidden; }
 @media (max-width: 600px) {
   .ledger-banner { margin: 10px 12px; font-size: 0.84rem; }
 }
+
+/* ---------- MCP module (own panel below the feed) + emoji brand logo ---------- */
+.panel-mcp { grid-column: 1 / -1; }
+.mcp-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px 18px;
+}
+.mcp-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.mcp-grid .offline-banner {
+  grid-column: 1 / -1;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  border-radius: var(--radius-sm);
+}
+.site-header .brand-logo {
+  flex: 0 0 auto;
+  min-width: 52px;
+  width: auto;
+  height: 52px;
+  padding: 0 10px;
+  gap: 2px;
+  font-size: 26px;
+  letter-spacing: -0.06em;
+  white-space: nowrap;
+}
+.site-header .brand-logo[data-count='3'] { font-size: 22px; }
+@media (max-width: 820px) {
+  .mcp-grid { grid-template-columns: minmax(0, 1fr); }
+  .panel-mcp { grid-column: auto; }
+  .site-header .brand-logo { height: 44px; min-width: 44px; font-size: 22px; padding: 0 8px; }
+  .site-header .brand-logo[data-count='3'] { font-size: 19px; }
+}
+.mcp-grid .cmd-copy-row { overflow-x: visible; align-items: flex-start; }
+.mcp-grid .cmd-copy-row code { white-space: normal; overflow-wrap: anywhere; }
+.mcp-grid .cmd-copy-row .btn-xs { flex: 0 0 auto; }
+.mcp-grid code, .mcp-grid .code-block { overflow-wrap: anywhere; }
+@media (max-width: 820px) {
+  .mcp-grid .cmd-copy-row { flex-direction: column; align-items: stretch; }
+}

@@ -1044,9 +1044,34 @@ export function stopPoaDice() {
   clearTimeout(reconnectTimer);
 }
 
+// Emoji brand logo: a different dice/agent/proof combo on every page load.
+export const BRAND_LOGO_COMBOS = [
+  '🎲🤖', '🎲🔐', '🤖🎲✨', '🎲⚡', '🔮🎲', '🎲🧠', '🎰🤖', '🎲🛡️',
+  '🤖🔗🎲', '🎲💎', '🧬🎲', '🎲🚀', '🦾🎲', '🎲🔍', '🎲🏦', '🎯🎲',
+];
+const BRAND_LOGO_KEY = 'poaDice.brandLogo';
+
+export function pickBrandLogo(previous, rand = Math.random) {
+  const pool = BRAND_LOGO_COMBOS.filter((c) => c !== previous);
+  const list = pool.length ? pool : BRAND_LOGO_COMBOS;
+  return list[Math.min(list.length - 1, Math.floor(rand() * list.length))];
+}
+
+function applyBrandLogo() {
+  const el = document.getElementById('brandLogo');
+  if (!el) return;
+  let previous = null;
+  try { previous = window.localStorage.getItem(BRAND_LOGO_KEY); } catch { previous = null; }
+  const combo = pickBrandLogo(previous);
+  el.textContent = combo;
+  el.dataset.count = String((combo.match(/\p{Extended_Pictographic}/gu) || []).length);
+  try { window.localStorage.setItem(BRAND_LOGO_KEY, combo); } catch { /* storage blocked: still random */ }
+}
+
 export function bootPoaDice() {
   const myGen = ++bootGeneration;
   const alive = () => myGen === bootGeneration && !!document.getElementById('btnCopyPrompt');
+  try { applyBrandLogo(); } catch { /* keep the default logo */ }
   bindEvents();
   const saved = loadSavedAddress();
   if (saved && !String($('playerAddressInput').value || '').trim()) {
@@ -1268,7 +1293,7 @@ function bindEvents() {
     btn.addEventListener('click', () => switchTab('data-bank-tab', 'bankTab', ['deposit', 'withdraw', 'incentives'], btn.getAttribute('data-bank-tab')))
   );
   document.querySelectorAll('[data-feed-tab]').forEach((btn) =>
-    btn.addEventListener('click', () => switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify', 'mcp'], btn.getAttribute('data-feed-tab')))
+    btn.addEventListener('click', () => switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify'], btn.getAttribute('data-feed-tab')))
   );
   $('liveBetsTableBody').addEventListener('click', (e) => {
     const row = e.target.closest('tr[data-bet-txid]');
@@ -1280,7 +1305,7 @@ function bindEvents() {
     $('verifyBetTxid').value = bet.betTxid || '';
     $('verifyTargetBps').value = String(bet.targetBps || 4950);
     $('verifyDirection').value = bet.direction || 'under';
-    switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify', 'mcp'], 'verify');
+    switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify'], 'verify');
   });
   $('btnCopyOfflineCmd').addEventListener('click', async () => {
     if (await copyText($('liveOfflineCommand').textContent)) flashCopied($('btnCopyOfflineCmd'), null, 'Copy Command');
