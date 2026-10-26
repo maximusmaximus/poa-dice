@@ -264,8 +264,8 @@ test('live replay: first pass after deploy heals the lock, undoes the double-boo
     assert.ok(rec3.halfApplyRepaired, 'the double-booked wager was undone');
     assert.deepEqual({ nav: fresh.s.engine.bankNavMicros, dev: fresh.s.engine.devReserveMicros, inc: fresh.s.engine.incentivePoolMicros }, before);
     assert.equal(fresh.s.reconcile.status, 'OK', JSON.stringify(fresh.s.reconcile));
-    assert.equal(fresh.s.getTxStatus(w2.x.id).payouts[0].rawStatus, 'CONFIRMED', '269433a2-like payout confirmed from its receipt');
-    assert.equal(fresh.s.state.outbound[p2.orderId].confirmedVia, 'receipt');
+    assert.equal(fresh.s.getTxStatus(w2.x.id).payouts[0].rawStatus, 'CONFIRMED', 'the payout is in the bank\'s ledger history (last complete read)');
+    assert.equal(fresh.s.state.outbound[p2.orderId].confirmedVia, 'ledger-history', 'confirmed by the ledger history, never by a receipt alone');
     await fresh.pass(2);
     const out = fresh.s.getTxStatus(x3.id).payouts[0];
     assert.ok(['SENT', 'CONFIRMED'].includes(out.rawStatus), `refund went out with a nonce from receipts: ${JSON.stringify(out)}`);
@@ -431,7 +431,7 @@ test('audit: explorer busy => last trusted balance (+ in-flight) within the fres
 
 // ─── 3. receipts ────────────────────────────────────────────────────────────
 
-test('receipt-only confirmation: included + matching txid/body => CONFIRMED; a mismatching receipt never confirms', async () => {
+test('a receipt alone never confirms: an included receipt keeps the payout SENT (in flight) until the ledger shows it', async () => {
   const c = await cluster('receipt', 1);
   const [a] = c.nodes;
   try {
@@ -447,6 +447,12 @@ test('receipt-only confirmation: included + matching txid/body => CONFIRMED; a m
       o.status = 'SENT';
       delete o.confirmedVia;
     });
+    // the bank's ledger history does not list it (live: 269433a2 was in neither the bank's nor the recipient's history)
+    {
+      const doc = c.store.load();
+      delete doc.ledgerOut[doc.outbound[orderId].txid];
+      c.store.save(doc);
+    }
     const o = stored();
     c.mock.setReadBusy(60, { receipts: false });
     const other = o.to === c.p.address ? c.bank.address : c.p.address;
@@ -467,11 +473,18 @@ test('receipt-only confirmation: included + matching txid/body => CONFIRMED; a m
     });
     c.mock.setReceipt(o.txid, { txid: o.txid, ts: 1793030540, status: 'included', height: 2358 });
     await a.pass(1);
+    const held = stored();
+    assert.equal(held.status, 'SENT', 'an included receipt alone is not enough');
+    assert.equal(held.receipt.height, 2358, 'the receipt is recorded');
+    assert.equal(c.mock.transfersFrom(c.bank.address).length, 1, 'nothing is sent');
+    // the ledger answers again and shows the txid: now it is CONFIRMED
+    c.mock.setReadBusy(0);
+    a.s.client._busyUntil.read = 0;
+    await a.pass(2);
     const done = stored();
     assert.equal(done.status, 'CONFIRMED');
-    assert.equal(done.confirmedVia, 'receipt');
-    assert.equal(done.receipt.height, 2358);
-    assert.equal(a.s.stuckPayouts().length, 0, 'no longer SENT_UNCONFIRMED_STALE');
+    assert.ok(['explorer', 'ledger-history'].includes(done.confirmedVia), done.confirmedVia);
+    assert.equal(a.s.stuckPayouts().length, 0);
     assert.equal(c.mock.transfersFrom(c.bank.address).length, 1, 'confirming never sends anything');
   } finally {
     await c.close();

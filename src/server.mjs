@@ -917,6 +917,23 @@ export function createDiceServer(options = {}) {
         }
       }
 
+      // Re-pay ONE payout that the vault marked paid from a receipt but that never reached the ledger. Admin only.
+      // Dry run by default (what would be sent + every check); {"confirm": true} records the request once.
+      // Recipient, amount and memo come from the stored order, never from this request.
+      if (pathname === '/api/admin/payouts/repay' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
+        if (!settlement) return sendJson(res, 503, { ok: false, error: 'chain settlement is not running on this instance' });
+        const body = await readJsonBody(req);
+        const extra = Object.keys(body || {}).filter((k) => !['orderId', 'confirm'].includes(k));
+        if (extra.length) return sendJson(res, 400, { ok: false, error: `only orderId and confirm are accepted (recipient, amount and memo come from the vault's records); unexpected: ${extra.join(', ')}` });
+        if (body.confirm !== undefined && typeof body.confirm !== 'boolean') return sendJson(res, 400, { ok: false, error: 'confirm must be true or false' });
+        try {
+          return sendJson(res, 200, { ok: true, ...(await settlement.repayMissingPayout({ orderId: String(body.orderId || ''), confirm: body.confirm === true })) });
+        } catch (err) {
+          return sendJson(res, err.status || 409, { ok: false, error: redactSecrets(err.message), ...(err.details ? err.details : {}) });
+        }
+      }
+
       if (pathname === '/api/seed/rotate' && req.method === 'POST') {
         if (!isAdmin(req)) return denyAdmin(res);
         const rotated = engine.seedManager.rotateSeed();

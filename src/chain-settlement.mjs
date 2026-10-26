@@ -978,6 +978,7 @@ export class ChainSettlement {
         // are subtracted as in flight (_inFlightOutMicros), deposits since then are simply not counted yet.
         this._lastRow = trusted;
         this._lastRowAt = now();
+        this._balanceRow = trusted;
         this.ledgerIndexComplete = true; // the trusted read was complete when it was taken
         return trusted;
       }
@@ -1118,6 +1119,7 @@ export class ChainSettlement {
     };
     this._lastRow = outIndexComplete ? row : null;
     this._lastRowAt = now();
+    this._balanceRow = row;
     if (outIndexComplete) this._noteTrustedRow(row, txs);
     return row;
   }
@@ -1243,6 +1245,22 @@ export class ChainSettlement {
     return s;
   }
 
+  /**
+   * The bank balance every endpoint reports (health, settlement, leader status and the chain audit use this
+   * one figure): the ledger balance of the last bank read, less this vault's own payouts that read does not
+   * list yet (signed, sent, or marked paid but not in the ledger history). ledgerBalancePoa is the raw read.
+   */
+  _bankBalanceView(row = this._balanceRow) {
+    if (!row || typeof row.effectiveMicros !== 'bigint') return null;
+    const notListed = this._inFlightOutMicros(row.listedIds || new Set());
+    const onChain = row.effectiveMicros - notListed;
+    return {
+      onChainBankBalancePoa: fromMicros(onChain < 0n ? 0n : onChain),
+      ledgerBalancePoa: fromMicros(row.effectiveMicros < 0n ? 0n : row.effectiveMicros),
+      ourPayoutsNotOnLedgerPoa: fromMicros(notListed)
+    };
+  }
+
   _unconfirmedInMicros() {
     let s = 0n;
     for (const r of Object.values(this.state.inbound)) {
@@ -1311,6 +1329,12 @@ export class ChainSettlement {
     }
   }
 
+  /** Is this bank txid listed as final in the bank's ledger history (address page / recent feed index)? */
+  _listedFinal(txid) {
+    const o = txid ? this.state.ledgerOut?.[txid] : null;
+    return Boolean(o && o.final);
+  }
+
   /** minepoa refused this exact body. Stop sending it; _reconcilePayouts decides (re-sign / wait / resend). */
   _markRejected(rec, error, source) {
     const expected = parseExpectedNonce(error);
@@ -1362,18 +1386,25 @@ export class ChainSettlement {
         this._save();
         this.engine.markOutboundSent(rec.orderId, rec.txid, 'CONFIRMED');
         this._emit('settlement.updated', this._outboundView(rec));
+      } else if (!(tx && tx.invalid) && this._listedFinal(rec.txid)) {
+        // Explorer busy or behind, but the bank's ledger history lists this exact txid as final.
+        rec.status = 'CONFIRMED';
+        rec.confirmedAt = now();
+        rec.confirmedVia = 'ledger-history';
+        this._save();
+        this.engine.markOutboundSent(rec.orderId, rec.txid, 'CONFIRMED');
+        this._emit('settlement.updated', this._outboundView(rec));
       } else if (!(tx && tx.invalid)) {
-        // Explorer busy, behind, or not final yet: minepoa's receipt for this exact signed tx is enough.
+        // A receipt alone never confirms a payout: on 2026-10-26 payout 269433a2 had an `included` receipt
+        // (height 2358) but never appeared in the bank's or the recipient's ledger history. The receipt is
+        // recorded (it still feeds the bank nonce), and the payout stays SENT, counted as in flight, until
+        // the ledger itself shows the txid (explorer tx page, or the bank's address history).
         const receipt = await this._receiptConfirms(rec);
-        if (receipt) {
-          rec.status = 'CONFIRMED';
-          rec.confirmedAt = now();
-          rec.confirmedVia = 'receipt';
-          rec.receipt = { status: receipt.status, height: receipt.height ?? null, ts: receipt.ts ?? null };
+        if (receipt && !rec.receipt) {
+          rec.receipt = { status: receipt.status, height: receipt.height ?? null, ts: receipt.ts ?? null, at: now() };
           this._save();
-          this.engine.markOutboundSent(rec.orderId, rec.txid, 'CONFIRMED');
           this._emit('settlement.updated', this._outboundView(rec));
-          if (this.logger) this.logger(`payout ${rec.orderId} confirmed from its receipt (${receipt.status}, height ${receipt.height ?? '?'})`);
+          if (this.logger) this.logger(`payout ${rec.orderId} has an ${receipt.status} receipt (height ${receipt.height ?? '?'}); waiting for the ledger history to show it before confirming`);
         }
       } else if (tx && tx.invalid) {
         rec.status = 'FAILED';
@@ -1645,7 +1676,7 @@ export class ChainSettlement {
       hold: hold ? { status: hold.status, reason: hold.reason } : null,
       reconcile: { status: r.status || null, reason: r.reason || null, at: r.at || null, inReview: r.inReview || [], audit: r.audit || null },
       foreignOutflows: this.foreign,
-      onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
+      onChainBankBalancePoa: this._bankBalanceView()?.onChainBankBalancePoa ?? this.lastBankBalance?.balance ?? null,
       coverage: lim.known ? { known: true, limitMicros: lim.limitMicros.toString() } : { known: false, code: lim.code, reason: lim.reason },
       seed: { epoch: this.engine.seedManager.epochId, hash: this.engine.seedManager.currentSeedHash },
       docSavedAt: this.state.savedAt ?? null,
@@ -2179,6 +2210,254 @@ export class ChainSettlement {
     return null;
   }
 
+  // ─── Admin re-pay: a payout marked paid that never reached the ledger ──────
+
+  /**
+   * Orders this vault marked CONFIRMED from a minepoa receipt alone (the rule before 2026-10-26) that a
+   * complete, fresh read of the bank's ledger history does not list, long after. Live: order
+   * 7e189a652cf97de836433a64, payout 269433a2 (nonce 10, receipt `included` at height 2358), 1.320176 POA.
+   */
+  _repayCandidate(rec) {
+    if (!rec) return 'unknown order';
+    if (rec.repay) return `this order was already re-paid once (${rec.repay.original?.txid ? `original ${String(rec.repay.original.txid).slice(0, 16)}` : 'see repay record'})`;
+    if (rec.status !== 'CONFIRMED') return `the order is ${rec.status}, not CONFIRMED (only a payout marked paid can be re-paid)`;
+    if (!rec.txid) return 'the order has no payout txid';
+    if (rec.recoveredFromLedger || rec.matchedFromLedger) return 'the order was matched to a transfer found on the ledger';
+    if (rec.confirmedVia !== 'receipt') return `the payout was confirmed by the ${rec.confirmedVia || 'ledger'}, not by a receipt alone`;
+    if (now() - Number(rec.confirmedAt || rec.sentAt || 0) <= this.stuckAfterMs) return `the payout was marked paid less than ${Math.round(this.stuckAfterMs / 60000)} min ago; the ledger may still be catching up`;
+    return null;
+  }
+
+  static repayMemo(memo) {
+    const base = String(memo || '');
+    return base.includes(':repay=') ? base : `${base}:repay=1`.slice(0, 500);
+  }
+
+  /**
+   * Fresh proof that order `rec`'s payout never reached the ledger and nothing else paid it. Every read is
+   * made now (never the cached index or the last trusted read); any read that fails, is busy, or is
+   * incomplete refuses. Returns {ok, refusal, checks[], nonceConsumer}.
+   */
+  async _verifyRepay(rec) {
+    const checks = [];
+    const add = (name, ok, detail) => checks.push({ name, ok: Boolean(ok), detail });
+    const done = (refusal, extra = {}) => ({ ok: !refusal, refusal: refusal || null, checks, ...extra });
+    const why = this._repayCandidate(rec);
+    add('order is a receipt-only payout missing from the ledger', !why, why || `${rec.kind} ${rec.amountPoa} POA to ${rec.to}, payout ${String(rec.txid).slice(0, 16)} (nonce ${rec.nonce ?? '?'}) marked paid from its receipt`);
+    if (why) return done(why);
+    const tag = String(rec.orderId).slice(0, 12);
+
+    // 1. the ledger must be healthy right now (slow / degraded / unavailable refuses)
+    if (this.ledgerProbe) {
+      await this.ledgerProbe.probe().catch(() => {});
+      const st = this.ledgerProbe.view().status;
+      add('minepoa ledger healthy', st === 'OK', `ledger probe: ${st}${this.ledgerProbe.lastError ? ` (${String(this.ledgerProbe.lastError).slice(0, 120)})` : ''}`);
+      if (st !== 'OK') return done(`the minepoa ledger is ${st} right now; a re-pay needs a healthy ledger read`);
+    }
+
+    // 2. a fresh, complete read of the bank's whole ledger history
+    const prevErrors = this._tickErrors;
+    this._tickErrors = [];
+    let row;
+    try {
+      row = await this._scanBank();
+    } finally {
+      const errs = this._tickErrors;
+      this._tickErrors = prevErrors;
+      if (errs.length) this._tickErrors.push(...errs);
+    }
+    const fresh = Boolean(row && !row.fromTrusted && typeof row.effectiveMicros === 'bigint' && this.ledgerIndexComplete);
+    add('fresh, complete bank history', fresh, fresh ? `${(row.listedIds || new Set()).size} bank transfers listed, every outgoing memo indexed` : !row ? 'the bank address page could not be read' : row.fromTrusted ? 'only the last trusted read is available (explorer busy)' : 'some outgoing memos could not be read');
+    if (!fresh) return done('could not read the bank\'s complete ledger history right now');
+    const inBank = row.listedIds.has(rec.txid) || Boolean(this.state.ledgerOut[rec.txid]);
+    add('original txid absent from the bank history', !inBank, inBank ? `${rec.txid.slice(0, 16)} IS in the bank's ledger history` : `${rec.txid.slice(0, 16)} not listed`);
+    if (inBank) return done('the original payout is on the ledger (bank history)');
+    const tagged = Object.entries(this.state.ledgerOut || {}).filter(([, o]) => o.ord === tag || (o.to === rec.to && toMicros(String(o.amountPoa)) === toMicros(rec.amountPoa) && String(o.memo || '').includes(`:ord=${tag}`)));
+    add(`no other bank transfer tagged ord=${tag}`, !tagged.length, tagged.length ? `found ${tagged.map(([id]) => id.slice(0, 16)).join(', ')}` : 'none');
+    if (tagged.length) return done(`the ledger already has bank transfer ${tagged[0][0].slice(0, 16)} tagged for this order`);
+    const dup = this._ledgerPaidFor(rec);
+    add('no other payout or refund for the same bet', !dup, dup ? `${dup.txid.slice(0, 16)}: ${dup.why}` : 'none');
+    if (dup) return done(`the ledger already has ${dup.txid.slice(0, 16)} for this bet (${dup.why})`);
+
+    // 3. the explorer must say the original txid does not exist (an error or busy answer refuses)
+    let orig;
+    try {
+      orig = await this.client.getTx(rec.txid);
+    } catch (err) {
+      orig = undefined;
+      add('explorer: original txid unknown', false, `explorer could not answer (${String(err.message || err).slice(0, 120)})`);
+      return done('the minepoa explorer could not answer for the original txid');
+    }
+    add('explorer: original txid unknown', orig === null, orig ? `explorer has ${rec.txid.slice(0, 16)}${orig.invalid ? ' (invalid)' : ''}` : 'not found');
+    if (orig) return done('the minepoa explorer knows the original payout txid');
+
+    // 4. the recipient's own history: not the original, and no bank transfer of this amount tagged for the order
+    let rrow;
+    try {
+      rrow = await this.client.getAddress(rec.to);
+    } catch (err) {
+      add('recipient history read', false, `could not read ${rec.to} (${String(err.message || err).slice(0, 120)})`);
+      return done('could not read the recipient\'s ledger history right now');
+    }
+    const rtxs = (rrow.txs || []).filter((t) => t && t.id);
+    if (rtxs.some((t) => t.id === rec.txid)) {
+      add('original txid absent from the recipient history', false, `${rec.txid.slice(0, 16)} IS in ${rec.to}'s history`);
+      return done('the original payout is in the recipient\'s ledger history');
+    }
+    add('original txid absent from the recipient history', true, `${rtxs.length} transfers listed for ${rec.to}`);
+    const same = rtxs.filter((t) => t.from === this.bankAddress && t.to === rec.to && toMicros(String(t.amount || '0')) === toMicros(rec.amountPoa));
+    for (const t of same) {
+      let memo = t.memoKnown ? String(t.memo || '') : undefined;
+      if (memo === undefined) {
+        try {
+          memo = await this.client.getMemo(t.id);
+        } catch (err) {
+          add('recipient: bank transfers of this amount checked', false, `memo of ${t.id.slice(0, 16)} unreadable (${String(err.message || err).slice(0, 80)})`);
+          return done('could not read every matching transfer in the recipient\'s history');
+        }
+      }
+      if (memo === null || memo === undefined || String(memo).includes(`:ord=${tag}`)) {
+        add('recipient: bank transfers of this amount checked', false, `${t.id.slice(0, 16)} pays ${rec.amountPoa} POA ${memo == null ? '(memo unknown)' : `tagged ord=${tag}`}`);
+        return done(`the recipient already received ${t.id.slice(0, 16)} for this order (or its memo cannot be read)`);
+      }
+    }
+    add('recipient: bank transfers of this amount checked', true, `${same.length} bank transfer(s) of ${rec.amountPoa} POA, none tagged ord=${tag}`);
+
+    // 5. the original body can never land later: another final bank tx used its nonce
+    if (!Number.isInteger(rec.nonce)) {
+      add('original nonce used by another bank tx', false, 'the original nonce is unknown');
+      return done('the original payout\'s nonce is unknown, so it cannot be proven that it can never land');
+    }
+    const consumer = await this._nonceConsumer(rec.nonce, rec.txid);
+    if (consumer === undefined) {
+      add('original nonce used by another bank tx', false, 'minepoa could not answer');
+      return done('could not check which bank tx used the original nonce right now');
+    }
+    add('original nonce used by another bank tx', Boolean(consumer), consumer ? `nonce ${rec.nonce} was used by final bank tx ${consumer.slice(0, 16)}, so the original body can never land` : `no final bank tx with nonce ${rec.nonce} found`);
+    if (!consumer) return done(`no other final bank tx with nonce ${rec.nonce} was found, so the original payout could still land`);
+    return done(null, { nonceConsumer: consumer });
+  }
+
+  _repayView(rec, v, claim) {
+    return {
+      order: {
+        orderId: rec.orderId,
+        kind: rec.kind,
+        to: rec.to,
+        amountPoa: rec.amountPoa,
+        status: rec.status,
+        originalTxid: rec.repay?.original?.txid || rec.txid,
+        originalNonce: rec.repay?.original?.nonce ?? rec.nonce ?? null,
+        confirmedVia: rec.repay?.original?.confirmedVia || rec.confirmedVia || null,
+        receipt: rec.repay?.original?.receipt || rec.receipt || null
+      },
+      wouldSend: v && v.ok
+        ? {
+            from: this.bankAddress,
+            to: rec.to,
+            amountPoa: rec.amountPoa,
+            memo: ChainSettlement.repayMemo(rec.memo),
+            nonce: `a new bank nonce, chosen when it is signed (never ${rec.nonce})`,
+            path: 'queued as a normal payout: signed, saved to the vault store, then broadcast (never twice)'
+          }
+        : null,
+      eligible: Boolean(v && v.ok),
+      refusal: v ? v.refusal : null,
+      checks: v ? v.checks : [],
+      requested: claim || null,
+      repay: rec.repay || null
+    };
+  }
+
+  async _repayClaim(orderId) {
+    if (typeof this.store.peek !== 'function') return null;
+    return this.store.peek(`repay:${orderId}`);
+  }
+
+  /**
+   * Admin: re-pay ONE order whose payout was marked paid from a receipt but is missing from the ledger.
+   * Without confirm it is a dry run (what would be sent and every check). With confirm the request is
+   * recorded once in the store (`repay:<orderId>`, first writer wins: a second request is refused), and the
+   * bank writer re-checks everything on its pass before it requeues the order. Recipient, amount and memo
+   * come from the stored order only.
+   */
+  async repayMissingPayout({ orderId, confirm = false }) {
+    if (!/^[0-9a-f]{24}$/.test(String(orderId || ''))) throw bad('orderId: the 24-hex order id (see /api/audit/chain confirmedNotOnLedger)');
+    await this.ready();
+    // Start from the current vault document (a standby refreshes its replica; the writer runs a pass).
+    await (this.passMode ? this.maybePass({ force: true, budgetMs: 8000 }) : this.tick()).catch(() => {});
+    if (!this.writer.canWrite()) await this._observe().catch(() => {});
+    let rec = this.state.outbound[orderId];
+    if (!rec) throw bad(`unknown order ${orderId}`, 404);
+    const claim = await this._repayClaim(orderId).catch(() => undefined);
+    if (claim === undefined) throw bad('the vault store could not be read; try again', 503);
+    if (rec.repay || (claim && confirm)) {
+      return { mode: confirm ? 'confirm' : 'preview', alreadyRequested: true, ...this._repayView(rec, null, claim), refusal: rec.repay ? 'this order was already re-paid once' : 'a re-pay of this order was already requested once; the bank writer applies it on its next pass' };
+    }
+    const v = await this._verifyRepay(rec);
+    if (!confirm) return { mode: 'preview', ...this._repayView(rec, v, claim) };
+    if (!v.ok) throw Object.assign(bad(`re-pay refused: ${v.refusal}`, 409), { details: this._repayView(rec, v, claim) });
+    const value = { orderId, originalTxid: rec.txid, originalNonce: rec.nonce ?? null, to: rec.to, amountPoa: rec.amountPoa, nonceConsumer: v.nonceConsumer, requestedAt: new Date(now()).toISOString() };
+    const res = await this.store.claim(`repay:${orderId}`, value);
+    if (!res.claimed) return { mode: 'confirm', alreadyRequested: true, ...this._repayView(rec, null, res.value), refusal: 'a re-pay of this order was already requested once' };
+    if (this.logger) this.logger(`admin re-pay requested for order ${orderId} (${rec.amountPoa} POA to ${rec.to}; original ${rec.txid.slice(0, 16)} never reached the ledger)`);
+    // Applied (re-checked) by the bank writer on its pass, which then pays it like any other queued payout.
+    if (this.passMode) await this.maybePass({ force: true, budgetMs: 8000 }).catch(() => {});
+    else await this.tick().catch(() => {});
+    rec = this.state.outbound[orderId] || rec;
+    return { mode: 'confirm', requested: res.value, applied: Boolean(rec.repay), order: this._outboundView(rec), repay: rec.repay || null, repayBlocked: rec.repayBlocked || null };
+  }
+
+  /** Writer, every pass: apply recorded admin re-pay requests (each re-verified now, applied at most once). */
+  async _applyRepays() {
+    if (!this.writer.canWrite()) return 0;
+    let applied = 0;
+    for (const rec of Object.values(this.state.outbound)) {
+      if (rec.repay || rec.status !== 'CONFIRMED' || rec.confirmedVia !== 'receipt') continue;
+      let claim;
+      try {
+        claim = await this._repayClaim(rec.orderId);
+      } catch (err) {
+        this._tickErrors.push(`repay ${rec.orderId.slice(0, 12)}: store unavailable`);
+        continue;
+      }
+      if (!claim) continue;
+      if (rec.repayBlocked && now() - Number(rec.repayBlocked.checkedAt || 0) < 60000) continue; // re-checked at most once a minute
+      if (claim.originalTxid !== rec.txid || claim.to !== rec.to || toMicros(String(claim.amountPoa)) !== toMicros(rec.amountPoa)) {
+        rec.repayBlocked = { at: now(), checkedAt: now(), reason: 'the recorded request does not match the stored order' };
+        this._save();
+        continue;
+      }
+      const v = await this._verifyRepay(rec);
+      if (!v.ok) {
+        rec.repayBlocked = { at: rec.repayBlocked?.reason === v.refusal ? rec.repayBlocked.at : now(), checkedAt: now(), reason: v.refusal };
+        this._save();
+        if (this.logger) this.logger(`admin re-pay for order ${rec.orderId} not applied yet: ${v.refusal}`);
+        continue;
+      }
+      const original = { txid: rec.txid, nonce: rec.nonce ?? null, confirmedVia: rec.confirmedVia, confirmedAt: rec.confirmedAt ? new Date(rec.confirmedAt).toISOString() : null, receipt: rec.receipt || null };
+      rec.superseded = rec.superseded || [];
+      rec.superseded.push({ txid: rec.txid, nonce: rec.nonce ?? null, error: 'marked paid from a receipt but never in the ledger history; superseded by an admin re-pay', reason: 'REPAY_NOT_ON_LEDGER', at: now() });
+      rec.repay = { at: now(), requestedAt: claim.requestedAt || null, original, nonceConsumer: v.nonceConsumer, checks: v.checks.map((c) => c.name) };
+      rec.repayBlocked = null;
+      rec.memo = ChainSettlement.repayMemo(rec.memo);
+      rec.resigns = (rec.resigns || 0) + 1; // a new payout claim generation: a new body, a new nonce
+      Object.assign(rec, { status: 'QUEUED', txid: null, body: null, nonce: null, attempts: 0, nextAttemptAt: 0, lastError: null, rejection: null, nonceRule: null, forceRebroadcast: false });
+      for (const k of ['confirmedAt', 'confirmedVia', 'receipt', 'sentAt', 'signedAt', 'nextReceiptCheckAt', 'lastBroadcastAt', 'nextRebroadcastAt', 'rebroadcasts']) delete rec[k];
+      const item = this.engine.outboundQueue.find((x) => x.orderId === rec.orderId);
+      if (item) {
+        item.status = 'IN_SETTLEMENT';
+        item.ledgerTxid = null;
+        this.engine._saveToDisk();
+      }
+      this._save();
+      this._emit('settlement.updated', this._outboundView(rec));
+      if (this.logger) this.logger(`admin re-pay applied for order ${rec.orderId}: original ${original.txid.slice(0, 16)} superseded, requeued (new body, new nonce)`);
+      applied += 1;
+    }
+    return applied;
+  }
+
   // ─── Bank nonce + rejected-payout reconciler ─────────────────────────────
 
   /** minepoa receipt: object, null (none), undefined (could not ask, or an error body such as "origin busy"). */
@@ -2207,9 +2486,10 @@ export class ChainSettlement {
   }
 
   /**
-   * minepoa's receipt proves this payout landed: status included / final, for this txid, and the signed
-   * body behind the txid pays exactly this order (recipient, amount, nonce). Fields the receipt itself
-   * carries (to / amount / nonce / from) must match too. Returns the receipt or null.
+   * minepoa's receipt for this payout: status included / final, for this txid, and the signed body behind
+   * the txid pays exactly this order (recipient, amount, nonce). Fields the receipt itself carries
+   * (to / amount / nonce / from) must match too. Returns the receipt or null. A receipt is recorded but never
+   * confirms a payout on its own: only the ledger (explorer tx page or the bank's history) does.
    */
   async _receiptConfirms(rec) {
     if (!rec.txid) return null;
@@ -2549,6 +2829,7 @@ export class ChainSettlement {
         to: o.to,
         amountPoa: o.amountPoa,
         status: o.status === 'REJECTED' ? 'REJECTED' : 'SENT_UNCONFIRMED_STALE',
+        receiptOnly: o.status === 'SENT' && Boolean(o.receipt),
         txid: o.txid,
         nonce: o.nonce,
         error: o.rejection?.error || o.lastError || null,
@@ -2673,6 +2954,7 @@ export class ChainSettlement {
         await this._confirmInbound();
         await this._matchLedgerPayouts().catch((err) => this._tickErrors.push(`ord match: ${err.message}`));
         await this._applyForeignAcks().catch((err) => this._tickErrors.push(`foreign acks: ${err.message}`));
+        await this._applyRepays().catch((err) => this._tickErrors.push(`repay: ${err.message}`));
         await this._reconcile(row);
         this._adoptOutbound();
         await this._processOutbound(row);
@@ -3165,6 +3447,7 @@ export class ChainSettlement {
     const ins = Object.values(this.state.inbound);
     const fromWriter = !this.writer.canWrite() && this.writer.status === 'STANDBY' && this._sharedFresh() ? this.shared : null;
     const rec = fromWriter ? fromWriter.reconcile || {} : this.reconcile;
+    const bal = this._bankBalanceView();
     return {
       mode: 'chain',
       bankAddress: this.bankAddress,
@@ -3176,8 +3459,8 @@ export class ChainSettlement {
       lastGoodTick: this.lastGoodTick ? new Date(this.lastGoodTick).toISOString() : null,
       lastError: this.lastError,
       lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
-      onChainBankBalancePoa: fromWriter ? fromWriter.onChainBankBalancePoa : this.lastBankBalance?.balance ?? null,
-      bankBalance: this.lastBankBalance,
+      onChainBankBalancePoa: fromWriter ? fromWriter.onChainBankBalancePoa : bal?.onChainBankBalancePoa ?? this.lastBankBalance?.balance ?? null,
+      bankBalance: this.lastBankBalance ? { ...this.lastBankBalance, ...(bal ? { ...bal, balance: bal.onChainBankBalancePoa } : {}) } : null,
       stuckPayouts: this.stuckPayouts(),
       writer: this.writer.view(),
       leader: this.leaderView(),
@@ -3225,13 +3508,15 @@ export class ChainSettlement {
         ? []
         : Object.values(this.state.outbound)
             .filter((o) => o.status === 'CONFIRMED' && o.txid && !o.recoveredFromLedger && !row.listedIds.has(o.txid) && now() - Number(o.confirmedAt || o.sentAt || 0) > this.stuckAfterMs)
-            .map((o) => ({ orderId: o.orderId, kind: o.kind, to: o.to, amountPoa: o.amountPoa, txid: o.txid, nonce: o.nonce ?? null, confirmedVia: o.confirmedVia || null, receipt: o.receipt || null, confirmedAt: o.confirmedAt ? new Date(o.confirmedAt).toISOString() : null }));
+            .map((o) => ({ orderId: o.orderId, kind: o.kind, to: o.to, amountPoa: o.amountPoa, txid: o.txid, nonce: o.nonce ?? null, confirmedVia: o.confirmedVia || null, receipt: o.receipt || null, confirmedAt: o.confirmedAt ? new Date(o.confirmedAt).toISOString() : null, repayable: o.confirmedVia === 'receipt', repayBlocked: o.repayBlocked || null }));
     let rejectedMicros = 0n;
     for (const o of Object.values(this.state.outbound)) if (o.status === 'REJECTED') rejectedMicros += toMicros(o.amountPoa);
     return {
       ok: delta >= 0n,
       bankAddress: this.bankAddress,
       onChainBalancePoa: fromMicros(onChain < 0n ? 0n : onChain),
+      // the same figures /api/health and /api/settlement report
+      ...this._bankBalanceView(row),
       balanceFrom: row.fromTrusted ? 'last-trusted-read' : 'ledger',
       trustedBalanceAt: row.fromTrusted ? new Date(row.trustedAt).toISOString() : null,
       trustedBalanceAgeMs: row.fromTrusted ? Math.max(0, now() - row.trustedAt) : null,
@@ -3251,6 +3536,7 @@ export class ChainSettlement {
       payoutsOk: stuck.length === 0,
       stuckPayouts: stuck,
       confirmedNotOnLedger,
+      repaidPayouts: Object.values(this.state.outbound).filter((o) => o.repay).map((o) => ({ orderId: o.orderId, to: o.to, amountPoa: o.amountPoa, status: o.status, txid: o.txid, originalTxid: o.repay.original?.txid || null, repayAt: new Date(o.repay.at).toISOString() })),
       writer: this.writer.view(),
       foreignOutflowsOk: this._foreignOutflows().every((f) => f.acknowledged),
       foreignOutflows: this._foreignOutflows(),
