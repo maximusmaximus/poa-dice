@@ -60,17 +60,20 @@
  *     on-chain balance, new bets and withdrawals are refused (and deferred if they arrive on the
  *     ledger directly), and quotes for them are not valid. Deposits stay open.
  */
+import crypto from 'node:crypto';
+import { BankWriter, BINDING_KEY } from './bank-writer.mjs';
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
 import { PersistQueue } from './settlement-store.mjs';
 import { isLedgerOutage, LEDGER_HOLD } from './ledger-probe.mjs';
 
-const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED']);
+const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED', 'REFUSED_DUPLICATE']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
 const HOLD_ACTIONS = new Set(['BET', 'LP_WITHDRAW', 'WITHDRAW', 'CLAIM']);
 
 /** Public trading state: OPEN, HOLD (reconciling / solvency) or PAUSED_LEDGER_UNAVAILABLE. */
 export function tradingLabel(hold) {
   if (!hold) return 'OPEN';
+  if (hold.status === 'SIGNER_READ_ONLY') return 'READ_ONLY';
   return hold.status === LEDGER_HOLD ? 'PAUSED_LEDGER_UNAVAILABLE' : 'HOLD';
 }
 
@@ -111,6 +114,8 @@ export class ChainSettlement {
     sentGraceMs = 20000,
     stuckAfterMs = 10 * 60 * 1000,
     nonceScanDepth = 12,
+    writer = null,
+    bindOnBoot = false,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -132,6 +137,11 @@ export class ChainSettlement {
     this.stuckAfterMs = stuckAfterMs;
     this.nonceScanDepth = nonceScanDepth;
     this._txNonce = new Map(); // txid -> body.nonce of bank txs on the ledger (immutable)
+    // Single writer (bank-writer.mjs): without a writer, this instance is read-only (fail-closed).
+    this.writer = writer || new BankWriter({ store, bankAddress: bankWallet.address, enabled: false });
+    this.bindOnBoot = Boolean(bindOnBoot);
+    this._leaderToken = null; // fencing token the in-memory state was (re)loaded under
+    this.foreign = []; // bank outflows this vault did not create (see _foreignOutflows)
     this.inboundExpireMs = inboundExpireMs;
     this.balanceStaleMs = balanceStaleMs;
     this._lastRow = null;
@@ -172,10 +182,28 @@ export class ChainSettlement {
 
   /** Resolves once state is loaded from the store (async for KV stores). */
   ready() {
-    return this._loadPromise;
+    if (this.bindOnBoot && !this._bootBind) {
+      // POA_DICE_BIND_STORE: try the one-time binding as soon as the stored vault is loaded.
+      this._bootBind = this._loadPromise.then(() => this._tryBootBind()).catch(() => {});
+    }
+    return this._bootBind ? this._loadPromise.then(() => this._bootBind) : this._loadPromise;
+  }
+
+  async _tryBootBind() {
+    if (!this.writer.enabled || !this.writer.supportsLease()) return;
+    if (await this.writer.refresh()) return;
+    if (this.writer.status !== 'UNBOUND') return;
+    try {
+      await this.bindStore({ via: 'env' });
+      await this.writer.refresh();
+    } catch (err) {
+      this.lastError = `store binding: ${err.message}`;
+      this.lastErrorAt = now();
+    }
   }
 
   _applyDoc(doc) {
+    this._docLoaded = Boolean(doc && doc.version === 1);
     if (doc && doc.version === 1) {
       this.state = doc;
       if (this.state.createdAt === undefined) this.state.createdAt = 0; // pre-recovery doc: age unknown
@@ -218,6 +246,7 @@ export class ChainSettlement {
 
   _save() {
     if (!this._loaded) return; // never overwrite stored state with a pre-load blank
+    if (!this.writer.canWrite()) return; // read-only instances never write the shared vault document
     this.state.engine = this.engine.serializeState();
     this.state.savedAt = now();
     this._persist.save(this.state);
@@ -289,6 +318,14 @@ export class ChainSettlement {
   async submitInbound(txEnvelope, { reserve = null, groupId = null, coverage = null } = {}) {
     await this.ready();
     const { body, txid, parsed } = this._validateInbound(txEnvelope);
+    // Only the bank writer takes new money-moving txs (it is the one that will settle them).
+    if (!this.writer.canWrite() && !this.state.inbound[txid] && !this.engine.processedTxids.has(txid)) {
+      await this.tick().catch(() => {});
+      if (!this.writer.canWrite()) {
+        const h = this.writer.hold();
+        throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY', txid });
+      }
+    }
     // Ledger can't accept transactions: refuse every NEW broadcast (bets, stakes, withdrawals, chat) up front.
     if (this.ledgerProbe && !this.state.inbound[txid] && !this.engine.processedTxids.has(txid)) {
       await this.ledgerProbe.maybeProbe().catch(() => {});
@@ -312,6 +349,8 @@ export class ChainSettlement {
       await this.reserveBetCoverage(txid, BigInt(q.payoutOnWinMicros));
       cov = { key: txid, micros: String(q.payoutOnWinMicros) };
     }
+    // A bet is settled with the server seed committed when it was accepted, never a later/different one.
+    if (parsed.action === 'BET' && !(await this._syncSeed())) throw Object.assign(new Error('Vault store unavailable (seed commitment); not broadcast'), { status: 503, txid });
     const rec = {
       txid,
       seq: ++this.state.seq,
@@ -319,6 +358,7 @@ export class ChainSettlement {
       amountPoa: body.amount,
       memo: body.memo,
       action: parsed.action,
+      seedCommit: parsed.action === 'BET' ? this._seedCommit() : null,
       status: 'SUBMITTING',
       submittedAt: now(),
       reserve,
@@ -550,6 +590,29 @@ export class ChainSettlement {
       this._emit('settlement.updated', this._inboundView(rec));
       return;
     }
+    // A bet this store never accepted (found only on the ledger) and older than the store's binding:
+    // never rolled, never paid. Another copy of the server (or a lost state) may have handled it.
+    if (rec.action === 'BET' && rec.discoveredBy === 'ledger-scan' && !this.engine.processedTxids.has(rec.txid)) {
+      if (this._preBinding(rec.txid, b.ts)) {
+        rec.status = 'NEEDS_REVIEW';
+        rec.ledger = { atts: tx.atts, final: tx.final };
+        rec.reviewReason = 'LEDGER_ONLY_BET';
+        rec.error = 'Bet found only on the ledger and older than this vault store\'s binding: not rolled and not paid. Listed in the audit for operator review.';
+        this._save();
+        this._emit('settlement.updated', this._inboundView(rec));
+        return;
+      }
+    }
+    // Seed commitment: roll only with the seed committed when the bet was accepted.
+    if (rec.action === 'BET' && rec.seedCommit && !this.engine.processedTxids.has(rec.txid) && rec.seedCommit.hash !== this.engine.seedManager.currentSeedHash) {
+      rec.status = 'NEEDS_REVIEW';
+      rec.ledger = { atts: tx.atts, final: tx.final };
+      rec.reviewReason = 'SEED_COMMITMENT_CHANGED';
+      rec.error = 'The server seed changed since this bet was accepted; it is not re-rolled with a different seed. Operator review.';
+      this._save();
+      this._emit('settlement.updated', this._inboundView(rec));
+      return;
+    }
     // Trading hold: a NEW bet / withdrawal waits (stays open, booked later) until the books reconcile.
     if (this.tradingHold() && !replay && HOLD_ACTIONS.has(rec.action) && !this.engine.processedTxids.has(rec.txid)) {
       rec.ledger = { atts: tx.atts, final: tx.final };
@@ -587,6 +650,13 @@ export class ChainSettlement {
     } else {
       const ticket = await this._claimBetTicket(rec, b);
       if (ticket === null) return false;
+      if (ticket && rec.seedCommit && ticket.serverSeedHash && ticket.serverSeedHash !== rec.seedCommit.hash && !this.engine.processedTxids.has(rec.txid)) {
+        rec.status = 'NEEDS_REVIEW';
+        rec.reviewReason = 'SEED_COMMITMENT_CHANGED';
+        rec.error = 'The stored settlement ticket uses a different server seed than the one committed for this bet; not rolled. Operator review.';
+        this._save();
+        return;
+      }
       if (this.engine.processedTxids.has(rec.txid)) {
         result = this.engine.processedTxids.get(rec.txid);
       } else {
@@ -684,6 +754,7 @@ export class ChainSettlement {
           amountPoa: t.amount,
           memo,
           action: parseDiceMemo(memo).action || null,
+          seedCommit: parseDiceMemo(memo).action === 'BET' ? this._seedCommit() : null,
           status: 'SEEN',
           submittedAt: now(),
           ledgerTs: t.ts || null,
@@ -1025,6 +1096,29 @@ export class ChainSettlement {
         }
         continue;
       }
+      // Never sign twice for one bet: the ledger is checked for any bank payout that references it.
+      const dup = this._ledgerPaidFor(rec);
+      if (dup) {
+        if (dup.adopt) {
+          this._adoptLanded(rec, dup.txid);
+          rec.recoveredFromLedger = true;
+          continue;
+        }
+        rec.status = 'REFUSED_DUPLICATE';
+        rec.lastError = `refused: the ledger already has bank payout ${dup.txid.slice(0, 16)} for this bet (${dup.why}); never paid twice. Operator review.`;
+        rec.duplicateOf = dup.txid;
+        this._failEngine(rec);
+        this._save();
+        this._emit('settlement.updated', this._outboundView(rec));
+        continue;
+      }
+      let fence;
+      try {
+        fence = await this.writer.assertLeader();
+      } catch (err) {
+        this._tickErrors.push(`signing stopped: ${err.message}`);
+        return;
+      }
       let nonce;
       let parents;
       try {
@@ -1049,7 +1143,7 @@ export class ChainSettlement {
       let tx = signed;
       try {
         // One signed body per order (and re-sign generation) across all instances.
-        const res = await this._persist.claim(`payout:${rec.orderId}:${rec.resigns || 0}`, { txid: signed.id, body: signed.body, nonce });
+        const res = await this._persist.claim(`payout:${rec.orderId}:${rec.resigns || 0}`, { txid: signed.id, body: signed.body, nonce, fence });
         if (!res.claimed) {
           const v = res.value || {};
           if (!v.body || txidOf(v.body) !== v.txid || v.body.to !== rec.to || toMicros(v.body.amount) !== toMicros(rec.amountPoa) || !verifyBody(v.body, this.bankAddress)) {
@@ -1082,6 +1176,220 @@ export class ChainSettlement {
       const ok = await this._broadcastSigned(rec);
       if (!ok) return;
     }
+  }
+
+  // ─── Single writer, store binding, foreign outflows ───────────────────────
+
+  _seedCommit() {
+    return { epoch: this.engine.seedManager.epochId, hash: this.engine.seedManager.currentSeedHash, at: now() };
+  }
+
+  async _reloadFromStore() {
+    const doc = await this.store.load();
+    if (doc && doc.version === 1) {
+      this.state = { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, ledgerOut: {}, seq: 0, createdAt: Math.floor(now() / 1000) };
+      this._applyDoc(doc);
+    }
+    this._seedSyncedEpoch = null;
+    return doc && doc.version === 1 ? doc : null;
+  }
+
+  /** Bank txids a STORED vault document knows: {out, in} (never this instance's in-memory copy). */
+  static docKnownIds(doc) {
+    const out = new Set();
+    const inb = new Set();
+    if (!doc || doc.version !== 1) return { out, in: inb };
+    const eng = doc.engine || {};
+    for (const id of Object.keys(doc.ledgerOut || {})) out.add(id);
+    for (const e of eng.recoveredOutflows || []) out.add(e[0]);
+    for (const o of Object.values(doc.outbound || {})) {
+      if (o.txid) out.add(o.txid);
+      for (const x of o.superseded || []) if (x.txid) out.add(x.txid);
+    }
+    for (const id of Object.keys(doc.inbound || {})) inb.add(id);
+    for (const e of eng.processedTxids || []) inb.add(e[0]);
+    return { out, in: inb };
+  }
+
+  /**
+   * Taking the writer lease: the stored document must account for every bank outflow on the ledger
+   * (known to the document, on the ledger before the binding, or acknowledged by an operator).
+   * Returns the unaccounted outflow ids, or undefined when minepoa cannot answer.
+   */
+  async _unaccountedOutflows(doc) {
+    let row;
+    try {
+      row = await this.client.getAddress(this.bankAddress);
+    } catch {
+      return undefined;
+    }
+    const known = ChainSettlement.docKnownIds(doc).out;
+    const attested = new Set(Object.keys(doc?.attestedOutflows || {}));
+    const missing = [];
+    for (const t of row.txs || []) {
+      if (!t || !t.id || t.from !== this.bankAddress) continue;
+      if (known.has(t.id) || attested.has(t.id)) continue;
+      if (!Array.isArray(this.writer.binding?.priorLedgerIds)) continue; // binding row without an id list: nothing to judge by
+      if (this._preBinding(t.id, t.ts)) continue;
+      missing.push(t.id);
+    }
+    return missing;
+  }
+
+  /**
+   * Operator review after STALE_STORE: records the listed (or all currently unaccounted) bank outflows as
+   * acknowledged in the stored document, so the next writer can take over. They still show as foreign
+   * outflows (holding trading) until acknowledged with ackForeignOutflows.
+   */
+  async attestOutflows() {
+    const doc = await this.store.load();
+    const missing = await this._unaccountedOutflows(doc);
+    if (missing === undefined) throw new Error('minepoa did not answer; try again');
+    this.writer.unblock();
+    this._attestPending = missing;
+    await this.tick();
+    return { attested: missing, writer: this.writer.view() };
+  }
+
+  /** Read-only instance: refresh the ledger view for status/audit; never book, roll, claim or sign. */
+  async _readOnlyTick() {
+    const row = await this._scanBank();
+    this.foreign = this._foreignOutflows();
+    this.lastTick = now();
+    this.lastError = this._tickErrors.length ? this._tickErrors.join('; ') : null;
+    if (this.lastError) this.lastErrorAt = now();
+    return row;
+  }
+
+  /**
+   * One-time binding of this store to the bank. Refused unless the store provably holds the live vault:
+   * when the bank has ledger history, the stored document must already know the bank's newest outgoing
+   * transfer (or, with no outgoing yet, its newest incoming one). An empty store, or an old copy, fails
+   * this check and stays read-only. `recovery: true` (admin only) binds anyway after a real state loss;
+   * then every bet older than the binding is held for review, never rolled.
+   */
+  async bindStore({ via = 'admin', recovery = false } = {}) {
+    if (!this.writer.enabled) throw new Error('POA_DICE_BANK_SIGNER is not 1 on this instance');
+    if (!this.writer.supportsLease()) throw new Error('this vault store has no single-writer lease (use Postgres)');
+    const existing = await this.store.peek(BINDING_KEY);
+    if (existing) {
+      if (existing.bankAddress !== this.bankAddress) throw new Error('store is already bound to a different bank');
+      this.writer.binding = existing;
+      if (recovery && this.writer.blocked) return { alreadyBound: true, binding: existing, ...(await this.attestOutflows()) };
+      return { alreadyBound: true, binding: existing };
+    }
+    const row = await this.client.getAddress(this.bankAddress);
+    const hist = (row.txs || []).filter((t) => t && t.id && (t.from === this.bankAddress || t.to === this.bankAddress)).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    const storedDoc = hist.length ? await this.store.load() : null;
+    const accepted = new Set(Object.keys(storedDoc?.version === 1 ? storedDoc.inbound || {} : {}));
+    // Bank ledger txs that exist before the binding and that the stored vault has not accepted: bets among
+    // them are never rolled, and payouts among them are history (only this writer pays from now on).
+    const priorLedgerIds = hist.map((t) => t.id).filter((id) => !accepted.has(id)).slice(0, 5000);
+    if (hist.length && !recovery) {
+      // Judge the document as it is stored, never this instance's in-memory copy (a read-only copy
+      // scans the ledger into memory, which must not make an old store look current).
+      const doc = storedDoc;
+      if (!doc || doc.version !== 1) throw new Error('the store holds no vault state, but the bank has ledger history: refusing to bind (use the admin recovery binding only after a real state loss)');
+      if (doc.bankAddress && doc.bankAddress !== this.bankAddress) throw new Error('the stored vault state belongs to a different bank');
+      const eng = doc.engine || {};
+      const outIds = new Set([...Object.keys(doc.ledgerOut || {}), ...(eng.recoveredOutflows || []).map((e) => e[0])]);
+      for (const o of Object.values(doc.outbound || {})) {
+        if (o.txid) outIds.add(o.txid);
+        for (const x of o.superseded || []) if (x.txid) outIds.add(x.txid);
+      }
+      const inIds = new Set([...Object.keys(doc.inbound || {}), ...(eng.processedTxids || []).map((e) => e[0])]);
+      const out = hist.find((t) => t.from === this.bankAddress);
+      const knowsOut = (id) => outIds.has(id);
+      const knowsIn = (id) => inIds.has(id);
+      if (out ? !knowsOut(out.id) : !knowsIn(hist[0].id)) {
+        throw new Error(`the stored vault state does not know the bank's newest ledger ${out ? 'outflow' : 'transfer'} (${(out || hist[0]).id.slice(0, 16)}): this is not the live store; refusing to bind`);
+      }
+    }
+    const binding = { bankAddress: this.bankAddress, storeId: `store-${crypto.randomBytes(9).toString('hex')}`, boundAt: new Date(now()).toISOString(), boundAtMs: now(), via, recovery: Boolean(recovery), ledgerTxCount: hist.length, priorLedgerIds };
+    const res = await this.store.claim(BINDING_KEY, binding);
+    this.writer.binding = res.value;
+    if (this.logger) this.logger(`vault store bound to bank ${this.bankAddress} (${res.value.storeId}, via ${via})`);
+    return { alreadyBound: !res.claimed, binding: res.value };
+  }
+
+  /**
+   * Bank outflows this vault did not create: final transfers from the bank that are not ours (no order /
+   * txid of ours, not booked by recovery) AND either reference a bet or deposit this vault already settled,
+   * or happened after the store binding. They hold trading until acknowledged (ackForeignOutflows).
+   */
+  _foreignOutflows() {
+    const known = this._knownOutTxids();
+    const tags = this._knownOrderTags();
+    const settled = new Set();
+    for (const id of this.engine.processedTxids.keys()) settled.add(String(id).slice(0, 16));
+    for (const r of Object.values(this.state.inbound)) if (r.status === 'BOOKED' || r.status === 'NEEDS_REVIEW') settled.add(r.txid.slice(0, 16));
+    const acks = this.state.foreignAck || {};
+    const out = [];
+    for (const [id, o] of Object.entries(this.state.ledgerOut || {})) {
+      if (!o.final || known.has(id) || this.engine.recoveredOutflows.has(id)) continue;
+      if (o.ord && tags.has(o.ord)) continue;
+      const memo = String(o.memo || '');
+      const ref = memo.split(':').find((part) => /^[0-9a-f]{16}$/.test(part) && settled.has(part)) || null;
+      const afterBinding = Boolean(this.writer.binding) && !this._preBinding(id, o.ts);
+      if (!ref && !afterBinding) continue;
+      out.push({
+        txid: id,
+        to: o.to,
+        amountPoa: o.amountPoa,
+        memo: memo.slice(0, 120),
+        ts: o.ts ? new Date(Number(o.ts) * 1000).toISOString() : null,
+        references: ref,
+        reason: ref ? 'pays a bet/transaction this vault already settled' : 'signed with the bank key after the store binding, not by this vault',
+        acknowledged: acks[id] || null,
+        explorer: this.client.explorerTxUrl(id)
+      });
+    }
+    return out;
+  }
+
+  /** Operator decision for foreign outflows: 'book_loss' (charge to the bankroll) or 'reimbursed' (funds returned to the bank). */
+  async ackForeignOutflows({ txids = [], mode }) {
+    if (!['book_loss', 'reimbursed'].includes(mode)) throw new Error("mode must be 'book_loss' or 'reimbursed'");
+    await this.tick();
+    if (!this.writer.canWrite()) throw new Error(this.writer.hold()?.reason || 'read-only');
+    const foreign = new Map(this._foreignOutflows().map((f) => [f.txid, f]));
+    this.state.foreignAck = this.state.foreignAck || {};
+    const done = [];
+    for (const id of txids) {
+      const f = foreign.get(id);
+      if (!f) throw new Error(`${String(id).slice(0, 16)} is not a listed foreign outflow`);
+      if (mode === 'book_loss') {
+        const o = this.state.ledgerOut[id];
+        const d = await this._claimDecision(id, { v: 1, kind: 'UNMATCHED_OUTFLOW', txid: id, to: o.to, amountMicros: toMicros(o.amountPoa).toString(), memo: String(o.memo || '').slice(0, 200), ts: Math.floor(now() / 1000), foreign: true });
+        this._applyDecision(d);
+      }
+      this.state.foreignAck[id] = { mode, at: new Date(now()).toISOString() };
+      done.push({ txid: id, mode });
+    }
+    this._save();
+    await this.flush();
+    await this.tick();
+    return { acknowledged: done, foreign: this._foreignOutflows() };
+  }
+
+  /** A bank payout already on the ledger for this order's bet: {txid, adopt, why} or null. */
+  _ledgerPaidFor(rec) {
+    const m = /^DICE1:(WIN|REFUND):([0-9a-f]{16}):/.exec(String(rec.memo || ''));
+    if (!m) return null;
+    const [, kind, tag] = m;
+    if (kind === 'WIN') {
+      const booked = this.engine.processedTxids.get(rec.sourceTxid);
+      if (booked && booked.won === false) return { txid: rec.sourceTxid, adopt: false, why: 'the bet was booked as a loss' };
+    }
+    const mine = new Set([rec.txid, ...(rec.superseded || []).map((x) => x.txid)].filter(Boolean));
+    for (const [id, o] of Object.entries(this.state.ledgerOut || {})) {
+      if (mine.has(id)) continue;
+      const memo = String(o.memo || '');
+      if (!memo.split(':').includes(tag) || !/^DICE1:(WIN|REFUND):/.test(memo)) continue;
+      const same = o.to === rec.to && toMicros(o.amountPoa) === toMicros(rec.amountPoa) && memo.startsWith(`DICE1:${kind}:${tag}:`);
+      return { txid: id, adopt: same, why: same ? 'identical payout already on the ledger' : `different payout on the ledger (${o.amountPoa} POA to ${o.to})` };
+    }
+    return null;
   }
 
   // ─── Bank nonce + rejected-payout reconciler ─────────────────────────────
@@ -1389,6 +1697,48 @@ export class ChainSettlement {
       try {
         await this.ready();
         if (this.ledgerProbe) await this.ledgerProbe.maybeProbe().catch(() => {});
+        let leader = await this.writer.refresh();
+        if (!leader && this.writer.status === 'UNBOUND' && this.bindOnBoot) {
+          try {
+            await this.bindStore({ via: 'env' });
+          } catch (err) {
+            this._tickErrors.push(`store binding: ${err.message}`);
+          }
+          leader = await this.writer.refresh();
+        }
+        if (!leader) {
+          this._leaderToken = null;
+          await this._readOnlyTick();
+          return;
+        }
+        if (this._leaderToken !== this.writer.lease.token) {
+          // Newly the writer (or the lease changed hands): start from the shared document, not our copy,
+          // and only if that document accounts for every bank outflow on the ledger.
+          const doc = await this._reloadFromStore();
+          const missing = await this._unaccountedOutflows(doc);
+          const attest = new Set(this._attestPending || []);
+          this._attestPending = null;
+          const unexplained = (missing || []).filter((id) => !attest.has(id));
+          if (missing === undefined || unexplained.length) {
+            if (missing === undefined) {
+              this._tickErrors.push('writer takeover: minepoa did not answer; retrying');
+              await this.writer.release();
+            } else {
+              const msg = `stored vault does not account for bank transfer(s) ${unexplained.map((id) => id.slice(0, 16)).join(', ')}: refusing to sign (old copy of the store, or a transfer made outside this vault)`;
+              this._tickErrors.push(`writer takeover: ${msg}`);
+              await this.writer.block(msg, unexplained);
+            }
+            await this._readOnlyTick();
+            return;
+          }
+          if (attest.size) {
+            this.state.attestedOutflows = this.state.attestedOutflows || {};
+            for (const id of attest) this.state.attestedOutflows[id] = { at: new Date(now()).toISOString() };
+            this._save();
+          }
+          this._leaderToken = this.writer.lease.token;
+        }
+        this.writer.tokenAtTickStart = this.writer.lease.token;
         await this._syncSeed();
         const row = await this._scanBank();
         await this._confirmInbound();
@@ -1404,6 +1754,7 @@ export class ChainSettlement {
           this.lastError = null; // only report errors that are still happening
         }
         this.lastGoodTick = this._tickErrors.length ? this.lastGoodTick : now();
+        this.writer.tokenAtTickStart = null;
       } catch (err) {
         this.lastError = String(err.message || err);
         this.lastErrorAt = now();
@@ -1569,8 +1920,11 @@ export class ChainSettlement {
    * RECONCILING / SOLVENCY_HOLD (books vs ledger) take precedence over LEDGER_UNAVAILABLE.
    */
   tradingHold() {
+    const wh = this.writer.hold();
+    if (wh) return wh;
     if (this.reconcile && this.reconcile.status !== 'OK') {
-      return { status: this.reconcile.status === 'SOLVENCY_HOLD' ? 'SOLVENCY_HOLD' : 'RECONCILING', reason: this.reconcile.reason };
+      const st = this.reconcile.status;
+      return { status: st === 'SOLVENCY_HOLD' || st === 'FOREIGN_OUTFLOW_HOLD' ? st : 'RECONCILING', reason: this.reconcile.reason };
     }
     return this.ledgerProbe ? this.ledgerProbe.hold() : null;
   }
@@ -1605,10 +1959,32 @@ export class ChainSettlement {
     return false;
   }
 
-  /** 16-hex txid prefixes referenced by the memos of the bank's outgoing transfers (WIN/REFUND/PAYOUT/...). */
+  /**
+   * True when a bank ledger tx predates this store's binding (it was on the ledger when the store was bound
+   * and the stored vault had not accepted it). Falls back to the binding time for older binding rows.
+   */
+  _preBinding(txid, ts) {
+    const b = this.writer.binding;
+    if (!b) return true;
+    if (Array.isArray(b.priorLedgerIds)) {
+      if (!this._priorIds || this._priorIdsOf !== b) {
+        this._priorIds = new Set(b.priorLedgerIds);
+        this._priorIdsOf = b;
+      }
+      return this._priorIds.has(txid);
+    }
+    return !(Number(ts || 0) >= Math.floor(Number(b.boundAtMs || 0) / 1000));
+  }
+
+  /**
+   * 16-hex txid prefixes referenced by the memos of the bank's outgoing transfers (WIN/REFUND/PAYOUT/...).
+   * Once the store is bound, only transfers from before the binding count: after it, only this writer
+   * pays, so any other bank payout is a foreign outflow and never marks a bet as settled.
+   */
   _outflowRefs() {
     const refs = new Set();
-    for (const o of Object.values(this.state.ledgerOut || {})) {
+    for (const [id, o] of Object.entries(this.state.ledgerOut || {})) {
+      if (this.writer.binding && !this._preBinding(id, o.ts)) continue;
       for (const part of String(o.memo || '').split(':')) if (/^[0-9a-f]{16}$/.test(part)) refs.add(part);
     }
     return refs;
@@ -1669,6 +2045,7 @@ export class ChainSettlement {
         let match = null;
         for (const [id, o] of outs) {
           if (known.has(id) || o.to !== rec.from) continue;
+          if (this.writer.binding && !this._preBinding(id, o.ts)) continue; // after the binding only this writer pays
           const memo = String(o.memo || '');
           if (memo.startsWith(`DICE1:WIN:${tag}:`) || memo.startsWith(`DICE1:REFUND:${tag}:`)) {
             match = { id, o, kind: memo.startsWith('DICE1:WIN:') ? 'BET_WIN' : 'BET_REFUND' };
@@ -1716,8 +2093,10 @@ export class ChainSettlement {
       const inboundTags = new Set(Object.keys(this.state.inbound).map((id) => id.slice(0, 16)));
       for (const id of this.engine.processedTxids.keys()) inboundTags.add(String(id).slice(0, 16));
       let recovered = 0;
+      this.foreign = this._foreignOutflows();
+      const foreignIds = new Set(this.foreign.map((f) => f.txid));
       for (const [id, o] of outs) {
-        if (known.has(id) || (o.ord && tags.has(o.ord))) continue;
+        if (known.has(id) || (o.ord && tags.has(o.ord)) || foreignIds.has(id)) continue;
         const memo = String(o.memo || '');
         const reviewTag = /^DICE1:(?:WIN|REFUND):([0-9a-f]{16}):/.exec(memo);
         if (reviewTag && review.some((r) => r.txid.startsWith(reviewTag[1]) && r.status === 'NEEDS_REVIEW')) continue; // handled above once final
@@ -1748,8 +2127,13 @@ export class ChainSettlement {
       const available = row.effectiveMicros - this._inFlightOutMicros(row.listedIds);
       const inReview = Object.values(this.state.inbound).filter((r) => r.status === 'NEEDS_REVIEW').map((r) => r.txid);
       const audit = { onChainPoa: fromMicros(available < 0n ? 0n : available), requiredPoa: fromMicros(required), ok: available >= required };
+      audit.foreignOutflows = this.foreign.length;
       if (!audit.ok) {
         return set('SOLVENCY_HOLD', `Books (${fromMicros(required)} POA) exceed the confirmed on-chain bank balance (${fromMicros(available < 0n ? 0n : available)} POA); bets and withdrawals are paused until reconciled.`, { inReview, audit, recovered: this.reconcile.recovered + recovered });
+      }
+      const unacked = this.foreign.filter((f) => !f.acknowledged);
+      if (unacked.length) {
+        return set('FOREIGN_OUTFLOW_HOLD', `${unacked.length} bank transfer(s) on the ledger were not created by this vault (${unacked.map((f) => f.txid.slice(0, 16)).join(', ')}); bets and withdrawals are paused until an operator acknowledges them.`, { inReview, audit, recovered: this.reconcile.recovered + recovered });
       }
       return set('OK', null, { inReview, audit, recovered: this.reconcile.recovered + recovered });
     } catch (err) {
@@ -1775,6 +2159,8 @@ export class ChainSettlement {
       onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
       bankBalance: this.lastBankBalance,
       stuckPayouts: this.stuckPayouts(),
+      writer: this.writer.view(),
+      foreignOutflows: this.foreign,
       ledgerIndexComplete: this.ledgerIndexComplete,
       reconcile: { status: this.reconcile.status, reason: this.reconcile.reason, at: this.reconcile.at ? new Date(this.reconcile.at).toISOString() : null, inReview: this.reconcile.inReview, audit: this.reconcile.audit },
       trading: tradingLabel(this.tradingHold()),
@@ -1828,6 +2214,11 @@ export class ChainSettlement {
       },
       payoutsOk: stuck.length === 0,
       stuckPayouts: stuck,
+      writer: this.writer.view(),
+      foreignOutflowsOk: this._foreignOutflows().every((f) => f.acknowledged),
+      foreignOutflows: this._foreignOutflows(),
+      ledgerOnlyBets: Object.values(this.state.inbound).filter((r) => r.status === 'NEEDS_REVIEW' && r.action === 'BET').map((r) => ({ txid: r.txid, from: r.from, amountPoa: r.amountPoa, reason: r.reviewReason || 'PREDATES_STATE', error: r.error })),
+      refusedDuplicatePayouts: Object.values(this.state.outbound).filter((o) => o.status === 'REFUSED_DUPLICATE').map((o) => ({ orderId: o.orderId, to: o.to, amountPoa: o.amountPoa, duplicateOf: o.duplicateOf, error: o.lastError })),
       requiredOnChainPoa: fromMicros(required),
       deltaPoa: (delta < 0n ? '-' : '') + fromMicros(delta < 0n ? -delta : delta),
       note:

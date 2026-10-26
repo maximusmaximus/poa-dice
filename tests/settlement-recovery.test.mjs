@@ -21,12 +21,12 @@ import { startMockMinepoa } from './helpers/mock-minepoa.mjs';
 
 const tmp = (t) => fs.mkdtempSync(path.join(os.tmpdir(), `poa-dice-recovery-${t}-`));
 
-async function boot({ mock, dataDir, bank, extra = {} }) {
+async function boot({ mock, dataDir, bank, extra = {}, recover = false }) {
   const app = createDiceServer({
     dataDir,
     watcherMode: 'live',
     nodeUrl: mock.url,
-    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey },
+    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey, POA_DICE_BANK_SIGNER: '1', POA_DICE_BIND_STORE: bank.address },
     storeEnv: {},
     chainCacheMs: 0,
     backoffBaseMs: 5,
@@ -35,6 +35,9 @@ async function boot({ mock, dataDir, bank, extra = {} }) {
   });
   const info = await app.listen(0, '127.0.0.1');
   if (app.settlement) app.settlement.client.retryBaseMs = 5;
+  // Lost state = a new, empty store while the bank has ledger history: only the operator's one-time
+  // admin recovery binding lets the vault rebuild from the ledger (never bound automatically).
+  if (recover) await app.settlement.bindStore({ via: 'admin', recovery: true });
   const settle = async (rounds = 4) => {
     for (let i = 0; i < rounds; i++) {
       await app.settlement.tick();
@@ -90,7 +93,7 @@ test('lost state: a final DICE1:LP_ADD found only on the ledger (no memo on the 
   mock.finalizeAll();
   assert.equal(mock.checkpointBalanceOf(bank.address), '0.000000', 'explorer balance still shows 0');
 
-  const srv = await boot({ mock, dataDir: tmp('lost1'), bank });
+  const srv = await boot({ mock, dataDir: tmp('lost1'), bank, recover: true });
   try {
     // status endpoint finds it on the ledger even before the scan books it
     const pre = await (await fetch(`${srv.url}/api/tx/${dep.id}/status`)).json();
@@ -127,7 +130,7 @@ test('lost state: a final DICE1:LP_ADD found only on the ledger (no memo on the 
   }
 
   // State lost AGAIN after the payout: replay must rebuild deposit+withdraw and adopt the payout, not repeat it.
-  const srv2 = await boot({ mock, dataDir: tmp('lost2'), bank });
+  const srv2 = await boot({ mock, dataDir: tmp('lost2'), bank, recover: true });
   try {
     await srv2.settle(6);
     assert.equal(mock.transfersFrom(bank.address).length, 1, 'no second payout after replay');
@@ -162,43 +165,36 @@ test('ephemeral store => read-only STORAGE_EPHEMERAL (no bank address handed out
   await mock.close();
 });
 
-test('Redis REST (Vercel KV / Upstash) store: state survives a recycled instance; payouts wait for a durable write', async () => {
-  const mock = await startMockMinepoa({ realistic: true, autoFinal: true });
+test('Redis REST (Vercel KV / Upstash) store: the vault document survives a recycled instance, but Redis never signs (no single-writer lease)', async () => {
   const kv = await startFakeKv();
+  // store level: a document written by one instance is read back by the next
+  const s1 = createRedisRestStore({ url: kv.url, token: 'kv-test-token', key: 'poa-dice:test:vault' });
+  await s1.save({ version: 1, marker: 'kept' });
+  const s2 = createRedisRestStore({ url: kv.url, token: 'kv-test-token', key: 'poa-dice:test:vault' });
+  assert.equal((await s2.load()).marker, 'kept');
+
+  // server level: with Redis as the store, the bank key never signs and no bet or deposit is booked
+  const mock = await startMockMinepoa({ realistic: true, autoFinal: true });
   const bank = genKeypair();
   const player = genKeypair();
   mock.setBalance(player.address, '50.000000');
   const env = { KV_REST_API_URL: kv.url, KV_REST_API_TOKEN: 'kv-test-token' };
   const srv = await boot({ mock, dataDir: tmp('kv1'), bank, extra: { storeEnv: env, dataDirIsPersistent: false } });
-  let depId;
   try {
     assert.equal(srv.app.settlement.store.kind, 'redis');
     const dep = directTx(mock, player, bank.address, '20.000000', formatDiceMemo({ action: 'LP_ADD', lockEpochs: 0 }));
-    depId = dep.id;
     mock.directSubmit(dep.body);
     await srv.settle();
-    assert.equal((await (await fetch(`${srv.url}/api/tx/${dep.id}/status`)).json()).status, 'CONFIRMED');
-    await srv.app.settlement.flush();
-    assert.ok([...kv.data.keys()][0].endsWith(`${bank.address}:vault`));
-  } finally {
-    await srv.close();
-  }
-  // New instance, new (empty) disk: everything comes back from KV.
-  const srv2 = await boot({ mock, dataDir: tmp('kv2'), bank, extra: { storeEnv: env, dataDirIsPersistent: false } });
-  try {
-    assert.ok(srv2.app.engine.processedTxids.has(depId), 'engine snapshot restored from KV');
-    assert.ok(srv2.app.engine.lpPositions.get(player.address).shares > 0n);
-    // KV outage: the payout is signed but NOT broadcast until the signed body is durable.
+    assert.equal(srv.app.settlement.writer.status, 'UNSUPPORTED_STORE');
+    assert.equal(srv.app.settlement.tradingHold().status, 'SIGNER_READ_ONLY');
+    assert.equal(srv.app.engine.processedTxids.has(dep.id), false, 'nothing booked by a read-only copy');
+    assert.equal([...kv.data.keys()].some((k) => k.endsWith(`${bank.address}:vault`)), false, 'read-only copy never writes the vault');
     const wd = directTx(mock, player, bank.address, '0.000001', formatDiceMemo({ action: 'LP_WITHDRAW', mode: 'ALL' }));
     mock.directSubmit(wd.body);
-    kv.fail(1000);
-    await srv2.settle(3);
-    assert.equal(mock.transfersFrom(bank.address).length, 0, 'nothing broadcast while the store is down');
-    kv.fail(0);
-    await srv2.settle(4);
-    assert.equal(mock.transfersFrom(bank.address).length, 1, 'broadcast once the store is back');
+    await srv.settle(3);
+    assert.equal(mock.transfersFrom(bank.address).length, 0, 'the bank signed nothing');
   } finally {
-    await srv2.close();
+    await srv.close();
     await kv.close();
     await mock.close();
   }
@@ -213,7 +209,7 @@ test('a bet older than the vault state is held for review, never re-rolled', asy
   bet.body.ts = Math.floor(Date.now() / 1000) - 3600;
   const resigned = buildSignedTransfer({ wallet: player, to: bank.address, amount: '1.000000', memo: bet.body.memo, nonce: bet.body.nonce, parents: bet.body.parents, ts: bet.body.ts });
   mock.directSubmit(resigned.body);
-  const srv = await boot({ mock, dataDir: tmp('oldbet'), bank });
+  const srv = await boot({ mock, dataDir: tmp('oldbet'), bank, recover: true });
   try {
     await srv.settle();
     const st = await (await fetch(`${srv.url}/api/tx/${resigned.id}/status`)).json();

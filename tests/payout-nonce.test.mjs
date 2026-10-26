@@ -24,7 +24,7 @@ async function boot({ mock, bank, tag, store = null, extra = {} }) {
     dataDir: tmp(tag),
     watcherMode: 'live',
     nodeUrl: mock.url,
-    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey },
+    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey, POA_DICE_BANK_SIGNER: '1', POA_DICE_BIND_STORE: bank.address },
     storeEnv: {},
     ...(store ? { settlementStore: store } : {}),
     chainCacheMs: 0,

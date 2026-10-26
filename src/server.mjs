@@ -31,6 +31,7 @@ import { isAddress as isPoaAddress, looksLikePrivkey, walletBalance } from './wa
 import crypto from 'node:crypto';
 import { loadBankWallet } from './bank-key.mjs';
 import { ChainSettlement } from './chain-settlement.mjs';
+import { BankWriter } from './bank-writer.mjs';
 import { LedgerProbe, LEDGER_HOLD } from './ledger-probe.mjs';
 import { DEFAULT_CHAIN_ID, MinepoaClient } from './minepoa-client.mjs';
 import { resolveStore } from './settlement-store.mjs';
@@ -178,7 +179,20 @@ export function createDiceServer(options = {}) {
             chainId: options.chainId || process.env.POA_CHAIN_ID || DEFAULT_CHAIN_ID
           });
         try {
+          // Single writer (bank-writer.mjs): signing needs POA_DICE_BANK_SIGNER=1, a bound store and the lease.
+          const signerEnv = options.bankEnv || process.env;
+          const writer = new BankWriter({
+            store,
+            bankAddress: key.wallet.address,
+            enabled: options.bankSigner !== undefined ? Boolean(options.bankSigner) : signerEnv.POA_DICE_BANK_SIGNER === '1',
+            expectedStoreId: options.storeId || signerEnv.POA_DICE_STORE_ID || null,
+            leaseMs: options.writerLeaseMs ?? 30000,
+            deploymentEnv: signerEnv.VERCEL_ENV || null
+          });
+          const bindTarget = options.bindStore !== undefined ? (options.bindStore ? key.wallet.address : null) : signerEnv.POA_DICE_BIND_STORE || null;
           settlement = new ChainSettlement({
+            writer,
+            bindOnBoot: bindTarget === key.wallet.address,
             engine,
             watcher,
             client,
@@ -421,7 +435,9 @@ export function createDiceServer(options = {}) {
       bankBalance: sum.bankBalance,
       inbound: sum.inbound,
       outbound: sum.outbound,
-      stuckPayouts: sum.stuckPayouts
+      stuckPayouts: sum.stuckPayouts,
+      writer: sum.writer,
+      foreignOutflows: sum.foreignOutflows
     };
   }
 
@@ -787,6 +803,33 @@ export function createDiceServer(options = {}) {
         return sendJson(res, 200, verification);
       }
 
+      // One-time binding of the vault store to the bank (see bank-writer.mjs). Admin only.
+      if (pathname === '/api/admin/store-binding' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
+        if (!settlement) return sendJson(res, 503, { ok: false, error: 'chain settlement is not running on this instance' });
+        const body = await readJsonBody(req);
+        if (body.bankAddress !== settlement.bankAddress) return sendJson(res, 400, { ok: false, error: `bankAddress must be ${settlement.bankAddress}` });
+        try {
+          const out = await settlement.bindStore({ via: 'admin', recovery: body.recovery === true });
+          await settlement.tick();
+          return sendJson(res, 200, { ok: true, ...out, writer: settlement.writer.view() });
+        } catch (err) {
+          return sendJson(res, 409, { ok: false, error: redactSecrets(err.message), writer: settlement.writer.view() });
+        }
+      }
+
+      // Operator decision on bank transfers this vault did not create ("foreign outflows"). Admin only.
+      if (pathname === '/api/admin/foreign-outflows/ack' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
+        if (!settlement) return sendJson(res, 503, { ok: false, error: 'chain settlement is not running on this instance' });
+        const body = await readJsonBody(req);
+        try {
+          return sendJson(res, 200, { ok: true, ...(await settlement.ackForeignOutflows({ txids: Array.isArray(body.txids) ? body.txids : [], mode: body.mode })) });
+        } catch (err) {
+          return sendJson(res, 409, { ok: false, error: redactSecrets(err.message) });
+        }
+      }
+
       if (pathname === '/api/seed/rotate' && req.method === 'POST') {
         if (!isAdmin(req)) return denyAdmin(res);
         const rotated = engine.seedManager.rotateSeed();
@@ -914,6 +957,10 @@ export function createDiceServer(options = {}) {
     async close() {
       watcher.stopPolling();
       if (settlement) settlement.stop();
+      if (settlement) {
+        await settlement.idle().catch(() => {});
+        await settlement.writer.release();
+      }
       for (const client of sseClients) {
         try {
           client.end();
