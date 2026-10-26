@@ -238,12 +238,12 @@ test('broadcast failures are retried with backoff; lost responses never double-p
   }
 });
 
-test('definitive rejection => safe re-sign with a fresh nonce, still exactly one payout', async () => {
+test('definitive rejection => confirmed repeatedly, then re-signed with the same nonce, still exactly one payout', async () => {
   const mock = await startMockMinepoa({ autoFinal: true });
   const bank = genKeypair();
   const player = genKeypair();
   mock.setBalance(player.address, '50.000000');
-  const srv = await boot({ mock, dataDir: tmp('resign'), bank });
+  const srv = await boot({ mock, dataDir: tmp('resign'), bank, extra: { rejectCheckIntervalMs: 0 } });
   try {
     await srv.mcp('bank_stake', { amount_poa: '20.000000', max_total_spend_poa: '20.000000', privkey: player.privkey });
     await srv.settle();

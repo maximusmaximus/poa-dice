@@ -188,6 +188,11 @@ export function createDiceServer(options = {}) {
             backoffBaseMs: options.backoffBaseMs ?? 2000,
             backoffMaxMs: options.backoffMaxMs ?? 5 * 60 * 1000,
             inboundExpireMs: options.inboundExpireMs ?? 30 * 60 * 1000,
+            // rejected payouts: re-signed only after repeated definitive rejections (see _reconcilePayouts)
+            rejectConfirmations: options.rejectConfirmations ?? 3,
+            rejectCheckIntervalMs: options.rejectCheckIntervalMs ?? 15000,
+            sentGraceMs: options.sentGraceMs ?? 20000,
+            stuckAfterMs: options.stuckAfterMs ?? 10 * 60 * 1000,
             // Pause trading when minepoa can't accept transactions; resumes by itself (see ledger-probe.mjs).
             ledgerProbe:
               options.ledgerProbe === false
@@ -415,7 +420,8 @@ export function createDiceServer(options = {}) {
       onChainBankBalancePoa: sum.onChainBankBalancePoa,
       bankBalance: sum.bankBalance,
       inbound: sum.inbound,
-      outbound: sum.outbound
+      outbound: sum.outbound,
+      stuckPayouts: sum.stuckPayouts
     };
   }
 
