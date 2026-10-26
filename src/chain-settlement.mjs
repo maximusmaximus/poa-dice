@@ -74,6 +74,16 @@ export function tradingLabel(hold) {
   return hold.status === LEDGER_HOLD ? 'PAUSED_LEDGER_UNAVAILABLE' : 'HOLD';
 }
 
+/** "bad nonce 5 (expected 6)" / "bad nonce: expected 6, got 5" -> 6; null when not a nonce error. */
+export function parseExpectedNonce(error) {
+  const m = /nonce[^0-9]*?(?:\d+\s*)?\(?\s*expected\s*:?\s*(\d+)/i.exec(String(error || ''));
+  return m ? Number(m[1]) : null;
+}
+
+function isRejectedReceipt(receipt) {
+  return !!receipt && typeof receipt === 'object' && /^(rejected|invalid|failed)$/i.test(String(receipt.status || ''));
+}
+
 function now() {
   return Date.now();
 }
@@ -96,6 +106,11 @@ export class ChainSettlement {
     inboundExpireMs = 30 * 60 * 1000,
     balanceStaleMs = 60 * 1000,
     ledgerProbe = null,
+    rejectConfirmations = 3,
+    rejectCheckIntervalMs = 15000,
+    sentGraceMs = 20000,
+    stuckAfterMs = 10 * 60 * 1000,
+    nonceScanDepth = 12,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -109,6 +124,14 @@ export class ChainSettlement {
     this.backoffBaseMs = backoffBaseMs;
     this.backoffMaxMs = backoffMaxMs;
     this.maxResign = maxResign;
+    // Rejected-payout reconciler (see _reconcilePayouts): a payout is re-signed only after minepoa has
+    // definitively rejected it on `rejectConfirmations` separate checks, spaced `rejectCheckIntervalMs` apart.
+    this.rejectConfirmations = Math.max(1, rejectConfirmations);
+    this.rejectCheckIntervalMs = rejectCheckIntervalMs;
+    this.sentGraceMs = sentGraceMs;
+    this.stuckAfterMs = stuckAfterMs;
+    this.nonceScanDepth = nonceScanDepth;
+    this._txNonce = new Map(); // txid -> body.nonce of bank txs on the ledger (immutable)
     this.inboundExpireMs = inboundExpireMs;
     this.balanceStaleMs = balanceStaleMs;
     this._lastRow = null;
@@ -847,34 +870,32 @@ export class ChainSettlement {
       return false;
     }
     if (known) return this._markSent(rec, {});
+    // Never resend a body minepoa already rejected for good (e.g. bad nonce): the reconciler decides what
+    // happens to the order. A NONCE_GAP body is the exception: it is resent unchanged once the gap is filled.
+    if (!rec.forceRebroadcast) {
+      const receipt = await this._receipt(rec.txid);
+      if (isRejectedReceipt(receipt)) {
+        this._markRejected(rec, String(receipt.error || 'rejected'), 'receipt');
+        return false;
+      }
+    }
+    rec.forceRebroadcast = false;
     try {
       rec.attempts += 1;
       const resp = await this.client.submitTx(rec.body);
       return this._markSent(rec, resp || {});
     } catch (err) {
       rec.lastError = String(err.message || err);
-      // Stays queued and retries with backoff (same signed body, same txid: never paid twice).
+      // Outages (401/403/5xx/timeouts) pause trading; a definitive rejection (4xx about the tx) does not.
       this.ledgerProbe?.reportFailure('payout broadcast', err);
       if (err.definitive) {
         const again = await this.client.getTx(rec.txid).catch(() => undefined);
         if (again) return this._markSent(rec, {});
-        if (again === null) {
-          // The node refused this body and it is not on the ledger: safe to re-sign with fresh nonce/parents.
-          rec.superseded.push({ txid: rec.txid, nonce: rec.nonce, error: rec.lastError });
-          rec.resigns += 1;
-          this.state.bankNonce = null;
-          this._tip = null; // fetch fresh parents too
-          rec.txid = null;
-          rec.body = null;
-          rec.nonce = null;
-          rec.status = rec.resigns > this.maxResign ? 'FAILED' : 'QUEUED';
-          rec.nextAttemptAt = now() + this._backoff(rec.resigns);
-          if (rec.status === 'FAILED') this._failEngine(rec);
-          this._save();
-          this._emit('settlement.updated', this._outboundView(rec));
-          return false;
-        }
+        // Not re-signed here: the reconciler re-checks it before anything new is signed for this order.
+        this._markRejected(rec, String(err.body?.error || err.message || 'rejected'), 'submit');
+        return false;
       }
+      // Stays signed and retries with backoff (same signed body, same txid: never paid twice).
       rec.nextAttemptAt = now() + this._backoff(rec.attempts);
       this._save();
       this._emit('settlement.updated', this._outboundView(rec));
@@ -882,12 +903,30 @@ export class ChainSettlement {
     }
   }
 
+  /** minepoa refused this exact body. Stop sending it; _reconcilePayouts decides (re-sign / wait / resend). */
+  _markRejected(rec, error, source) {
+    const expected = parseExpectedNonce(error);
+    if (!rec.rejection || rec.rejection.txid !== rec.txid) {
+      rec.rejection = { txid: rec.txid, nonce: rec.nonce, error, source, expected, kind: null, firstAt: now(), lastCheckAt: 0, checks: 0, consumedBy: null, lastTransient: null };
+    } else {
+      rec.rejection.error = error;
+      if (expected !== null) rec.rejection.expected = expected;
+    }
+    rec.status = 'REJECTED';
+    rec.forceRebroadcast = false;
+    rec.lastError = `minepoa rejected ${String(rec.txid).slice(0, 16)}: ${error}`;
+    this._save();
+    this._emit('settlement.updated', this._outboundView(rec));
+  }
+
   _markSent(rec, resp) {
     rec.status = 'SENT';
     rec.sentAt = now();
     rec.lastError = null;
+    rec.rejection = null;
     const next = Number(resp.next_nonce);
-    this.state.bankNonce = Number.isInteger(next) && next > rec.nonce ? next : rec.nonce + 1;
+    // Informational only: the next bank nonce is always re-derived from minepoa when signing.
+    if (Number.isInteger(rec.nonce)) this.state.bankNonce = Number.isInteger(next) && next > rec.nonce ? next : rec.nonce + 1;
     this._save();
     this.engine.markOutboundSent(rec.orderId, rec.txid, 'SENT');
     this._emit('settlement.updated', this._outboundView(rec));
@@ -921,6 +960,8 @@ export class ChainSettlement {
         this._failEngine(rec);
       }
     }
+    // 1b. payouts minepoa refused (or never took): detect, confirm repeatedly, then re-sign safely
+    await this._reconcilePayouts(recs);
     // 2. head of line: an un-acknowledged signed tx blocks new signing (nonce order)
     const pendingSigned = recs.find((r) => r.status === 'SIGNED');
     if (pendingSigned) {
@@ -957,6 +998,20 @@ export class ChainSettlement {
         this._emit('settlement.updated', this._outboundView(rec));
         continue;
       }
+      // A re-signed order: if any earlier body of it reached the ledger after all, adopt it (never pay twice).
+      if ((rec.superseded || []).length) {
+        const landed = await this._landedSuperseded(rec);
+        if (landed === undefined) {
+          rec.lastError = 'minepoa unreachable (checking earlier payout bodies)';
+          rec.nextAttemptAt = now() + this._backoff(++rec.attempts);
+          this._save();
+          return;
+        }
+        if (landed) {
+          this._adoptLanded(rec, landed);
+          continue;
+        }
+      }
       if (now() < rec.nextAttemptAt) continue;
       if (balanceMicros === null || !this.ledgerIndexComplete) return; // cannot prove solvency / non-payment this tick
       const amount = toMicros(rec.amountPoa);
@@ -973,7 +1028,15 @@ export class ChainSettlement {
       let nonce;
       let parents;
       try {
-        nonce = this.state.bankNonce ?? (await this.client.nextNonce(this.bankAddress));
+        nonce = await this._chooseBankNonce(rec);
+      } catch (err) {
+        rec.lastError = `bank nonce: ${err.message}`;
+        this._tickErrors.push(rec.lastError);
+        rec.nextAttemptAt = now() + this._backoff(++rec.attempts);
+        this._save();
+        return;
+      }
+      try {
         parents = await this._parents();
       } catch (err) {
         rec.lastError = err.message;
@@ -1008,7 +1071,7 @@ export class ChainSettlement {
       rec.nonce = nonce;
       rec.status = 'SIGNED';
       rec.signedAt = now();
-      this.state.bankNonce = nonce; // reserved; advanced once the node accepts it
+      rec.nonceRule = null;
       this._save(); // write-ahead: the txid is durable before anything leaves the box
       try {
         await this.flush();
@@ -1021,6 +1084,283 @@ export class ChainSettlement {
     }
   }
 
+  // ─── Bank nonce + rejected-payout reconciler ─────────────────────────────
+
+  /** minepoa receipt: object, null (none), undefined (could not ask, or an error body such as "origin busy"). */
+  async _receipt(txid) {
+    const r = await this.client.getReceipt(txid).catch(() => undefined);
+    if (r === undefined || r === null) return r;
+    if (typeof r !== 'object' || !r.status) return undefined;
+    return r;
+  }
+
+  /** body.nonce of a bank tx on the ledger (cached; nonces are immutable). undefined = could not ask. */
+  async _nonceOfTx(txid) {
+    if (this._txNonce.has(txid)) return this._txNonce.get(txid);
+    const tx = await this.client.getTx(txid);
+    if (!tx || tx.invalid) return null;
+    const n = Number(tx.body?.nonce);
+    if (!Number.isInteger(n) || (tx.from && tx.from !== this.bankAddress)) return null;
+    this._txNonce.set(txid, n);
+    return n;
+  }
+
+  /**
+   * Next bank nonce according to minepoa: highest nonce among the bank's recent sends on the ledger, +1.
+   * Throws when minepoa cannot answer (never guessed from local state alone).
+   */
+  async _chainNextNonce() {
+    const row = await this.client.getAddress(this.bankAddress);
+    const sent = (row.txs || []).filter((t) => t && t.id && t.from === this.bankAddress).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, this.nonceScanDepth);
+    let max = 0;
+    for (const t of sent) {
+      const n = await this._nonceOfTx(t.id);
+      if (Number.isInteger(n) && n > max) max = n;
+    }
+    return max + 1;
+  }
+
+  /** Nonces our own live bodies already hold (the explorer's address page lags the open epoch). */
+  _localNonceFloor() {
+    let floor = 0;
+    for (const o of Object.values(this.state.outbound)) {
+      if (o.recoveredFromLedger || !Number.isInteger(o.nonce)) continue;
+      if (o.status === 'SIGNED' || o.status === 'SENT' || o.status === 'CONFIRMED') floor = Math.max(floor, o.nonce + 1);
+    }
+    return floor;
+  }
+
+  /**
+   * The nonce for this order's next body. Read from minepoa every time, floored by our own live bodies and
+   * by what minepoa said it expects, then reserved with an atomic store claim (bank-nonce:<n>) so two
+   * instances can never sign two different payouts with the same nonce.
+   */
+  async _chooseBankNonce(rec) {
+    const rule = rec.nonceRule || {};
+    if (Number.isInteger(rule.fixed)) {
+      // Same nonce as the rejected body: at most one of the two can ever land.
+      const res = await this._persist.claim(`bank-nonce:${rule.fixed}`, { orderId: rec.orderId, gen: rec.resigns || 0, at: now() });
+      if (!res.claimed && res.value?.orderId !== rec.orderId) throw new Error(`nonce ${rule.fixed} is reserved by order ${res.value?.orderId}`);
+      return rule.fixed;
+    }
+    const chainNext = await this._chainNextNonce();
+    let n = Math.max(chainNext, this._localNonceFloor(), Number.isInteger(rule.floor) ? rule.floor : 0);
+    for (let i = 0; i < 64; i++, n++) {
+      const res = await this._persist.claim(`bank-nonce:${n}`, { orderId: rec.orderId, gen: rec.resigns || 0, at: now() });
+      if (res.claimed || res.value?.orderId === rec.orderId) return n;
+    }
+    throw new Error('no free bank nonce within 64 of the ledger tip');
+  }
+
+  /** A previous body of this order that is on the ledger: txid, null (none), undefined (could not ask). */
+  async _landedSuperseded(rec) {
+    for (const s of rec.superseded || []) {
+      if (!s.txid) continue;
+      const tx = await this.client.getTx(s.txid).catch(() => undefined);
+      if (tx === undefined) return undefined;
+      if (tx && !tx.invalid) return s.txid;
+    }
+    return null;
+  }
+
+  _adoptLanded(rec, txid) {
+    if (rec.txid && rec.txid !== txid) rec.superseded.push({ txid: rec.txid, nonce: rec.nonce, error: 'an earlier body of this payout landed instead', reason: 'EARLIER_BODY_LANDED', at: now() });
+    rec.superseded = rec.superseded.filter((s) => s.txid !== txid);
+    rec.txid = txid;
+    rec.nonce = this._txNonce.get(txid) ?? null;
+    rec.body = null;
+    rec.status = 'SENT';
+    rec.sentAt = now();
+    rec.rejection = null;
+    rec.nonceRule = null;
+    rec.lastError = null;
+    this._save();
+    this.engine.markOutboundSent(rec.orderId, rec.txid, 'SENT');
+    this._emit('settlement.updated', this._outboundView(rec));
+  }
+
+  /**
+   * Which final bank tx used `nonce` (other than `excludeTxid`)? txid, null (none found), undefined (could not ask).
+   * Proof that a rejected body's nonce is consumed, i.e. that body can never land.
+   */
+  async _nonceConsumer(nonce, excludeTxid) {
+    const ids = new Set();
+    for (const o of Object.values(this.state.outbound)) {
+      if (o.txid && o.nonce === nonce) ids.add(o.txid);
+      for (const s of o.superseded || []) if (s.txid && s.nonce === nonce) ids.add(s.txid);
+    }
+    try {
+      const row = await this.client.getAddress(this.bankAddress);
+      for (const t of row.txs || []) if (t && t.id && t.from === this.bankAddress) ids.add(t.id);
+    } catch {
+      return undefined;
+    }
+    ids.delete(excludeTxid);
+    for (const id of ids) {
+      let tx;
+      try {
+        tx = await this.client.getTx(id);
+      } catch {
+        return undefined;
+      }
+      if (!tx || tx.invalid || !this._confirmed(tx)) continue;
+      const n = Number(tx.body?.nonce);
+      if (Number.isInteger(n)) this._txNonce.set(id, n);
+      if (n === nonce && (tx.from || tx.body?.from) === this.bankAddress) return id;
+    }
+    return null;
+  }
+
+  /**
+   * SENT payouts that never landed and REJECTED ones. A body is re-signed only when minepoa definitively
+   * rejected it on `rejectConfirmations` separate checks AND it is absent from the ledger every time AND it
+   * provably cannot land later:
+   *   - bad nonce, minepoa expects a HIGHER nonce: the old nonce must be used by another final bank tx
+   *     (found on the ledger); the payout is re-signed with the nonce minepoa expects (or the ledger tip).
+   *   - bad nonce, minepoa expects a LOWER nonce (gap): never re-signed; the same body is resent once the
+   *     bank's next nonce reaches it.
+   *   - any other definitive rejection: re-signed with the SAME nonce, so at most one body can ever land.
+   * Transient answers (explorer unreachable / busy, ledger outage) reset the count. The old txid stays
+   * linked in `superseded` for audit.
+   */
+  async _reconcilePayouts(recs) {
+    if (this.ledgerProbe && this.ledgerProbe.hold()) return; // during an outage nothing counts as evidence
+    for (const rec of recs) {
+      if (!rec.txid || rec.recoveredFromLedger) continue;
+      if (rec.status === 'SENT') {
+        if (now() - (rec.sentAt || 0) < this.sentGraceMs) continue;
+        if (rec.nextReceiptCheckAt && now() < rec.nextReceiptCheckAt) continue;
+        rec.nextReceiptCheckAt = now() + this.rejectCheckIntervalMs;
+        const receipt = await this._receipt(rec.txid);
+        if (!isRejectedReceipt(receipt)) continue;
+        const tx = await this.client.getTx(rec.txid).catch(() => undefined);
+        if (tx !== null) continue; // on the ledger after all, or the explorer could not say
+        this._markRejected(rec, String(receipt.error || 'rejected'), 'receipt');
+        continue;
+      }
+      if (rec.status === 'REJECTED') await this._checkRejected(rec);
+    }
+  }
+
+  async _checkRejected(rec) {
+    const r = rec.rejection || (rec.rejection = { txid: rec.txid, nonce: rec.nonce, error: 'rejected', source: 'unknown', expected: null, kind: null, firstAt: now(), lastCheckAt: 0, checks: 0, consumedBy: null, lastTransient: null });
+    if (r.checks > 0 && now() - r.lastCheckAt < this.rejectCheckIntervalMs) return;
+    r.lastCheckAt = now();
+    const transient = (why) => {
+      r.checks = 0;
+      r.lastTransient = why;
+      this._save();
+    };
+    // 1. never act while any body of this payout might be on the ledger
+    const tx = await this.client.getTx(rec.txid).catch(() => undefined);
+    if (tx === undefined) return transient('explorer could not answer for the rejected txid');
+    if (tx && !tx.invalid) return this._adoptLanded(rec, rec.txid);
+    const landed = await this._landedSuperseded(rec);
+    if (landed === undefined) return transient('explorer could not answer for an earlier body');
+    if (landed) return this._adoptLanded(rec, landed);
+    // 2. minepoa must still say rejected
+    const receipt = await this._receipt(rec.txid);
+    if (receipt === undefined) return transient('receipt unavailable');
+    if (receipt && !isRejectedReceipt(receipt)) {
+      // the node now reports it as pending / included: back to waiting for confirmation
+      rec.status = 'SENT';
+      rec.sentAt = now();
+      rec.rejection = null;
+      rec.lastError = null;
+      this._save();
+      return;
+    }
+    if (!receipt && r.source !== 'submit') return transient('no receipt for the txid');
+    if (receipt?.error) {
+      r.error = String(receipt.error);
+      const e = parseExpectedNonce(r.error);
+      if (e !== null) r.expected = e;
+    }
+    r.checks += 1;
+    r.lastTransient = null;
+    this._save();
+    if (r.checks < this.rejectConfirmations) return;
+    // 3. decide
+    const E = r.expected;
+    const old = rec.nonce;
+    if (Number.isInteger(E) && Number.isInteger(old) && E < old) {
+      r.kind = 'NONCE_GAP';
+      rec.lastError = `minepoa expects bank nonce ${E}; this payout holds ${old}. It is resent unchanged once the gap is filled.`;
+      const next = await this._chainNextNonce().catch(() => null);
+      if (next === old) {
+        rec.status = 'SIGNED';
+        rec.forceRebroadcast = true;
+        rec.nextAttemptAt = 0;
+      }
+      this._save();
+      return;
+    }
+    let rule;
+    if (Number.isInteger(E) && Number.isInteger(old) && E > old) {
+      const consumer = await this._nonceConsumer(old, rec.txid);
+      if (consumer === undefined) return transient('explorer could not answer while proving the nonce is used');
+      if (!consumer) {
+        r.kind = 'NONCE_USED_UNPROVEN';
+        rec.lastError = `minepoa says nonce ${old} is used, but no final bank tx with that nonce was found yet; not re-signed.`;
+        this._save();
+        return;
+      }
+      if (rec.superseded.some((s) => s.txid === consumer)) return this._adoptLanded(rec, consumer);
+      r.kind = 'NONCE_USED';
+      r.consumedBy = consumer;
+      rule = { floor: E };
+    } else {
+      r.kind = 'REJECTED';
+      rule = Number.isInteger(old) ? { fixed: old } : {};
+    }
+    this._resign(rec, rule);
+  }
+
+  _resign(rec, rule) {
+    const r = rec.rejection || {};
+    rec.superseded.push({ txid: rec.txid, nonce: rec.nonce, error: r.error || rec.lastError, reason: r.kind || 'REJECTED', consumedBy: r.consumedBy || null, rejectedAt: r.firstAt || now(), at: now() });
+    rec.resigns = (rec.resigns || 0) + 1;
+    rec.nonceRule = rule;
+    rec.txid = null;
+    rec.body = null;
+    rec.nonce = null;
+    rec.rejection = null;
+    rec.forceRebroadcast = false;
+    this._tip = null; // fresh parents too
+    rec.status = rec.resigns > this.maxResign ? 'FAILED' : 'QUEUED';
+    rec.nextAttemptAt = 0;
+    if (rec.status === 'FAILED') {
+      rec.lastError = `payout rejected ${rec.resigns} times; operator must review`;
+      this._failEngine(rec);
+    }
+    if (this.logger) this.logger(`payout ${rec.orderId} re-signing (${rule.fixed !== undefined ? `same nonce ${rule.fixed}` : `nonce >= ${rule.floor}`})`);
+    this._save();
+    this._emit('settlement.updated', this._outboundView(rec));
+  }
+
+  /** Payouts that are owed but not on their way: rejected bodies, and SENT ones unconfirmed for too long. */
+  stuckPayouts() {
+    const out = [];
+    for (const o of Object.values(this.state.outbound)) {
+      const staleSent = o.status === 'SENT' && o.sentAt && now() - o.sentAt > this.stuckAfterMs;
+      if (o.status !== 'REJECTED' && !staleSent) continue;
+      out.push({
+        orderId: o.orderId,
+        to: o.to,
+        amountPoa: o.amountPoa,
+        status: o.status === 'REJECTED' ? 'REJECTED' : 'SENT_UNCONFIRMED_STALE',
+        txid: o.txid,
+        nonce: o.nonce,
+        error: o.rejection?.error || o.lastError || null,
+        kind: o.rejection?.kind || null,
+        rejectionChecks: o.rejection?.checks ?? null,
+        since: new Date(o.rejection?.firstAt || o.sentAt).toISOString(),
+        superseded: o.superseded || []
+      });
+    }
+    return out;
+  }
+
   _outboundView(rec) {
     return {
       direction: 'outbound',
@@ -1029,12 +1369,13 @@ export class ChainSettlement {
       sourceTxid: rec.sourceTxid,
       to: rec.to,
       amountPoa: rec.amountPoa,
-      status: rec.status === 'QUEUED' || rec.status === 'WAITING_FUNDS' || rec.status === 'SIGNED' ? 'PENDING' : rec.status,
+      status: rec.status === 'QUEUED' || rec.status === 'WAITING_FUNDS' || rec.status === 'SIGNED' || rec.status === 'REJECTED' ? 'PENDING' : rec.status,
       rawStatus: rec.status,
       txid: rec.txid,
       explorer: rec.txid ? this.client.explorerTxUrl(rec.txid) : null,
       attempts: rec.attempts,
       lastError: rec.lastError,
+      rejection: rec.rejection ? { error: rec.rejection.error, kind: rec.rejection.kind, expectedNonce: rec.rejection.expected, checks: rec.rejection.checks } : null,
       superseded: rec.superseded
     };
   }
@@ -1433,6 +1774,7 @@ export class ChainSettlement {
       lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
       onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
       bankBalance: this.lastBankBalance,
+      stuckPayouts: this.stuckPayouts(),
       ledgerIndexComplete: this.ledgerIndexComplete,
       reconcile: { status: this.reconcile.status, reason: this.reconcile.reason, at: this.reconcile.at ? new Date(this.reconcile.at).toISOString() : null, inReview: this.reconcile.inReview, audit: this.reconcile.audit },
       trading: tradingLabel(this.tradingHold()),
@@ -1466,6 +1808,9 @@ export class ChainSettlement {
     const confirmedOnChain = onChain - unconfirmedIn;
     const delta = confirmedOnChain - required;
     const sentUnconfirmed = this._inFlightOutMicros(row.listedIds);
+    const stuck = this.stuckPayouts();
+    let rejectedMicros = 0n;
+    for (const o of Object.values(this.state.outbound)) if (o.status === 'REJECTED') rejectedMicros += toMicros(o.amountPoa);
     return {
       ok: delta >= 0n,
       bankAddress: this.bankAddress,
@@ -1476,9 +1821,13 @@ export class ChainSettlement {
         bankNavPoa: fromMicros(this.engine.bankNavMicros),
         devReserveUnpaidPoa: fromMicros(this.engine.devReserveMicros),
         incentivePoolPoa: fromMicros(this.engine.incentivePoolMicros),
+        // owed and NOT on its way (includes rejected payouts, listed separately below)
         outboundNotYetSentPoa: fromMicros(pendingOut),
+        outboundRejectedPoa: fromMicros(rejectedMicros),
         outboundSentUnconfirmedPoa: fromMicros(sentUnconfirmed)
       },
+      payoutsOk: stuck.length === 0,
+      stuckPayouts: stuck,
       requiredOnChainPoa: fromMicros(required),
       deltaPoa: (delta < 0n ? '-' : '') + fromMicros(delta < 0n ? -delta : delta),
       note:

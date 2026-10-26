@@ -11,7 +11,13 @@
 import http from 'node:http';
 import { fromMicros, toMicros, txidOf, verifyBody } from '../../src/crypto-poa.mjs';
 
-export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1', autoFinal = false, realistic = false } = {}) {
+export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1', autoFinal = false, realistic = false, asyncReject = false } = {}) {
+  // asyncReject=true mimics minepoa.com on 2026-10-25: /api/submit answers 200 for a body it later refuses,
+  // /api/receipt/<id> then says {status:'rejected', error:'bad nonce 5 (expected 6)'} and the explorer
+  // answers 404 "not in segments" for that txid.
+  const receipts = new Map(); // txid -> rejected receipt
+  const hidden = new Set(); // txids the address page does not list yet (read-node lag)
+  let readFaults = []; // queue of '503' | 'busy' for GET /api/explorer/tx and /api/receipt
   const bal = new Map(Object.entries(balances).map(([a, v]) => [a, toMicros(v)]));
   // realistic=true mimics minepoa.com read-node v0.2 (observed 2026-10-25):
   //   address pages omit memos, `balance` is as of the last checkpoint, and
@@ -43,7 +49,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     if (body.cid !== chainId) return 'wrong chain id';
     if (!verifyBody(body, body.from)) return 'bad signature';
     const want = (nonces.get(body.from) || 0) + 1;
-    if (body.nonce !== want) return `bad nonce: expected ${want}, got ${body.nonce}`;
+    if (body.nonce !== want) return asyncReject ? `bad nonce ${body.nonce} (expected ${want})` : `bad nonce: expected ${want}, got ${body.nonce}`;
     if (!Array.isArray(body.parents) || body.parents.some((p) => !txs.has(p))) return 'unknown parents';
     let amt;
     try {
@@ -97,21 +103,30 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       const id = txidOf(body);
       if (txs.has(id)) return json(res, 409, { error: 'duplicate tx' });
       const err = check(body);
+      if (err && asyncReject) {
+        receipts.set(id, { txid: id, ts: Math.floor(Date.now() / 1000), status: 'rejected', error: err });
+        return json(res, 200, { ok: true, txid: id, queued: true });
+      }
       if (err) return json(res, 400, { error: err });
       accept(body);
       if (fault?.kind === 'lost') return json(res, 503, { error: 'gateway timeout (but accepted)' });
       return json(res, 200, { ok: true, txid: id, next_nonce: body.nonce + 1 });
     }
     let m;
+    if (req.method === 'GET' && readFaults.length && /^\/api\/(explorer\/tx|receipt)\//.test(p)) {
+      const f = readFaults.shift();
+      if (f === 'busy') return json(res, 200, { error: 'origin busy, retry' });
+      return json(res, 503, { error: 'read node busy' });
+    }
     if ((m = p.match(/^\/api\/explorer\/tx\/(.+)$/))) {
       const t = txs.get(m[1]);
-      if (!t) return json(res, 404, { error: 'not found' });
+      if (!t) return json(res, 404, { error: asyncReject ? 'not in segments' : 'not found' });
       return json(res, 200, { id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo, ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0, body: t.body });
     }
     if ((m = p.match(/^\/api\/explorer\/address\/(.+)$/))) {
       const a = decodeURIComponent(m[1]);
       const list = [...txs.values()]
-        .filter((t) => t.body.from === a || t.body.to === a)
+        .filter((t) => (t.body.from === a || t.body.to === a) && !hidden.has(t.id))
         .sort((x, y) => y.seq - x.seq)
         .map((t) => {
           const row = { id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo, ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0 };
@@ -133,6 +148,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       return json(res, 200, list);
     }
     if ((m = p.match(/^\/api\/receipt\/(.+)$/))) {
+      if (receipts.has(m[1]) && !txs.has(m[1])) return json(res, 200, receipts.get(m[1]));
       const t = txs.get(m[1]);
       if (!t) return json(res, 404, { error: 'not found' });
       return json(res, 200, { txid: t.id, status: 'included', from: t.body.from, next_nonce: (nonces.get(t.body.from) || 0) + 1 });
@@ -178,6 +194,17 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       return accept(body);
     },
     nextNonce: (a) => (nonces.get(a) || 0) + 1,
+    receipt: (id) => receipts.get(id) || null,
+    /** The address page stops listing these txids (read-node lag) until unhideAll(). */
+    hide: (...ids) => ids.forEach((id) => hidden.add(id)),
+    unhideAll: () => hidden.clear(),
+    /** The next GETs of /api/explorer/tx/* and /api/receipt/* fail: '503' or 'busy' (200 with an error). */
+    failReads: (...modes) => {
+      readFaults = readFaults.concat(modes);
+    },
+    clearReadFaults: () => {
+      readFaults = [];
+    },
     parents: () => [...txs.values()].sort((x, y) => y.seq - x.seq).slice(0, 2).map((t) => t.id).reverse(),
     close: () => new Promise((r) => server.close(r))
   };
