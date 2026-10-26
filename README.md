@@ -188,7 +188,7 @@ When `POA_DICE_WATCHER_MODE` is not `simulated` (the default for `npm start` is 
 
 - **Bank key from a secret.** `POA_DICE_BANK_PRIVKEY` (Base58 Ed25519) or `POA_DICE_BANK_KEY_FILE` (path to the key, or a `poa.mjs` `wallet.json`). The optional `POA_DICE_BANK_ADDRESS` pins the expected address. The server never generates a bank key in chain mode. If the key is missing or invalid, it starts **read-only**: no bank address is advertised, every money-moving endpoint and MCP tool returns `503`/rejected, and the UI shows `BANK KEY MISSING`. Set `POA_DICE_REQUIRE_BANK_KEY=1` to refuse to start instead. The key is never logged or serialized. It is removed from `process.env` after loading.
 - **Inbound** (deposits, bets, withdraw triggers): signed txs from MCP or `/api/tx/submit` are broadcast to minepoa with `POST /api/submit`. They are booked **only once the ledger confirms them** (`POA_DICE_CONFIRM=final` by default: K=5 attestations or checkpoint coverage), using the ledger's copy of the body. Transfers sent straight to the bank with `poa.mjs send` are picked up from the bank's explorer page. Booking is idempotent by txid.
-- **Outbound** (payouts, withdrawals, refunds, dev sweeps): a durable queue. Each order is signed with the bank key and persisted before broadcast. Retries use backoff and rebroadcast the **same** signed tx, so there is no double-pay across retries or restarts. Status goes QUEUED → SIGNED → SENT → CONFIRMED (or FAILED, or WAITING_FUNDS).
+- **Outbound** (payouts, withdrawals, refunds, dev sweeps): a durable queue. Each order is signed with the bank key and persisted before broadcast. Retries use backoff and rebroadcast the **same** signed tx, so there is no double-pay across retries or restarts. Status goes QUEUED → SIGNED → SENT → CONFIRMED (or FAILED, WAITING_FUNDS, or REFUSED_DUPLICATE when the ledger already has a bank payout for that bet).
 - **Solvency:** orders are signed only when the on-chain bank balance covers them. That balance counts final inbound only and subtracts in-flight outbound; see Ledger recovery. `dice_audit_solvency` and `GET /api/audit/chain` compare the internal books with the on-chain balance.
 - **Status:** `GET /api/tx/<txid>/status`, MCP `tx_status`, `GET /api/settlement`, and `settlement` in `/api/state` and `/api/health`.
 - **Wallet balance:** `GET /api/wallet/<poa1 address>/balance` (CORS `*`) and MCP `wallet_balance`. These are read-only and never take a key. The result is cached for 5 s, and checkpoint-covered tx lookups are cached for good. It returns `503` with `retryAfterSeconds` while the minepoa ledger is catching up, and `400` for anything that isn't a `poa1` address, including a pasted private key. The browser version is the PoA key generator's balance checker at https://maximusmaximus.github.io/poa-keygen/check.html.
@@ -197,13 +197,34 @@ When `POA_DICE_WATCHER_MODE` is not `simulated` (the default for `npm start` is 
 ### Storage
 All vault state (the settlement queue **and** the engine's books) is one JSON document, written in order. A payout is broadcast only after its signed body is durable.
 
-- **Vercel / Grok app-builder / any host that recycles instances:** use Redis over REST. Add the Vercel KV (Upstash) integration, or set `KV_REST_API_URL` + `KV_REST_API_TOKEN` (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` also work). The key is `poa-dice:<bankAddress>:vault` (prefix: `POA_DICE_KV_KEY`).
+- **Vercel / Grok app-builder / any host that recycles instances:** use Postgres. Set `POA_DICE_DATABASE_URL` (or `DATABASE_URL` / `POSTGRES_URL`). Postgres is the only hosted store with the single-writer lease, so it is **required for the bank to sign** (see Single bank writer). The key is `poa-dice:<bankAddress>:vault` (prefix: `POA_DICE_KV_KEY`); the binding, claims and lease rows are namespaced by that key.
+- **Redis over REST** (`KV_REST_API_URL` + `KV_REST_API_TOKEN`, or `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`) keeps the vault document but has no lease, so a Redis-backed instance is **read-only**: it never rolls a bet or signs.
 - **VM or container with a persistent volume:** set `POA_DICE_DATA_DIR` to it.
 - **Anything else** (the default `data/` dir, or any file on Vercel) is **ephemeral**. The server goes read-only (`STORAGE_EPHEMERAL`) and advertises no bank address. `POA_DICE_ALLOW_EPHEMERAL=1` overrides this, at your own risk.
 
+### Single bank writer (required to sign)
+Only one server instance may roll bets, book settlement and sign with the bank key. Every other instance (a second copy, a preview deployment, an instance pointed at an empty or older store) is read-only: it serves pages and status, but never rolls, books, claims or signs, and refuses new bets with `503 SIGNER_READ_ONLY`. An instance is the writer only when **all** of these hold:
+
+1. `POA_DICE_BANK_SIGNER=1` is set on it. **Default off: without it the bank key never signs.** Set it for the Production environment only, never for Preview or Development.
+2. It is not a Vercel preview or development deployment (`VERCEL_ENV`, when present, must be `production`).
+3. Its store supports the single-writer lease: Postgres (or a file store on a persistent disk for VM hosts). Redis and ephemeral files are read-only.
+4. The store has a **binding** row for this bank (`store-binding`, created once, see below). A store bound to another bank, or with a `storeId` other than `POA_DICE_STORE_ID` when that is set, is read-only.
+5. It holds the `bank-writer` lease in that store (30 s, renewed every tick). The lease carries a fencing token: on Postgres a vault write lands only while the writer's lease and token are still live, and the lease is re-checked right before each signature.
+6. When it takes the lease, the stored vault document accounts for every bank outflow on the ledger (known to the document, on the ledger before the binding, or acknowledged by an operator). An old copy of the database fails this and reports `STALE_STORE`.
+
+**Binding (one time).** A binding is never created automatically when the bank already has ledger history and the store does not provably hold the live vault: the stored document must already know the bank's newest outgoing transfer (or, with none yet, its newest incoming one). Ways to bind:
+- `POA_DICE_BIND_STORE=<bank address>` on the production instance: it binds at startup if that check passes, then the variable can stay or be removed.
+- `POST /api/admin/store-binding` with `{"bankAddress": "<bank address>"}` (admin token). Add `"recovery": true` only after a real state loss: it binds an empty store, and every bet already on the ledger at that moment is held for review (`LEDGER_ONLY_BET`), never rolled. On a bound store in `STALE_STORE`, `recovery: true` acknowledges the listed outflows so the writer can resume; they still hold trading as foreign outflows until reviewed.
+
+**Bets.** A bet is rolled only if the writer accepted it while bound: a bet that was on the ledger before the binding (and not in the stored vault) is `NEEDS_REVIEW` and listed in `ledgerOnlyBets` in `GET /api/audit/chain`. Each accepted bet stores the server-seed commitment (epoch + hash) it was accepted under; if the seed changed before the roll, the bet is held for review (`SEED_COMMITMENT_CHANGED`) instead of rolled with another seed.
+
+**Payouts.** Before signing a WIN or REFUND, the writer checks the ledger for any bank transfer that references the same bet id (with or without an `:ord=` tag). An identical one is adopted; a different one, or a WIN for a bet booked as a loss, makes the order `REFUSED_DUPLICATE` (listed in `refusedDuplicatePayouts`). The bet is never paid twice.
+
+**Foreign outflows.** A final bank transfer this vault did not create, that either pays a bet or transaction the vault already settled or was signed after the binding, is a **foreign outflow**. It is listed in `/api/health` (`settlement.foreignOutflows`) and the audit (`foreignOutflows`, `foreignOutflowsOk`), and holds bets and withdrawals (`FOREIGN_OUTFLOW_HOLD`; `SOLVENCY_HOLD` wins while the books exceed the on-chain balance). An operator resolves them with `POST /api/admin/foreign-outflows/ack` and `{"txids": [...], "mode": "book_loss"}` (charge them to the bankroll) or `"mode": "reimbursed"` (the funds came back to the bank).
+
 ### Ledger recovery (state lost or never written)
 The minepoa ledger is the source of truth, and every tick rescans the bank address:
-- Address pages on minepoa omit memos, so each bank tx's memo is read from `/api/explorer/tx/<id>`. Every final `DICE1:*` transfer to the bank gets booked once, by txid, even if the vault has no record of it. A lost deposit is credited automatically on the next tick after deploy, with no admin step.
+- Address pages on minepoa omit memos, so each bank tx's memo is read from `/api/explorer/tx/<id>`. Every final `DICE1:*` transfer to the bank gets booked once, by txid, even if the vault has no record of it. After a real state loss the empty store must first be bound with the admin recovery binding (see Single bank writer); the writer then credits lost deposits from the ledger.
 - The bank's own sent txs are indexed by their `:ord=<orderId>` memo tag. An order already paid on chain is adopted and never paid twice.
 - A **bet** older than the vault state is not re-rolled. A new seed could pay an outcome that never happened. It is held as `NEEDS_REVIEW`.
 - **Balance:** the explorer `balance` is the balance at the last checkpoint, which can lag by hours. Spendable funds are computed as the larger of two lower bounds: final inbound minus outbound over the bank's ledger history, or the checkpoint balance minus outbound. In-flight payouts are then subtracted.
@@ -214,7 +235,11 @@ The minepoa ledger is the source of truth, and every tick rescans the bank addre
 |---|---|
 | `POA_DICE_BANK_PRIVKEY` / `POA_DICE_BANK_KEY_FILE` | House bank key (secret). Use a **new dedicated wallet**. |
 | `POA_DICE_BANK_ADDRESS` | Optional: expected bank address (refuses any other key) |
-| `KV_REST_API_URL` + `KV_REST_API_TOKEN` | Durable vault store (Vercel KV / Upstash Redis REST). **Required on Vercel / Grok app-builder.** |
+| `POA_DICE_BANK_SIGNER=1` | **Required for the bank to sign.** Default off (read-only). Production environment only. |
+| `POA_DICE_BIND_STORE` | Bank address: one-time binding of the store at startup (refused unless the store is the live one) |
+| `POA_DICE_STORE_ID` | Optional: the binding's `storeId` this instance must see (from `settlement.writer.binding.storeId`) |
+| `POA_DICE_DATABASE_URL` / `DATABASE_URL` / `POSTGRES_URL` | Postgres vault store. **Required for signing on Vercel / Grok app-builder.** |
+| `KV_REST_API_URL` + `KV_REST_API_TOKEN` | Redis REST vault store (read-only for the bank: no single-writer lease) |
 | `POA_DICE_DATA_DIR` | Persistent state directory (alternative on hosts with a real disk) |
 | `POA_DICE_ALLOW_EPHEMERAL=1` | Run with an ephemeral store anyway (relies on ledger replay; not recommended) |
 | `POA_MINEPOA_TIMEOUT_MS` / `POA_MINEPOA_RETRIES` | minepoa read timeout per attempt (25000) / attempts (3) |

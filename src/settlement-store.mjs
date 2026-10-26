@@ -27,6 +27,15 @@
  *   durable only when POA_DICE_DATA_DIR is set explicitly and the host is not Vercel.
  * - memory: tests only.
  *
+ * Single-writer support (see bank-writer.mjs): postgres, file and memory stores also implement
+ *   peek(key): the claimed value or null (never creates),
+ *   lease(name, holder, ttlMs): {held, holder, token, expiresAt} - one holder at a time; the fencing
+ *     token increases every time the lease changes hands,
+ *   releaseLease(name, holder).
+ * Postgres additionally fences document writes: once setFence({name, holder, token}) is called, a save
+ * only lands while that lease is still held with that token. Redis has no lease support, so a vault on
+ * Redis never signs bank transactions (read-only).
+ *
  * resolveStore() picks one. When the best it can do is an ephemeral file, `durable` is false and the
  * server refuses to take player funds (read-only, STORAGE_EPHEMERAL) unless
  * POA_DICE_ALLOW_EPHEMERAL=1 is set (then the vault relies on ledger replay; see chain-settlement).
@@ -83,8 +92,35 @@ export function createFileStore(dir, name = 'settlement.json') {
     capacityUsed(scope) {
       const f = path.join(dir, 'claims', `cap-${claimFileName(scope)}.json`);
       return fs.existsSync(f) ? capUsed(JSON.parse(fs.readFileSync(f, 'utf8'))) : '0';
+    },
+    peek(key) {
+      const f = path.join(dir, 'claims', `${claimFileName(key)}.json`);
+      return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
+    },
+    lease(name, holder, ttlMs) {
+      return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => leaseBook(book, holder, ttlMs, Date.now()));
+    },
+    releaseLease(name, holder) {
+      return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => {
+        if (book.holder === holder) book.expiresAt = 0;
+      });
     }
   };
+}
+
+/**
+ * Lease state machine shared by the memory and file stores. Free or expired -> taken (token + 1);
+ * held by the same holder -> renewed (same token); held by someone else -> refused.
+ */
+export function leaseBook(book, holder, ttlMs, nowMs) {
+  const live = book.holder && Number(book.expiresAt || 0) > nowMs;
+  if (live && book.holder !== holder) return { held: false, holder: book.holder, token: Number(book.token || 0), expiresAt: Number(book.expiresAt) };
+  if (!live || book.holder !== holder) {
+    book.token = Number(book.token || 0) + 1;
+    book.holder = holder;
+  }
+  book.expiresAt = nowMs + ttlMs;
+  return { held: true, holder, token: book.token, expiresAt: book.expiresAt };
 }
 
 /** Read-modify-write a JSON book under an O_EXCL lock file (single host, many processes). */
@@ -181,6 +217,25 @@ export function createMemoryStore(initial = null, { claims = createClaimTable() 
     },
     capacityUsed(scope) {
       return capUsed(claims.get(`__capacity__:${scope}`) || {});
+    },
+    peek(key) {
+      return claims.has(key) ? JSON.parse(claims.get(key)) : null;
+    },
+    lease(name, holder, ttlMs) {
+      const k = `__lease__:${name}`;
+      const book = claims.has(k) ? JSON.parse(claims.get(k)) : {};
+      const out = leaseBook(book, holder, ttlMs, Date.now());
+      claims.set(k, JSON.stringify(book));
+      return out;
+    },
+    releaseLease(name, holder) {
+      const k = `__lease__:${name}`;
+      if (!claims.has(k)) return;
+      const book = JSON.parse(claims.get(k));
+      if (book.holder === holder) {
+        book.expiresAt = 0;
+        claims.set(k, JSON.stringify(book));
+      }
     },
     kind: 'memory',
     location: 'memory',
@@ -346,6 +401,7 @@ export function createPostgresStore({ connectionString, key, query = null }) {
         await q('CREATE TABLE IF NOT EXISTS poa_dice_claims (key TEXT PRIMARY KEY, value JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())');
         await q('CREATE TABLE IF NOT EXISTS poa_dice_capacity (scope TEXT PRIMARY KEY)');
         await q('CREATE TABLE IF NOT EXISTS poa_dice_reservations (scope TEXT NOT NULL, key TEXT NOT NULL, micros BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (scope, key))');
+        await q('CREATE TABLE IF NOT EXISTS poa_dice_leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)');
       })();
       ready.catch(() => {
         ready = null;
@@ -353,8 +409,12 @@ export function createPostgresStore({ connectionString, key, query = null }) {
     }
     return ready;
   };
+  let fence = null; // {name, holder, token}: document writes only land while this lease is held
   return {
     kind: 'postgres',
+    setFence(f) {
+      fence = f ? { ...f } : null;
+    },
     async: true,
     location: `postgres#${key}`,
     durable: true,
@@ -365,7 +425,46 @@ export function createPostgresStore({ connectionString, key, query = null }) {
     },
     async save(doc) {
       await init();
-      await q('INSERT INTO poa_dice_docs (key, doc, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()', [key, JSON.stringify(doc)]);
+      if (!fence) {
+        await q('INSERT INTO poa_dice_docs (key, doc, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()', [key, JSON.stringify(doc)]);
+        return;
+      }
+      // Fenced write: lands only while our lease (same holder, same token) is still live.
+      const r = await q(
+        'INSERT INTO poa_dice_docs (key, doc, updated_at) SELECT $1, $2::jsonb, now() WHERE EXISTS (SELECT 1 FROM poa_dice_leases WHERE key = $3 AND holder = $4 AND token = $5 AND expires_at > now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now() RETURNING key',
+        [key, JSON.stringify(doc), `${key}:${fence.name}`, fence.holder, String(fence.token)]
+      );
+      if (!r.rows || !r.rows.length) throw new Error('vault write fenced off: this instance no longer holds the bank writer lease');
+    },
+    async peek(claimKey) {
+      await init();
+      const r = await q('SELECT value FROM poa_dice_claims WHERE key = $1', [`${key}:${claimKey}`]);
+      if (!r.rows[0]) return null;
+      const v = r.rows[0].value;
+      return typeof v === 'string' ? JSON.parse(v) : v;
+    },
+    async lease(name, holder, ttlMs) {
+      await init();
+      const lk = `${key}:${name}`;
+      // Take it if free/expired (token + 1), renew if ours (same token), otherwise leave it.
+      const r = await q(
+        `INSERT INTO poa_dice_leases (key, holder, token, expires_at) VALUES ($1, $2, 1, now() + ($3 || ' milliseconds')::interval)
+         ON CONFLICT (key) DO UPDATE SET
+           token = CASE WHEN poa_dice_leases.holder = EXCLUDED.holder AND poa_dice_leases.expires_at > now() THEN poa_dice_leases.token ELSE poa_dice_leases.token + 1 END,
+           holder = EXCLUDED.holder,
+           expires_at = EXCLUDED.expires_at
+         WHERE poa_dice_leases.holder = EXCLUDED.holder OR poa_dice_leases.expires_at <= now()
+         RETURNING holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
+        [lk, holder, String(ttlMs)]
+      );
+      if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: Number(r.rows[0].expires_ms) };
+      const cur = await q("SELECT holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
+      const row = cur.rows[0] || {};
+      return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: Number(row.expires_ms || 0) };
+    },
+    async releaseLease(name, holder) {
+      await init();
+      await q('UPDATE poa_dice_leases SET expires_at = now() WHERE key = $1 AND holder = $2', [`${key}:${name}`, holder]);
     },
     async claim(claimKey, value) {
       await init();

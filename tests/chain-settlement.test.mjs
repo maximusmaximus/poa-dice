@@ -22,7 +22,7 @@ async function boot({ mock, dataDir, bank, env = null, extra = {} }) {
     dataDir,
     watcherMode: 'live',
     nodeUrl: mock.url,
-    bankEnv: env || { POA_DICE_BANK_PRIVKEY: bank.privkey },
+    bankEnv: env || { POA_DICE_BANK_PRIVKEY: bank.privkey, POA_DICE_BANK_SIGNER: '1', POA_DICE_BIND_STORE: bank.address },
     chainCacheMs: 0,
     backoffBaseMs: 5,
     backoffMaxMs: 20,

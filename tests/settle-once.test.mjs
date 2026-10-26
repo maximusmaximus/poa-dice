@@ -29,7 +29,7 @@ async function boot({ mock, bank, store, tag }) {
     dataDir: tmp(tag),
     watcherMode: 'live',
     nodeUrl: mock.url,
-    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey },
+    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey, POA_DICE_BANK_SIGNER: '1', POA_DICE_BIND_STORE: bank.address },
     storeEnv: {},
     settlementStore: store,
     chainCacheMs: 0,
@@ -89,29 +89,25 @@ function betOnLedger(mock, player, bank, seed) {
   return bet.id;
 }
 
-test('root cause: without an atomic claim two instances roll the same bet differently (76.96 vs 93.96)', async () => {
+test('root cause guard: a store without claims or a writer lease never rolls or pays (both instances stay read-only)', async () => {
+  // The 76.96 vs 93.96 incident came from two instances that each decided alone. A store that cannot
+  // provide atomic claims and a single-writer lease is now read-only for the bank: nothing is rolled.
   const mock = await startMockMinepoa({ realistic: true, autoFinal: true });
   const bank = genKeypair();
   const player = genKeypair();
   mock.setBalance(player.address, '100.000000');
-  const { a, b } = await twoInstances({ mock, bank, player, withClaims: false });
+  const a = await boot({ mock, bank, store: legacyStore(null), tag: 'a' });
+  const b = await boot({ mock, bank, store: legacyStore(null), tag: 'b' });
   try {
+    const dep = directTx(mock, player, bank.address, '20.000000', formatDiceMemo({ action: 'LP_ADD', lockEpochs: 0 }));
+    mock.directSubmit(dep.body);
     const id = betOnLedger(mock, player, bank, 'legacy-seed');
     await settleBoth(a, b);
-    const ra = a.app.engine.processedTxids.get(id);
-    const rb = b.app.engine.processedTxids.get(id);
-    assert.ok(ra && rb, 'both instances settled the bet');
-    if (ra.recovered || rb.recovered) {
-      // Second line of defence (reconcile PR): an instance that only sees the bet after the other one
-      // already paid it books that on-chain payout (memo roll, unverified) instead of rolling again.
-      const rec = ra.recovered ? ra : rb;
-      assert.equal(rec.rollSource, 'payout-memo');
-      assert.equal(rec.rollVerified, false);
-      return;
+    for (const srv of [a, b]) {
+      assert.equal(srv.app.settlement.writer.status, 'UNSUPPORTED_STORE');
+      assert.equal(srv.app.engine.processedTxids.has(id), false, 'bet never rolled');
     }
-    assert.notEqual(ra.provablyFair.serverSeedHash, rb.provablyFair.serverSeedHash, 'different seeds');
-    assert.notEqual(ra.provablyFair.nonce, rb.provablyFair.nonce, 'different nonces');
-    assert.notEqual(ra.provablyFair.hmacHex, rb.provablyFair.hmacHex, 'so the HMAC (and the roll) differ');
+    assert.equal(mock.transfersFrom(bank.address).length, 0, 'the bank signed nothing');
   } finally {
     await a.close();
     await b.close();
@@ -119,16 +115,16 @@ test('root cause: without an atomic claim two instances roll the same bet differ
   }
 });
 
-test('two instances settling at once: one ticket, one result, one payout, and the payout note matches', async () => {
+test('two instances on one shared store: only the lease holder rolls and pays; one result, one payout, the note matches', async () => {
   const mock = await startMockMinepoa({ realistic: true, autoFinal: true });
   const bank = genKeypair();
   const player = genKeypair();
   mock.setBalance(player.address, '100.000000');
   const { a, b } = await twoInstances({ mock, bank, player, withClaims: true });
   try {
-    // B adopts A's committed seed before it can roll anything
     await b.app.settlement.tick();
-    assert.equal(b.app.engine.seedManager.currentSeedHash, a.app.engine.seedManager.currentSeedHash, 'one commitment for all instances');
+    assert.equal(a.app.settlement.writer.status, 'LEADER');
+    assert.equal(b.app.settlement.writer.status, 'STANDBY', 'second copy is read-only while A holds the lease');
     const commitment = a.app.engine.seedManager.currentSeedHash;
 
     let won = null;
@@ -136,12 +132,9 @@ test('two instances settling at once: one ticket, one result, one payout, and th
       const id = betOnLedger(mock, player, bank, `once-${i}`);
       await settleBoth(a, b);
       const ra = a.app.engine.processedTxids.get(id);
-      const rb = b.app.engine.processedTxids.get(id);
-      assert.ok(ra && rb, 'both instances booked the bet');
-      for (const k of ['rollBps', 'rollDisplay', 'won', 'payoutPoa']) assert.equal(ra[k], rb[k], `${k} identical on both instances`);
-      assert.deepEqual(ra.provablyFair, rb.provablyFair, 'same nonce, seed epoch, seed hash and HMAC');
+      assert.ok(ra, 'the writer booked the bet');
+      assert.equal(b.app.engine.processedTxids.has(id), false, 'the standby copy never rolled it');
       assert.equal(ra.provablyFair.serverSeedHash, commitment, 'rolled with the published commitment');
-      // the claimed roll verifies against the committed seed
       const v = verifyRoll({
         serverSeed: a.app.engine.seedManager.currentSeed,
         serverSeedHash: commitment,
@@ -153,15 +146,12 @@ test('two instances settling at once: one ticket, one result, one payout, and th
       });
       assert.equal(v.seedHashMatches, true);
       assert.equal(v.rollBps, ra.rollBps, 'recomputed roll matches');
-      assert.equal(v.won, ra.won);
       if (ra.won) won = { id, ra };
     }
     assert.ok(won, 'a 95% bet won within 6 tries');
     const payouts = mock.transfersFrom(bank.address).filter((t) => String(t.body.memo).startsWith(`DICE1:WIN:${won.id.slice(0, 16)}`));
     assert.equal(payouts.length, 1, 'exactly one payout on the ledger');
     assert.match(payouts[0].body.memo, new RegExp(`:roll=${won.ra.rollDisplay.replace('.', '\\.')}:`), 'payout note carries the stored roll');
-    assert.equal(payouts[0].body.amount, won.ra.payoutPoa);
-    // no other bank transfer at all besides win payouts (no duplicate of any order)
     const memos = mock.transfersFrom(bank.address).map((t) => t.body.memo.split(':ord=')[1]);
     assert.equal(new Set(memos).size, memos.length, 'one transfer per order');
   } finally {

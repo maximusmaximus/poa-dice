@@ -105,7 +105,7 @@ async function boot(mock, bank, tag) {
     dataDir: tmp(tag),
     watcherMode: 'live',
     nodeUrl: mock.url,
-    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey },
+    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey, POA_DICE_BANK_SIGNER: '1', POA_DICE_BIND_STORE: bank.address },
     chainCacheMs: 0,
     backoffBaseMs: 5,
     backoffMaxMs: 20,

@@ -25,7 +25,7 @@ async function boot({ mock, bank, store, tag }) {
     dataDir: tmp(tag),
     watcherMode: 'live',
     nodeUrl: mock.url,
-    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey },
+    bankEnv: { POA_DICE_BANK_PRIVKEY: bank.privkey, POA_DICE_BANK_SIGNER: '1', POA_DICE_BIND_STORE: bank.address },
     storeEnv: {},
     settlementStore: store,
     chainCacheMs: 0,
@@ -35,6 +35,9 @@ async function boot({ mock, bank, store, tag }) {
   const info = await app.listen(0, '127.0.0.1');
   app.settlement.client.retryBaseMs = 5;
   await app.settlement.ready();
+  // A rebuilt vault (new, empty store while the bank has ledger history) is never bound automatically:
+  // the operator's one-time admin recovery binding is what lets it rebuild from the ledger.
+  if (tag !== 'live') await app.settlement.bindStore({ via: 'admin', recovery: true });
   let id = 0;
   const mcp = async (name, args = {}) => {
     const r = await fetch(`${info.url}/mcp`, {
@@ -188,18 +191,23 @@ test('idempotent: more ticks and a restart from the rebuilt store never book the
   }
 });
 
-test('two rebuilt instances reconciling at once book the same decision once each (claimed in the store)', async () => {
+test('two rebuilt instances on one shared store: only the lease holder reconciles; the decision is claimed once; never paid again', async () => {
   const h = await liveHistory();
   const claims = createClaimTable();
   const a = await boot({ mock: h.mock, bank: h.bank, store: createMemoryStore(null, { claims }), tag: 'two-a' });
   const b = await boot({ mock: h.mock, bank: h.bank, store: createMemoryStore(null, { claims }), tag: 'two-b' });
   try {
     for (let i = 0; i < 6; i++) await Promise.all([a.app.settlement.tick(), b.app.settlement.tick()]);
-    for (const s of [a, b]) {
-      assert.equal(fromMicros(s.app.engine.bankNavMicros), '9.956395');
-      assert.equal(s.app.engine.processedTxids.get(h.bet.id).payoutTxid, h.payoutTxid);
-      assert.equal(s.app.settlement.tradingHold(), null);
-    }
+    const leaders = [a, b].filter((s) => s.app.settlement.writer.status === 'LEADER');
+    assert.equal(leaders.length, 1, 'exactly one writer');
+    const [w] = leaders;
+    const standby = w === a ? b : a;
+    assert.equal(standby.app.settlement.writer.status, 'STANDBY');
+    assert.equal(fromMicros(w.app.engine.bankNavMicros), '9.956395');
+    assert.equal(w.app.engine.processedTxids.get(h.bet.id).payoutTxid, h.payoutTxid);
+    assert.equal(w.app.settlement.tradingHold(), null);
+    assert.equal(standby.app.engine.processedTxids.has(h.bet.id), false, 'standby copy books nothing');
+    assert.equal(standby.app.settlement.tradingHold().status, 'SIGNER_READ_ONLY');
     assert.ok(claims.has(`reconcile:${h.payoutTxid}`), 'decision claimed once in the shared store');
     assert.equal(h.mock.transfersFrom(h.bank.address).length, 1);
   } finally {
