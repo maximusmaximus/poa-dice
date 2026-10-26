@@ -116,6 +116,9 @@ export class ChainSettlement {
     nonceScanDepth = 12,
     writer = null,
     bindOnBoot = false,
+    onLoadStateChange = null,
+    loadRetryBaseMs = 2000,
+    loadRetryMaxMs = 60000,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -164,29 +167,87 @@ export class ChainSettlement {
     this.ledgerIndexComplete = false;
     this.reconcile = { status: 'PENDING', reason: 'Reconciling the vault with the minepoa ledger (first pass not finished yet)', at: null, inReview: [], recovered: 0, audit: null };
     this.state = { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, ledgerOut: {}, seq: 0, createdAt: Math.floor(now() / 1000) };
-    const loaded = store.load();
+    // Vault load: a store error (e.g. Postgres unreachable or a schema race) is retried on later ticks with
+    // backoff. Until a load succeeds the instance is read-only: tick() does nothing else, the writer never
+    // takes the lease, nothing is booked, rolled or signed. A bank mismatch in the stored document is fatal.
+    this.onLoadStateChange = onLoadStateChange;
+    this.loadRetryBaseMs = loadRetryBaseMs;
+    this.loadRetryMaxMs = loadRetryMaxMs;
+    this.vaultLoad = { status: 'LOADING', attempts: 0, failures: 0, lastError: null, lastErrorAt: null, nextRetryAt: null, loadedAt: null };
+    let loaded;
+    try {
+      loaded = store.load();
+    } catch (err) {
+      loaded = Promise.reject(err);
+    }
     if (loaded && typeof loaded.then === 'function') {
-      this._loadPromise = loaded.then(
-        (doc) => this._applyDoc(doc),
-        (err) => {
-          this.fatalError = `Could not load vault state from ${store.kind}: ${err.message}`;
-          throw new Error(this.fatalError);
-        }
-      );
-      this._loadPromise.catch(() => {});
+      this._loadPromise = this._trackLoad(loaded);
     } else {
+      this.vaultLoad.attempts = 1;
       this._applyDoc(loaded);
+      this._markLoaded();
       this._loadPromise = Promise.resolve();
     }
   }
 
-  /** Resolves once state is loaded from the store (async for KV stores). */
-  ready() {
-    if (this.bindOnBoot && !this._bootBind) {
-      // POA_DICE_BIND_STORE: try the one-time binding as soon as the stored vault is loaded.
-      this._bootBind = this._loadPromise.then(() => this._tryBootBind()).catch(() => {});
+  _markLoaded() {
+    this._loaded = true;
+    this.vaultLoad = { ...this.vaultLoad, status: 'LOADED', nextRetryAt: null, loadedAt: new Date(now()).toISOString() };
+    if (this.onLoadStateChange) this.onLoadStateChange(this.vaultLoad);
+  }
+
+  /** One load attempt: applies the document on success; records the error and the next retry on failure. */
+  _trackLoad(promise) {
+    this.vaultLoad.attempts += 1;
+    this.vaultLoad.status = 'LOADING';
+    const p = Promise.resolve(promise).then(
+      (doc) => {
+        this._applyDoc(doc); // bank mismatch throws here and sets fatalError (never retried)
+        this._markLoaded();
+      },
+      (err) => {
+        const msg = `Could not load vault state from ${this.store.kind}: ${err && err.message ? err.message : err}`;
+        this.vaultLoad.failures += 1;
+        const delay = Math.min(this.loadRetryMaxMs, this.loadRetryBaseMs * 2 ** Math.min(10, this.vaultLoad.failures - 1));
+        this.vaultLoad = { ...this.vaultLoad, status: 'FAILED', lastError: msg, lastErrorAt: new Date(now()).toISOString(), nextRetryAt: now() + delay };
+        this.lastError = msg;
+        this.lastErrorAt = now();
+        if (this.onLoadStateChange) this.onLoadStateChange(this.vaultLoad);
+        throw new Error(msg);
+      }
+    );
+    p.catch(() => {});
+    return p;
+  }
+
+  /** Retry a failed load (called from tick() once the backoff has passed). */
+  _retryLoad() {
+    let loaded;
+    try {
+      loaded = this.store.load();
+    } catch (err) {
+      loaded = Promise.reject(err);
     }
-    return this._bootBind ? this._loadPromise.then(() => this._bootBind) : this._loadPromise;
+    this._loadPromise = this._trackLoad(loaded);
+    return this._loadPromise;
+  }
+
+  /** Load status for health: {status LOADING|LOADED|FAILED, attempts, failures, lastError, nextRetryAt}. */
+  loadView() {
+    const v = this.vaultLoad;
+    return { ...v, nextRetryAt: v.nextRetryAt ? new Date(v.nextRetryAt).toISOString() : null, retries: Math.max(0, v.attempts - 1) };
+  }
+
+  /** Resolves once state is loaded from the store (async for KV stores); rejects while the latest attempt failed. */
+  ready() {
+    const p = this._loadPromise;
+    if (!this.bindOnBoot) return p;
+    // POA_DICE_BIND_STORE: try the one-time binding as soon as the stored vault is loaded (also after a
+    // delayed load; tick() retries the binding on later ticks as well).
+    return p.then(() => {
+      if (!this._bootBind) this._bootBind = this._tryBootBind().catch(() => {});
+      return this._bootBind;
+    });
   }
 
   async _tryBootBind() {
@@ -316,6 +377,10 @@ export class ChainSettlement {
    * opts.groupId: batch id (batch.completed fires once every member resolves).
    */
   async submitInbound(txEnvelope, { reserve = null, groupId = null, coverage = null } = {}) {
+    if (!this._loaded) await this.tick().catch(() => {});
+    if (!this._loaded) {
+      throw Object.assign(new Error(`${this.tradingHold().reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY' });
+    }
     await this.ready();
     const { body, txid, parsed } = this._validateInbound(txEnvelope);
     // Only the bank writer takes new money-moving txs (it is the one that will settle them).
@@ -1270,6 +1335,7 @@ export class ChainSettlement {
    */
   async bindStore({ via = 'admin', recovery = false } = {}) {
     if (!this.writer.enabled) throw new Error('POA_DICE_BANK_SIGNER is not 1 on this instance');
+    if (!this._loaded) throw new Error('the vault state is not loaded yet; binding waits for a successful load');
     if (!this.writer.supportsLease()) throw new Error('this vault store has no single-writer lease (use Postgres)');
     const existing = await this.store.peek(BINDING_KEY);
     if (existing) {
@@ -1693,8 +1759,24 @@ export class ChainSettlement {
   tick() {
     if (this._tickPromise) return this._tickPromise;
     this._tickPromise = (async () => {
+      // Yield first: an early return must not run `finally` before this._tickPromise is assigned
+      // (that would leave a settled promise in place and block every later tick).
+      await null;
       this._tickErrors = [];
       try {
+        if (this.fatalError) return;
+        if (!this._loaded) {
+          // Fail closed: nothing but the load is attempted until the vault document is loaded.
+          if (this.vaultLoad.status === 'LOADING') {
+            await this._loadPromise.catch(() => {});
+            if (!this._loaded) return;
+          } else if (this.vaultLoad.nextRetryAt && now() < this.vaultLoad.nextRetryAt) {
+            return;
+          } else {
+            await this._retryLoad().catch(() => {});
+            if (!this._loaded) return;
+          }
+        }
         await this.ready();
         if (this.ledgerProbe) await this.ledgerProbe.maybeProbe().catch(() => {});
         let leader = await this.writer.refresh();
@@ -1920,6 +2002,7 @@ export class ChainSettlement {
    * RECONCILING / SOLVENCY_HOLD (books vs ledger) take precedence over LEDGER_UNAVAILABLE.
    */
   tradingHold() {
+    if (!this._loaded) return { status: 'SIGNER_READ_ONLY', reason: `Vault state is not loaded yet (${this.vaultLoad.lastError || 'loading'}). Read-only until a load succeeds; retried automatically.`, writer: 'VAULT_NOT_LOADED' };
     const wh = this.writer.hold();
     if (wh) return wh;
     if (this.reconcile && this.reconcile.status !== 'OK') {
@@ -2149,6 +2232,7 @@ export class ChainSettlement {
     return {
       mode: 'chain',
       bankAddress: this.bankAddress,
+      vaultLoad: this.loadView(),
       confirmPolicy: this.confirmPolicy,
       store: this.store.kind,
       storeDurable: this.store.durable !== false,

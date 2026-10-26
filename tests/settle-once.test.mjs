@@ -178,7 +178,7 @@ test('claim adapters: memory, file (O_EXCL) and postgres (ON CONFLICT DO NOTHING
   const rows = new Map();
   const docs = new Map();
   const query = async (sql, params) => {
-    if (/^CREATE TABLE/.test(sql)) return { rows: [] };
+    if (/^CREATE TABLE/.test(sql) || /pg_advisory_xact_lock|pg_catalog.pg_tables/.test(sql)) return { rows: [] };
     if (/INSERT INTO poa_dice_claims/.test(sql)) {
       if (rows.has(params[0])) return { rows: [] };
       rows.set(params[0], JSON.parse(params[1]));

@@ -357,6 +357,22 @@ return tostring(used)`;
  * The vault document lives in poa_dice_docs; claims in poa_dice_claims (primary key = claim key), so
  * INSERT ... ON CONFLICT DO NOTHING RETURNING is the atomic arbiter across instances.
  */
+// Schema for the Postgres store (all idempotent). Setup is serialized with a fixed advisory lock key.
+export const PG_SCHEMA_LOCK_KEY = '5778343729120067585'; // fixed bigint, same for every instance
+export const PG_TABLES = ['poa_dice_docs', 'poa_dice_claims', 'poa_dice_capacity', 'poa_dice_reservations', 'poa_dice_leases'];
+const PG_SCHEMA = [
+  'CREATE TABLE IF NOT EXISTS poa_dice_docs (key TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())',
+  'CREATE TABLE IF NOT EXISTS poa_dice_claims (key TEXT PRIMARY KEY, value JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())',
+  'CREATE TABLE IF NOT EXISTS poa_dice_capacity (scope TEXT PRIMARY KEY)',
+  'CREATE TABLE IF NOT EXISTS poa_dice_reservations (scope TEXT NOT NULL, key TEXT NOT NULL, micros BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (scope, key))',
+  'CREATE TABLE IF NOT EXISTS poa_dice_leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)'
+];
+
+/** Postgres "it already exists" races during CREATE ... IF NOT EXISTS: unique_violation (pg_type/pg_class), duplicate_table, duplicate_object. */
+export function isPgAlreadyExists(err) {
+  return Boolean(err) && ['23505', '42P07', '42710'].includes(String(err.code || ''));
+}
+
 export function createPostgresStore({ connectionString, key, query = null }) {
   if (!query && !connectionString) throw new Error('Postgres store needs a connection string');
   let pool = null;
@@ -367,6 +383,8 @@ export function createPostgresStore({ connectionString, key, query = null }) {
       const pg = await import('pg');
       const Pool = pg.Pool || pg.default.Pool;
       pool = new Pool({ connectionString, max: 3, ssl: /sslmode=disable|localhost|127\.0\.0\.1/.test(connectionString) ? false : { rejectUnauthorized: false } });
+      // An idle connection dropped by the server must not crash the process; the next query reconnects.
+      pool.on('error', () => {});
     }
     return pool;
   };
@@ -397,11 +415,21 @@ export function createPostgresStore({ connectionString, key, query = null }) {
   const init = () => {
     if (!ready) {
       ready = (async () => {
-        await q('CREATE TABLE IF NOT EXISTS poa_dice_docs (key TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())');
-        await q('CREATE TABLE IF NOT EXISTS poa_dice_claims (key TEXT PRIMARY KEY, value JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())');
-        await q('CREATE TABLE IF NOT EXISTS poa_dice_capacity (scope TEXT PRIMARY KEY)');
-        await q('CREATE TABLE IF NOT EXISTS poa_dice_reservations (scope TEXT NOT NULL, key TEXT NOT NULL, micros BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (scope, key))');
-        await q('CREATE TABLE IF NOT EXISTS poa_dice_leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)');
+        // Concurrent first boot (two instances creating the same new table at once) can make Postgres raise
+        // a unique violation on pg_type even with IF NOT EXISTS. All schema statements run in one
+        // transaction behind a fixed advisory lock, and an "already exists" race is treated as success
+        // once every table is verified to exist.
+        try {
+          await tx(async (tq) => {
+            await tq('SELECT pg_advisory_xact_lock($1)', [PG_SCHEMA_LOCK_KEY]);
+            for (const sql of PG_SCHEMA) await tq(sql);
+          });
+        } catch (err) {
+          if (!isPgAlreadyExists(err)) throw err;
+        }
+        const r = await q('SELECT count(*)::int AS n FROM pg_catalog.pg_tables WHERE tablename = ANY($1::text[])', [PG_TABLES]);
+        const n = r && r.rows && r.rows[0] ? Number(r.rows[0].n) : null;
+        if (n !== null && n !== PG_TABLES.length) throw new Error(`Postgres schema incomplete: ${n} of ${PG_TABLES.length} poa_dice tables exist`);
       })();
       ready.catch(() => {
         ready = null;
@@ -412,6 +440,14 @@ export function createPostgresStore({ connectionString, key, query = null }) {
   let fence = null; // {name, holder, token}: document writes only land while this lease is held
   return {
     kind: 'postgres',
+    async close() {
+      if (pool) {
+        const p = pool;
+        pool = null;
+        ready = null;
+        await p.end().catch(() => {});
+      }
+    },
     setFence(f) {
       fence = f ? { ...f } : null;
     },
