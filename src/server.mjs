@@ -33,6 +33,7 @@ import { ChainSettlement } from './chain-settlement.mjs';
 import { BankWriter } from './bank-writer.mjs';
 import { LedgerProbe, LEDGER_HOLD } from './ledger-probe.mjs';
 import { DEFAULT_CHAIN_ID, MinepoaClient } from './minepoa-client.mjs';
+import { PoaScanClient } from './poascan-client.mjs';
 import { resolveStore } from './settlement-store.mjs';
 import {
   fetchExplorerAddress,
@@ -211,6 +212,14 @@ export function createDiceServer(options = {}) {
             payoutRetryMaxMs: options.payoutRetryMaxMs ?? 30000,
             trustedBalanceMaxAgeMs: options.trustedBalanceMaxAgeMs ?? (Number(signerEnv.POA_DICE_TRUSTED_BALANCE_MAX_AGE_MS) || 10 * 60 * 1000),
             bindOnBoot: bindTarget === key.wallet.address,
+            // Independent ledger index for the admin re-pay checks: POAScan on mainnet unless set or disabled.
+            indexer:
+              options.indexer !== undefined
+                ? options.indexer || null
+                : (() => {
+                    const url = options.poascanUrl ?? signerEnv.POA_DICE_POASCAN_URL ?? (/^https:\/\/(www\.)?minepoa\.com\/?$/.test(String(client.nodeUrl || '')) ? 'https://poascan.io' : '');
+                    return url && url !== 'off' ? new PoaScanClient({ baseUrl: url, fetchImpl: options.poascanFetch || globalThis.fetch }) : null;
+                  })(),
             engine,
             watcher,
             client,

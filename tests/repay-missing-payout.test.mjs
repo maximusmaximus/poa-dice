@@ -28,7 +28,7 @@ const tmp = (t) => fs.mkdtempSync(path.join(os.tmpdir(), `poa-dice-repay-${t}-`)
 const ts = () => Math.floor(Date.now() / 1000);
 const tx = (mock, wallet, to, amount, memo, nonce = null) => buildSignedTransfer({ wallet, to, amount, memo, nonce: nonce ?? mock.nextNonce(wallet.address), parents: mock.parents(), ts: ts() });
 
-async function boot({ mock, bank, store, tag }) {
+async function boot({ mock, bank, store, tag, indexer }) {
   const app = createDiceServer({
     dataDir: tmp(tag),
     watcherMode: 'live',
@@ -40,6 +40,7 @@ async function boot({ mock, bank, store, tag }) {
     backoffBaseMs: 5,
     backoffMaxMs: 20,
     adminToken: ADMIN,
+    indexer,
     cronSecret: 'repay-test-cron',
     passMode: true,
     passEveryMs: 100,
@@ -66,6 +67,33 @@ async function boot({ mock, bank, store, tag }) {
   return { app, s: app.settlement, pass, req, repay, close: () => app.close() };
 }
 
+/**
+ * Stand-in for POAScan (the independent index): answers from the mock ledger's true state, so a body the
+ * mock never accepted is "not found" and a landed tx is found even when minepoa's explorer hides it.
+ * `mode`: 'ok' | 'busy' (every call throws) ; `extra[addr]` adds rows to an address history.
+ */
+function fakeIndexer(mock) {
+  const ix = {
+    name: 'POAScan',
+    mode: 'ok',
+    extra: {},
+    calls: 0,
+    async lookupTx(id) {
+      ix.calls += 1;
+      if (ix.mode === 'busy') throw new Error('POAScan /api/v1/tx -> HTTP 429 upstream budget spent');
+      const t = mock.tx(id);
+      return t ? { found: true, tx: { id, from: t.body.from, to: t.body.to, amount: t.body.amount, memo: t.body.memo, nonce: t.body.nonce, final: true, atts: 8, checkpointHeight: 63150 } } : { found: false };
+    },
+    async addressTxs(addr) {
+      if (ix.mode === 'busy') throw new Error('POAScan history -> HTTP 503');
+      const rows = [];
+      for (const t of mock.transfersFrom(addr)) rows.push({ id: t.id, from: t.body.from, to: t.body.to, amount: t.body.amount, memo: t.body.memo, final: true });
+      return rows.concat(ix.extra[addr] || []);
+    }
+  };
+  return ix;
+}
+
 /** Bank with three LPs: p 500, q 20 (the player whose payout went missing), r 30 (whose payout used the nonce). */
 async function setup(tag) {
   const mock = await startMockMinepoa({ realistic: true, autoFinal: true });
@@ -77,7 +105,8 @@ async function setup(tag) {
   mock.setBalance(q.address, '100.000000');
   mock.setBalance(r.address, '100.000000');
   const store = createMemoryStore(null);
-  const a = await boot({ mock, bank, store, tag: `${tag}-a` });
+  const indexer = fakeIndexer(mock);
+  const a = await boot({ mock, bank, store, tag: `${tag}-a`, indexer });
   for (const [w, amt] of [[p, '500.000000'], [q, '20.000000'], [r, '30.000000']]) mock.directSubmit(tx(mock, w, bank.address, amt, formatDiceMemo({ action: 'LP_ADD', lockEpochs: 0 })).body);
   mock.finalizeAll();
   await a.pass(3);
@@ -89,6 +118,7 @@ async function setup(tag) {
   };
   return {
     mock,
+    indexer,
     bank,
     p,
     q,
@@ -97,7 +127,7 @@ async function setup(tag) {
     a,
     withdraw,
     boot: async (t) => {
-      const x = await boot({ mock, bank, store, tag: `${tag}-${t}` });
+      const x = await boot({ mock, bank, store, tag: `${tag}-${t}`, indexer });
       nodes.push(x);
       return x;
     },
@@ -463,6 +493,139 @@ test('/api/health, /api/settlement and /api/audit/chain report the same bank bal
     const diff = Math.round((Number(au.ledgerBalancePoa) - Number(au.onChainBalancePoa)) * 1e6);
     assert.equal(diff, Math.round(Number(rec.amountPoa) * 1e6));
     assert.equal(h.bankBalance.ledgerBalancePoa, au.ledgerBalancePoa);
+  } finally {
+    await c.close();
+  }
+});
+
+// ─── 7. the "original txid unknown" check needs an independent answer (fix/repay-independent-notfound) ──
+
+const explorerBusyFor = (s, id) => {
+  const real = s.client.getTx.bind(s.client);
+  s.client.getTx = async (x) => {
+    if (x === id) throw new Error(`minepoa /api/explorer/tx/${x} -> HTTP 503 busy: origin busy`);
+    return real(x);
+  };
+};
+const origCheck = (body) => body.checks.find((x) => x.name === 'explorer: original txid unknown');
+
+test('live case: minepoa explorer busy and its listings omit a payout that landed; POAScan has it => refused, never paid twice', async () => {
+  const c = await setup('ps-found');
+  try {
+    c.withdraw(c.q);
+    await c.a.pass(4);
+    const rec = orderTo(c.a.s, c.q.address);
+    const landed = c.mock.tx(rec.txid);
+    markReceiptConfirmed(c.store, rec.orderId, { txid: rec.txid, body: landed.body, nonce: landed.body.nonce });
+    c.mock.hide(rec.txid);
+    const s = c.a.s;
+    const realRecent = s.client.getRecentTransfers.bind(s.client);
+    s.client.getRecentTransfers = async (n) => {
+      const m = await realRecent(n);
+      m.delete(rec.txid);
+      return m;
+    };
+    const doc = c.store.load();
+    delete doc.ledgerOut[rec.txid];
+    doc.savedAt = Date.now();
+    c.store.save(doc);
+    explorerBusyFor(s, rec.txid);
+    let r = await c.a.repay({ orderId: rec.orderId });
+    assert.equal(r.body.eligible, false, JSON.stringify(r.body.checks));
+    assert.match(r.body.refusal, /POAScan has the original payout txid/);
+    const chk = origCheck(r.body);
+    assert.equal(chk.ok, false);
+    assert.match(chk.detail, /minepoa: no answer .*origin busy/);
+    assert.match(chk.detail, /POAScan HAS/);
+    r = await c.a.repay({ orderId: rec.orderId, confirm: true });
+    assert.equal(r.status, 409);
+    assert.equal(c.store.peek(`repay:${rec.orderId}`), null);
+    await c.a.pass(2);
+    assert.equal(payoutsTo(c.mock, c.bank, c.q.address).length, 1, 'never paid twice');
+  } finally {
+    await c.close();
+  }
+});
+
+test('minepoa explorer busy, POAScan definitely not found and absent from both histories => eligible; the detail names the source', async () => {
+  const c = await setup('ps-notfound');
+  try {
+    const { rec } = await missingPayout(c);
+    explorerBusyFor(c.a.s, rec.txid);
+    const r = await c.a.repay({ orderId: rec.orderId });
+    assert.equal(r.body.eligible, true, JSON.stringify(r.body.checks));
+    const chk = origCheck(r.body);
+    assert.equal(chk.ok, true);
+    assert.match(chk.detail, /^POAScan: not found \(definite 404\); absent from POAScan bank history \(\d+ txs\) and recipient history \(\d+ txs\); minepoa: no answer/);
+  } finally {
+    await c.close();
+  }
+});
+
+test('refuses when no independent source answers: POAScan busy, or no index configured (minepoa "not found" alone never passes)', async () => {
+  const c = await setup('ps-busy');
+  try {
+    const { rec } = await missingPayout(c);
+    explorerBusyFor(c.a.s, rec.txid);
+    c.indexer.mode = 'busy';
+    let r = await c.a.repay({ orderId: rec.orderId });
+    assert.equal(r.body.eligible, false);
+    assert.match(r.body.refusal, /POAScan could not answer/);
+    assert.match(origCheck(r.body).detail, /POAScan: no answer/);
+    r = await c.a.repay({ orderId: rec.orderId, confirm: true });
+    assert.equal(r.status, 409);
+    // minepoa itself says "not found", but there is no independent index
+    c.indexer.mode = 'ok';
+    c.a.s.indexer = null;
+    c.a.s.client.getTx = async () => null;
+    r = await c.a.repay({ orderId: rec.orderId });
+    assert.equal(r.body.eligible, false);
+    assert.match(r.body.refusal, /no independent source/);
+    assert.match(origCheck(r.body).detail, /minepoa: not found; no independent index/);
+    assert.equal(c.store.peek(`repay:${rec.orderId}`), null);
+    await c.a.pass(2);
+    assert.equal(payoutsTo(c.mock, c.bank, c.q.address).length, 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test('POAScan not found, but its recipient history lists the txid or a bank transfer tagged for the order => refused', async () => {
+  const c = await setup('ps-hist');
+  try {
+    const { rec } = await missingPayout(c);
+    c.indexer.extra[rec.to] = [{ id: rec.txid, from: c.bank.address, to: rec.to, amount: rec.amountPoa, memo: rec.memo, final: true }];
+    let r = await c.a.repay({ orderId: rec.orderId });
+    assert.equal(r.body.eligible, false);
+    assert.match(r.body.refusal, /POAScan lists the original payout in the recipient's history/);
+    const other = 'ab'.repeat(32);
+    c.indexer.extra[rec.to] = [{ id: other, from: c.bank.address, to: rec.to, amount: rec.amountPoa, memo: `DICE1:X:ord=${rec.orderId.slice(0, 12)}`, final: true }];
+    r = await c.a.repay({ orderId: rec.orderId });
+    assert.equal(r.body.eligible, false);
+    assert.match(r.body.refusal, /already tagged for this order/);
+  } finally {
+    await c.close();
+  }
+});
+
+test('top-level onChainBankBalancePoa always equals bankBalance.balance, also on an instance that reads the writer status', async () => {
+  const c = await setup('toplevel');
+  try {
+    await missingPayout(c);
+    const b = await c.boot('b');
+    await b.pass(1);
+    const realFresh = b.s._sharedFresh.bind(b.s);
+    b.s._sharedFresh = () => true;
+    b.s.shared = { ...(b.s.shared || {}), onChainBankBalancePoa: '999.000000' };
+    for (const x of [c.a, b]) {
+      const h = (await x.req('/api/health')).body.settlement;
+      const st = (await x.req('/api/settlement')).body;
+      assert.ok(h.bankBalance, 'bank balance read');
+      assert.equal(h.onChainBankBalancePoa, h.bankBalance.balance);
+      assert.equal(st.onChainBankBalancePoa, st.bankBalance.balance);
+      assert.notEqual(h.onChainBankBalancePoa, '999.000000');
+    }
+    b.s._sharedFresh = realFresh;
   } finally {
     await c.close();
   }

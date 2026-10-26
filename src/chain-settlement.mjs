@@ -133,12 +133,15 @@ export class ChainSettlement {
     rebroadcastAfterMs = 60000,
     payoutRetryMaxMs = 30000,
     trustedBalanceMaxAgeMs = 10 * 60 * 1000,
+    indexer = null,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
     this.engine = engine;
     this.watcher = watcher;
     this.client = client;
+    // Independent index of the ledger (POAScan, see poascan-client.mjs); the re-pay check needs its answer.
+    this.indexer = indexer;
     Object.defineProperty(this, 'bankWallet', { value: bankWallet, enumerable: false });
     this.bankAddress = bankWallet.address;
     this.store = store;
@@ -2279,17 +2282,61 @@ export class ChainSettlement {
     add('no other payout or refund for the same bet', !dup, dup ? `${dup.txid.slice(0, 16)}: ${dup.why}` : 'none');
     if (dup) return done(`the ledger already has ${dup.txid.slice(0, 16)} for this bet (${dup.why})`);
 
-    // 3. the explorer must say the original txid does not exist (an error or busy answer refuses)
-    let orig;
+    // 3. the original txid must be definitely unknown. minepoa's read node is asked, but its "not found"
+    //    alone never passes: it has answered "not in segments" / "origin busy" for, and omitted from address
+    //    pages, a payout that was final and checkpointed. An independent index (POAScan) must answer a
+    //    definite not-found, and must not list the txid (or any transfer tagged for this order) in the bank's
+    //    or the recipient's history. Any error, busy or ambiguous answer refuses.
+    const NAME = 'explorer: original txid unknown';
+    let mp;
     try {
-      orig = await this.client.getTx(rec.txid);
+      mp = (await this.client.getTx(rec.txid)) ? 'found' : 'not found';
     } catch (err) {
-      orig = undefined;
-      add('explorer: original txid unknown', false, `explorer could not answer (${String(err.message || err).slice(0, 120)})`);
-      return done('the minepoa explorer could not answer for the original txid');
+      mp = `no answer (${String(err.message || err).slice(0, 160)})`;
     }
-    add('explorer: original txid unknown', orig === null, orig ? `explorer has ${rec.txid.slice(0, 16)}${orig.invalid ? ' (invalid)' : ''}` : 'not found');
-    if (orig) return done('the minepoa explorer knows the original payout txid');
+    if (mp === 'found') {
+      add(NAME, false, `minepoa explorer has ${rec.txid.slice(0, 16)}`);
+      return done('the minepoa explorer knows the original payout txid');
+    }
+    const ix = this.indexer;
+    if (!ix) {
+      add(NAME, false, `minepoa: ${mp}; no independent index (POAScan) configured, and minepoa alone cannot prove a tx was dropped`);
+      return done('no independent source could confirm the original txid is unknown');
+    }
+    const src = ix.name || 'POAScan';
+    let look;
+    try {
+      look = await ix.lookupTx(rec.txid);
+    } catch (err) {
+      add(NAME, false, `minepoa: ${mp}; ${src}: no answer (${String(err.message || err).slice(0, 100)})`);
+      return done(`${src} could not answer for the original txid, and minepoa alone cannot prove it was dropped`);
+    }
+    if (look.found) {
+      const t = look.tx || {};
+      const how = [t.final ? 'final' : 'not final', t.atts ? `${t.atts} atts` : null, t.checkpointHeight ? `in checkpoint h${t.checkpointHeight}` : null, t.nonce != null ? `nonce ${t.nonce}` : null].filter(Boolean).join(', ');
+      add(NAME, false, `minepoa: ${mp}; ${src} HAS ${rec.txid.slice(0, 16)} (${how}${t.amount ? `, ${t.amount} POA to ${t.to}` : ''})`);
+      return done(`${src} has the original payout txid${t.final ? ' as final' : ''}: the payout reached the ledger, so it must not be paid again`);
+    }
+    const hist = {};
+    for (const [label, addr] of [['bank', this.bankAddress], ['recipient', rec.to]]) {
+      try {
+        hist[label] = await ix.addressTxs(addr);
+      } catch (err) {
+        add(NAME, false, `minepoa: ${mp}; ${src} tx lookup: not found; ${src} ${label} history unreadable (${String(err.message || err).slice(0, 80)})`);
+        return done(`could not read the ${label}'s history from ${src}`);
+      }
+      const lid = String(rec.txid).toLowerCase();
+      if (hist[label].some((t) => t.id === lid)) {
+        add(NAME, false, `minepoa: ${mp}; ${src} lists ${rec.txid.slice(0, 16)} in the ${label}'s history`);
+        return done(`${src} lists the original payout in the ${label}'s history`);
+      }
+      const tagged = hist[label].filter((t) => t.from === this.bankAddress && t.to === rec.to && String(t.memo || '').includes(`:ord=${tag}`));
+      if (tagged.length) {
+        add(NAME, false, `minepoa: ${mp}; ${src} lists bank transfer ${tagged[0].id.slice(0, 16)} tagged ord=${tag} in the ${label}'s history`);
+        return done(`${src} lists a bank transfer already tagged for this order`);
+      }
+    }
+    add(NAME, true, `${src}: not found (definite 404); absent from ${src} bank history (${hist.bank.length} txs) and recipient history (${hist.recipient.length} txs); minepoa: ${mp}`);
 
     // 4. the recipient's own history: not the original, and no bank transfer of this amount tagged for the order
     let rrow;
@@ -3459,7 +3506,8 @@ export class ChainSettlement {
       lastGoodTick: this.lastGoodTick ? new Date(this.lastGoodTick).toISOString() : null,
       lastError: this.lastError,
       lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
-      onChainBankBalancePoa: fromWriter ? fromWriter.onChainBankBalancePoa : bal?.onChainBankBalancePoa ?? this.lastBankBalance?.balance ?? null,
+      // The same figure as bankBalance.balance (and the chain audit): never a different read.
+      onChainBankBalancePoa: bal?.onChainBankBalancePoa ?? this.lastBankBalance?.balance ?? (fromWriter ? fromWriter.onChainBankBalancePoa : null) ?? null,
       bankBalance: this.lastBankBalance ? { ...this.lastBankBalance, ...(bal ? { ...bal, balance: bal.onChainBankBalancePoa } : {}) } : null,
       stuckPayouts: this.stuckPayouts(),
       writer: this.writer.view(),
