@@ -159,6 +159,8 @@ export class ChainSettlement {
     this.bindOnBoot = Boolean(bindOnBoot);
     this._leaderToken = null; // fencing token the in-memory state was (re)loaded under
     this.foreign = []; // bank outflows this vault did not create (see _foreignOutflows)
+    this._ordVerdict = new Map(); // txid -> false: a tagged bank outflow that does NOT match its order (held)
+    this._takeoverMatches = []; // outflows the stored document did not know, explained by an order on takeover
     // Serverless: many instances share one Postgres vault. The bank writer (lease holder) publishes its
     // status every tick; every other instance reads it and refuses bets when it is older than this.
     this.leaderStatusMaxAgeMs = leaderStatusMaxAgeMs; // bets need a good settlement pass at most this old
@@ -362,12 +364,26 @@ export class ChainSettlement {
     this.engine._syncLocked();
   }
 
+  /** Queue the vault document for writing. Returns false (and writes nothing) when this instance may not write. */
   _save() {
-    if (!this._loaded) return; // never overwrite stored state with a pre-load blank
-    if (!this.writer.canWrite()) return; // read-only instances never write the shared vault document
+    if (!this._loaded) return false; // never overwrite stored state with a pre-load blank
+    if (!this.writer.canWrite()) return false; // read-only instances never write the shared vault document
     this.state.engine = this.engine.serializeState();
     this.state.savedAt = now();
     this._persist.save(this.state);
+    return true;
+  }
+
+  /**
+   * Write-ahead for a payout: its signed body (txid, nonce) must be durable in the vault document BEFORE it
+   * can leave the box. Renews the writer lease first (a long pass can get within seconds of the lease expiry,
+   * where _save() is a silent no-op) and throws when the document could not be written, so the caller never
+   * broadcasts a payout the store does not know about.
+   */
+  async _writeAhead(rec) {
+    await this.writer.assertLeader();
+    if (!this._save()) throw new Error(`payout ${rec.orderId}: write-ahead not saved (this instance is not the bank writer right now)`);
+    await this.flush();
   }
 
   /** Wait until everything saved so far is durable (KV stores write asynchronously). */
@@ -1373,7 +1389,7 @@ export class ChainSettlement {
     if (pendingSigned) {
       if (now() < pendingSigned.nextAttemptAt) return;
       try {
-        await this.flush(); // its signed body must be durable before it can leave the box
+        await this._writeAhead(pendingSigned); // its signed body must be durable before it can leave the box
       } catch (err) {
         this._tickErrors.push(`store: ${err.message}`);
         return;
@@ -1391,6 +1407,16 @@ export class ChainSettlement {
       if (rec.status !== 'QUEUED' && rec.status !== 'WAITING_FUNDS') continue;
       // Already paid on chain (e.g. state was lost and the inbound replayed): adopt, never pay twice.
       const paid = tagged.get(rec.orderId.slice(0, 12));
+      if (paid && !claimed.has(paid) && !this._ordFits(paid, this.state.ledgerOut[paid])) {
+        // The ledger has a bank transfer tagged for this order that does not match it: never paid again
+        // automatically; the transfer is held as a foreign outflow for an operator.
+        const why = rec.ordConflict?.why || `bank transfer ${paid.slice(0, 16)} on the ledger is tagged for this order but does not match it`;
+        if (rec.lastError !== `not paid: ${why}`) {
+          rec.lastError = `not paid: ${why}`;
+          this._save();
+        }
+        continue;
+      }
       if (paid && !claimed.has(paid)) {
         rec.txid = paid;
         rec.recoveredFromLedger = true;
@@ -1501,9 +1527,8 @@ export class ChainSettlement {
       rec.status = 'SIGNED';
       rec.signedAt = now();
       rec.nonceRule = null;
-      this._save(); // write-ahead: the txid is durable before anything leaves the box
       try {
-        await this.flush();
+        await this._writeAhead(rec); // the txid is durable before anything leaves the box
       } catch (err) {
         this._tickErrors.push(`store: ${err.message}`);
         return; // stays SIGNED; rebroadcast (same txid) once the store is writable
@@ -1748,6 +1773,7 @@ export class ChainSettlement {
    * Returns the unaccounted outflow ids, or undefined when minepoa cannot answer.
    */
   async _unaccountedOutflows(doc) {
+    this._takeoverMatches = [];
     let row;
     try {
       row = await this.client.getAddress(this.bankAddress);
@@ -1757,14 +1783,37 @@ export class ChainSettlement {
     const known = ChainSettlement.docKnownIds(doc).out;
     const attested = new Set(Object.keys(doc?.attestedOutflows || {}));
     const missing = [];
+    const matches = [];
+    let memos = null;
     for (const t of row.txs || []) {
       if (!t || !t.id || t.from !== this.bankAddress) continue;
       if (known.has(t.id) || attested.has(t.id)) continue;
       if (!Array.isArray(this.writer.binding?.priorLedgerIds)) continue; // binding row without an id list: nothing to judge by
       if (this._preBinding(t.id, t.ts)) continue;
+      // A payout of an open order in this document that the pass which sent it did not get to save (cut off):
+      // explained by our own payout claim (same txid) or by its `:ord=` tag + recipient + exact amount.
+      const ex = await this._explainByOrder(doc, t, async () => (memos === null ? (memos = await this._recentMemos()) : memos));
+      if (ex === undefined) return undefined; // minepoa or the store could not answer: retried, never guessed
+      if (ex && !matches.some((x) => x.orderId === ex.orderId)) {
+        matches.push({ ...ex, txid: t.id, final: Boolean(t.final) });
+        continue;
+      }
       missing.push(t.id);
     }
+    this._takeoverMatches = missing.length ? [] : matches;
     return missing;
+  }
+
+  /** Memos from the recent-transfers feed (id -> memo); empty when the feed is unavailable. */
+  async _recentMemos() {
+    const out = new Map();
+    try {
+      const recent = await this.client.getRecentTransfers(200);
+      for (const r of recent.values()) if (typeof r.memo === 'string') out.set(r.id, r.memo);
+    } catch {
+      // optional: memos are then read per tx
+    }
+    return out;
   }
 
   /**
@@ -1860,7 +1909,7 @@ export class ChainSettlement {
     const out = [];
     for (const [id, o] of Object.entries(this.state.ledgerOut || {})) {
       if (!o.final || known.has(id) || this.engine.recoveredOutflows.has(id)) continue;
-      if (o.ord && tags.has(o.ord)) continue;
+      if (o.ord && tags.has(o.ord) && this._ordFits(id, o)) continue; // the payout of an order of ours (matched each pass)
       const memo = String(o.memo || '');
       const ref = memo.split(':').find((part) => /^[0-9a-f]{16}$/.test(part) && settled.has(part)) || null;
       const afterBinding = Boolean(this.writer.binding) && !this._preBinding(id, o.ts);
@@ -1872,7 +1921,7 @@ export class ChainSettlement {
         memo: memo.slice(0, 120),
         ts: o.ts ? new Date(Number(o.ts) * 1000).toISOString() : null,
         references: ref,
-        reason: ref ? 'pays a bet/transaction this vault already settled' : 'signed with the bank key after the store binding, not by this vault',
+        reason: o.ord && tags.has(o.ord) ? `tagged for order ${o.ord} of this vault but does not match it (recipient, amount or signed body); the order is not paid again` : ref ? 'pays a bet/transaction this vault already settled' : 'signed with the bank key after the store binding, not by this vault',
         acknowledged: acks[id] || null,
         explorer: this.client.explorerTxUrl(id)
       });
@@ -1915,6 +1964,199 @@ export class ChainSettlement {
     await this.flush();
     await this.tick();
     return { acknowledged: done, foreign: this._foreignOutflows() };
+  }
+
+  // ─── Matching bank outflows to orders by their `:ord=` tag ─────────────────
+
+  /** The order (vault record, or engine queue item not adopted yet) whose orderId starts with this 12-hex tag. */
+  _orderForTag(tag) {
+    if (!tag) return null;
+    const rec = Object.values(this.state.outbound).find((r) => String(r.orderId).slice(0, 12) === tag);
+    if (rec) return rec;
+    const item = this.engine.outboundQueue.find((x) => String(x.orderId).slice(0, 12) === tag);
+    return item ? { orderId: item.orderId, to: item.to, amountPoa: item.amountPoa ?? fromMicros(BigInt(item.amountMicros)), status: 'QUEUED', txid: null, engineOnly: true } : null;
+  }
+
+  /**
+   * Can this tagged bank outflow be the payout of the order its `:ord=` tag names? Same recipient and exact
+   * amount, the order not already paid by another tx, and no verdict against it from the claim check
+   * (_ordVerdict). Synchronous: used by the foreign-outflow list on every instance.
+   */
+  _ordFits(id, o) {
+    if (!o || !o.ord) return false;
+    const rec = this._orderForTag(o.ord);
+    if (!rec) return false;
+    if (rec.txid === id) return true;
+    if (this._ordVerdict.get(id) === false) return false;
+    if (TERMINAL_OUT.has(rec.status)) return false; // already paid (or closed) by another tx: this one is extra
+    return o.to === rec.to && toMicros(String(o.amountPoa)) === toMicros(String(rec.amountPoa));
+  }
+
+  /** The stored payout claims of an order (one per re-sign generation): [{gen, txid, body, nonce}]. undefined = store unavailable. */
+  async _payoutClaims(rec) {
+    if (typeof this.store.peek !== 'function') return [];
+    const out = [];
+    try {
+      for (let g = 0; g <= (rec.resigns || 0); g++) {
+        const v = await this.store.peek(`payout:${rec.orderId}:${g}`);
+        if (v && v.txid) out.push({ gen: g, txid: v.txid, body: v.body || null, nonce: v.nonce ?? v.body?.nonce ?? null });
+      }
+    } catch {
+      return undefined;
+    }
+    return out;
+  }
+
+  /** A stored payout claim body that really pays this order (bank-signed, txid, recipient, amount). */
+  _claimPaysOrder(c, rec) {
+    const b = c && c.body;
+    return Boolean(b && txidOf(b) === c.txid && b.from === this.bankAddress && b.to === rec.to && toMicros(String(b.amount)) === toMicros(String(rec.amountPoa)) && verifyBody(b, this.bankAddress));
+  }
+
+  /**
+   * Decide whether bank outflow `id` ({to, amountPoa}) is the payout of order `rec` (matched by its tag):
+   *   {match: true, via, claim}  same recipient + exact amount, and either our own stored payout claim has
+   *                              this exact txid (so also the same nonce), or the order has no txid and no
+   *                              claim for any other body;
+   *   {match: false, why}        anything else (held as a foreign outflow, the order is not paid again);
+   *   undefined                  the store could not be read (decided on a later pass).
+   */
+  async _ordVerdictFor(id, o, rec) {
+    if (o.to !== rec.to || toMicros(String(o.amountPoa)) !== toMicros(String(rec.amountPoa))) {
+      return { match: false, why: `tagged for order ${rec.orderId.slice(0, 12)} but pays ${o.amountPoa} POA to ${o.to} (order: ${rec.amountPoa} POA to ${rec.to})` };
+    }
+    if (TERMINAL_OUT.has(rec.status)) return { match: false, why: `order ${rec.orderId.slice(0, 12)} is already ${rec.status}${rec.txid ? ` by ${rec.txid.slice(0, 16)}` : ''}` };
+    if (rec.engineOnly) return { match: true, via: 'ord-tag', claim: null };
+    const claims = await this._payoutClaims(rec);
+    if (claims === undefined) return undefined;
+    const mine = claims.find((c) => c.txid === id);
+    if (mine) {
+      if (!this._claimPaysOrder(mine, rec)) return { match: false, why: `stored payout claim for ${rec.orderId.slice(0, 12)} does not match the order` };
+      return { match: true, via: 'payout-claim', claim: mine };
+    }
+    if (rec.txid) return { match: false, why: `order ${rec.orderId.slice(0, 12)} already holds a different signed body ${rec.txid.slice(0, 16)}` };
+    const cur = claims.find((c) => c.gen === (rec.resigns || 0));
+    if (cur) return { match: false, why: `order ${rec.orderId.slice(0, 12)} was signed as ${cur.txid.slice(0, 16)}, not this tx` };
+    return { match: true, via: 'ord-tag', claim: null };
+  }
+
+  /** Record that order `rec` was paid on chain by `txid` (never paid again). final = already final on the ledger. */
+  _applyOrderMatch(rec, txid, { via, claim = null, final = false } = {}) {
+    rec.superseded = rec.superseded || [];
+    if (rec.txid && rec.txid !== txid) rec.superseded.push({ txid: rec.txid, nonce: rec.nonce, error: 'another body of this payout is on the ledger', reason: 'LEDGER_ORD_MATCH', at: now() });
+    rec.superseded = (rec.superseded || []).filter((s) => s.txid !== txid);
+    rec.txid = txid;
+    rec.body = claim && claim.body ? claim.body : null;
+    rec.nonce = claim && Number.isInteger(Number(claim.nonce)) ? Number(claim.nonce) : this._txNonce.get(txid) ?? null;
+    rec.status = final ? 'CONFIRMED' : 'SENT';
+    rec.sentAt = rec.sentAt || now();
+    if (final) {
+      rec.confirmedAt = now();
+      rec.confirmedVia = 'ledger';
+    }
+    rec.matchedFromLedger = { via, at: now() };
+    rec.rejection = null;
+    rec.nonceRule = null;
+    rec.forceRebroadcast = false;
+    rec.lastError = null;
+    this._ordVerdict.delete(txid);
+    this._save();
+    this.engine.markOutboundSent(rec.orderId, txid, rec.status);
+    this._emit('settlement.updated', this._outboundView(rec));
+    if (this.logger) this.logger(`payout ${rec.orderId} matched to bank transfer ${txid.slice(0, 16)} on the ledger (${via}); ${rec.status}, never paid again`);
+  }
+
+  /**
+   * Writer, every pass (before reconciliation and before anything is signed):
+   *   1. every bank outflow on the ledger that we have no record of, but whose `:ord=` tag names an open order
+   *      with the same recipient and exact amount, is that order's payout: the order is marked SENT / CONFIRMED
+   *      with that txid (e.g. a pass that broadcast it was cut off before it saved). A mismatch is never
+   *      adopted: the outflow stays a foreign outflow (trading hold) and the order is not paid again.
+   *   2. an open order with no txid whose payout body is already claimed in the store (signed, maybe sent, by
+   *      a pass that was cut off) resumes as SIGNED with that exact body, so a resend has the same txid.
+   */
+  async _matchLedgerPayouts() {
+    this._adoptOutbound();
+    const known = this._knownOutTxids();
+    let matched = 0;
+    for (const [id, o] of Object.entries(this.state.ledgerOut || {})) {
+      if (!o.ord || known.has(id)) continue;
+      const rec = this.state.outbound[Object.keys(this.state.outbound).find((k) => k.slice(0, 12) === o.ord)];
+      if (!rec) continue;
+      const v = await this._ordVerdictFor(id, o, rec);
+      if (v === undefined) {
+        this._tickErrors.push(`ord match ${id.slice(0, 12)}: store unavailable`);
+        continue;
+      }
+      if (!v.match) {
+        if (this._ordVerdict.get(id) !== false && this.logger) this.logger(`bank transfer ${id.slice(0, 16)} is NOT matched to its order: ${v.why}`);
+        this._ordVerdict.set(id, false);
+        rec.ordConflict = { txid: id, why: v.why, at: rec.ordConflict?.txid === id ? rec.ordConflict.at : now() };
+        continue;
+      }
+      this._applyOrderMatch(rec, id, { via: v.via, claim: v.claim, final: Boolean(o.final) });
+      known.add(id);
+      matched += 1;
+    }
+    for (const rec of Object.values(this.state.outbound)) {
+      if ((rec.status !== 'QUEUED' && rec.status !== 'WAITING_FUNDS') || rec.txid) continue;
+      if (this._ledgerTagged(rec)) continue; // the ledger has a tx for this order: decided above, never signed again here
+      const claims = await this._payoutClaims(rec);
+      const cur = (claims || []).find((c) => c.gen === (rec.resigns || 0));
+      if (!cur || !this._claimPaysOrder(cur, rec)) continue;
+      rec.txid = cur.txid;
+      rec.body = cur.body;
+      rec.nonce = Number(cur.nonce ?? cur.body.nonce);
+      rec.status = 'SIGNED';
+      rec.signedAt = rec.signedAt || now();
+      rec.nextAttemptAt = 0;
+      rec.recoveredFromClaim = { at: now() };
+      this._save();
+      if (this.logger) this.logger(`payout ${rec.orderId} resumes with its stored signed body ${cur.txid.slice(0, 16)} (an earlier pass was cut off before saving it)`);
+    }
+    return matched;
+  }
+
+  /** Is any bank outflow on the ledger tagged with this order's `:ord=` tag? */
+  _ledgerTagged(rec) {
+    const tag = String(rec.orderId).slice(0, 12);
+    return Object.values(this.state.ledgerOut || {}).some((o) => o.ord === tag);
+  }
+
+  /**
+   * Writer takeover: can this bank outflow, unknown to the stored document, be explained by an open order in
+   * that document? Same rules as _ordVerdictFor (our own payout claim with this txid, or the `:ord=` memo tag
+   * with the same recipient and exact amount and no claim for a different body).
+   * Returns {orderId, via, claim} | null | undefined (minepoa or the store could not answer).
+   */
+  async _explainByOrder(doc, t, recentMemos) {
+    const open = Object.values(doc?.outbound || {}).filter((r) => r && r.orderId && !TERMINAL_OUT.has(r.status) && r.txid !== t.id);
+    if (!open.length) return null;
+    const asRec = (r) => ({ ...r, superseded: r.superseded || [] });
+    // 1. our own stored payout claim names this exact txid (needs no memo)
+    for (const r of open) {
+      const rec = asRec(r);
+      const claims = await this._payoutClaims(rec);
+      if (claims === undefined) return undefined;
+      const c = claims.find((x) => x.txid === t.id);
+      if (c && this._claimPaysOrder(c, rec) && t.to === rec.to && toMicros(String(t.amount)) === toMicros(String(rec.amountPoa))) return { orderId: rec.orderId, via: 'payout-claim', claim: c };
+    }
+    // 2. the memo's `:ord=` tag
+    let memo = t.memoKnown && typeof t.memo === 'string' ? t.memo : (await recentMemos()).get(t.id);
+    if (memo === undefined) {
+      try {
+        memo = await this.client.getMemo(t.id);
+      } catch {
+        return undefined;
+      }
+    }
+    const m = /:ord=([0-9a-f]{12})/.exec(String(memo || ''));
+    if (!m) return null;
+    const r = open.find((x) => String(x.orderId).slice(0, 12) === m[1]);
+    if (!r) return null;
+    const v = await this._ordVerdictFor(t.id, { to: t.to, amountPoa: t.amount }, asRec(r));
+    if (v === undefined) return undefined;
+    return v.match ? { orderId: r.orderId, via: v.via, claim: v.claim } : null;
   }
 
   /** A bank payout already on the ledger for this order's bet: {txid, adopt, why} or null. */
@@ -2412,6 +2654,11 @@ export class ChainSettlement {
             await this._readOnlyTick();
             return;
           }
+          for (const mt of this._takeoverMatches || []) {
+            const rec = this.state.outbound[mt.orderId];
+            if (rec && rec.txid !== mt.txid && !TERMINAL_OUT.has(rec.status)) this._applyOrderMatch(rec, mt.txid, { via: `takeover:${mt.via}`, claim: mt.claim, final: mt.final });
+          }
+          this._takeoverMatches = [];
           if (attest.size) {
             this.state.attestedOutflows = this.state.attestedOutflows || {};
             for (const id of attest) this.state.attestedOutflows[id] = { at: new Date(now()).toISOString() };
@@ -2424,6 +2671,7 @@ export class ChainSettlement {
         await this._syncSeed();
         const row = await this._scanBank();
         await this._confirmInbound();
+        await this._matchLedgerPayouts().catch((err) => this._tickErrors.push(`ord match: ${err.message}`));
         await this._applyForeignAcks().catch((err) => this._tickErrors.push(`foreign acks: ${err.message}`));
         await this._reconcile(row);
         this._adoptOutbound();
@@ -2970,6 +3218,14 @@ export class ChainSettlement {
     const confirmedOnChain = onChain - unconfirmedIn;
     const delta = confirmedOnChain - required;
     const stuck = this.stuckPayouts();
+    // Payouts marked CONFIRMED (e.g. from an `included` receipt) that a complete, fresh read of the bank's
+    // ledger history still does not list long after: informational, for an operator (never re-paid here).
+    const confirmedNotOnLedger =
+      row.fromTrusted || !this.ledgerIndexComplete || !row.listedIds
+        ? []
+        : Object.values(this.state.outbound)
+            .filter((o) => o.status === 'CONFIRMED' && o.txid && !o.recoveredFromLedger && !row.listedIds.has(o.txid) && now() - Number(o.confirmedAt || o.sentAt || 0) > this.stuckAfterMs)
+            .map((o) => ({ orderId: o.orderId, kind: o.kind, to: o.to, amountPoa: o.amountPoa, txid: o.txid, nonce: o.nonce ?? null, confirmedVia: o.confirmedVia || null, receipt: o.receipt || null, confirmedAt: o.confirmedAt ? new Date(o.confirmedAt).toISOString() : null }));
     let rejectedMicros = 0n;
     for (const o of Object.values(this.state.outbound)) if (o.status === 'REJECTED') rejectedMicros += toMicros(o.amountPoa);
     return {
@@ -2994,6 +3250,7 @@ export class ChainSettlement {
       },
       payoutsOk: stuck.length === 0,
       stuckPayouts: stuck,
+      confirmedNotOnLedger,
       writer: this.writer.view(),
       foreignOutflowsOk: this._foreignOutflows().every((f) => f.acknowledged),
       foreignOutflows: this._foreignOutflows(),
