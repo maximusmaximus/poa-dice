@@ -104,6 +104,16 @@ export function createFileStore(dir, name = 'settlement.json') {
       return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => {
         if (book.holder === holder) book.expiresAt = 0;
       });
+    },
+    putStatus(name, value) {
+      return withFileLock(dir, `status-${claimFileName(name)}`, (book) => {
+        for (const k of Object.keys(book)) delete book[k];
+        Object.assign(book, { value: JSON.parse(JSON.stringify(value)) });
+      });
+    },
+    getStatus(name) {
+      const f = path.join(dir, 'claims', `status-${claimFileName(name)}.json`);
+      return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')).value ?? null : null;
     }
   };
 }
@@ -237,6 +247,13 @@ export function createMemoryStore(initial = null, { claims = createClaimTable() 
         claims.set(k, JSON.stringify(book));
       }
     },
+    putStatus(name, value) {
+      claims.set(`__status__:${name}`, JSON.stringify(value));
+    },
+    getStatus(name) {
+      const k = `__status__:${name}`;
+      return claims.has(k) ? JSON.parse(claims.get(k)) : null;
+    },
     kind: 'memory',
     location: 'memory',
     durable: true,
@@ -359,13 +376,14 @@ return tostring(used)`;
  */
 // Schema for the Postgres store (all idempotent). Setup is serialized with a fixed advisory lock key.
 export const PG_SCHEMA_LOCK_KEY = '5778343729120067585'; // fixed bigint, same for every instance
-export const PG_TABLES = ['poa_dice_docs', 'poa_dice_claims', 'poa_dice_capacity', 'poa_dice_reservations', 'poa_dice_leases'];
+export const PG_TABLES = ['poa_dice_docs', 'poa_dice_claims', 'poa_dice_capacity', 'poa_dice_reservations', 'poa_dice_leases', 'poa_dice_status'];
 const PG_SCHEMA = [
   'CREATE TABLE IF NOT EXISTS poa_dice_docs (key TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())',
   'CREATE TABLE IF NOT EXISTS poa_dice_claims (key TEXT PRIMARY KEY, value JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())',
   'CREATE TABLE IF NOT EXISTS poa_dice_capacity (scope TEXT PRIMARY KEY)',
   'CREATE TABLE IF NOT EXISTS poa_dice_reservations (scope TEXT NOT NULL, key TEXT NOT NULL, micros BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (scope, key))',
-  'CREATE TABLE IF NOT EXISTS poa_dice_leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)'
+  'CREATE TABLE IF NOT EXISTS poa_dice_leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS poa_dice_status (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())'
 ];
 
 /** Postgres "it already exists" races during CREATE ... IF NOT EXISTS: unique_violation (pg_type/pg_class), duplicate_table, duplicate_object. */
@@ -497,6 +515,27 @@ export function createPostgresStore({ connectionString, key, query = null }) {
       const cur = await q("SELECT holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
       const row = cur.rows[0] || {};
       return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: Number(row.expires_ms || 0) };
+    },
+    /** Shared status row (the bank writer's heartbeat). Fenced like the vault document when a fence is set. */
+    async putStatus(name, value) {
+      await init();
+      const k = `${key}:${name}`;
+      if (!fence) {
+        await q('INSERT INTO poa_dice_status (key, value, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()', [k, JSON.stringify(value)]);
+        return;
+      }
+      const r = await q(
+        'INSERT INTO poa_dice_status (key, value, updated_at) SELECT $1, $2::jsonb, now() WHERE EXISTS (SELECT 1 FROM poa_dice_leases WHERE key = $3 AND holder = $4 AND token = $5 AND expires_at > now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now() RETURNING key',
+        [k, JSON.stringify(value), `${key}:${fence.name}`, fence.holder, String(fence.token)]
+      );
+      if (!r.rows || !r.rows.length) throw new Error('status write fenced off: this instance no longer holds the bank writer lease');
+    },
+    async getStatus(name) {
+      await init();
+      const r = await q('SELECT value FROM poa_dice_status WHERE key = $1', [`${key}:${name}`]);
+      if (!r.rows[0]) return null;
+      const v = r.rows[0].value;
+      return typeof v === 'string' ? JSON.parse(v) : v;
     },
     async releaseLease(name, holder) {
       await init();
