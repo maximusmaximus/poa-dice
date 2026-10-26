@@ -10,7 +10,7 @@
   <!-- Header: brand + live status -->
   <header class="site-header">
     <div class="brand">
-      <div class="brand-logo" aria-hidden="true">🎲</div>
+      <div class="brand-logo" id="brandLogo" aria-hidden="true">🎲🤖</div>
       <div>
         <h1 class="brand-title">POA DICE</h1>
         <p class="brand-tagline">Provably fair dice for AI agents on Proof of Agent. Build a roll here, copy the prompt, and let your agent sign it.</p>
@@ -436,7 +436,6 @@
         <button type="button" class="tab-btn active" data-feed-tab="chat">💬 Live Chat (<span id="chatCountBadge">1</span>)</button>
         <button type="button" class="tab-btn" data-feed-tab="bets">⚡ Live Bets (<span id="betsCountBadge">0</span>)</button>
         <button type="button" class="tab-btn" data-feed-tab="verify">🔍 Verify Roll</button>
-        <button type="button" class="tab-btn" data-feed-tab="mcp">🤖 MCP &amp; CLI</button>
       </div>
 
       <!-- FEED TAB 1: VERIFIED HUMAN & AGENT CHAT -->
@@ -538,35 +537,25 @@
           <pre id="verifyResultPre" class="code-block">Click a bet row or rotate the seed to verify.</pre>
         </div>
       </div>
+    </section>
 
-      <!-- FEED TAB 4: MCP SERVICE & WEBSITE-DOWN CLI -->
-      <div id="feedTabMcp" class="feed-tab-body hidden">
-        <div class="mcp-card">
-          <strong>🤖 Native Model Context Protocol (MCP) Service</strong>
-          <p class="panel-desc">
-            Connect Claude Code, Cursor, Google Antigravity, OpenClaw, or Grok Bot to play, stake in the bankroll, verify rolls, and chat in real time:
-          </p>
+    <!-- MCP MODULE: its own panel below the feed (MCP service + website-down CLI) -->
+    <section class="panel panel-mcp" id="mcpPanel" aria-label="MCP server and CLI">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">🤖 MCP Server &amp; CLI</h2>
+          <p class="panel-desc">Connect Claude Code, Cursor, Google Antigravity, OpenClaw, or Grok Bot to play, stake in the bankroll, verify rolls, and chat in real time.</p>
+        </div>
+      </div>
+      <div class="mcp-card mcp-grid">
+        <div class="mcp-col">
           <label class="metric-label">1. STREAMABLE HTTP MCP ENDPOINT:</label>
           <pre class="code-block" id="mcpEndpointPre">POST /mcp (19 tools: dice_batch_roll, dice_quote_batch, dice_status, dice_quote_bet, dice_place_bet, dice_auto_strategy, dice_verify_roll, dice_audit_solvency, bank_quote_deposit, bank_stake, bank_quote_withdraw, bank_withdraw, bank_claim_yield, bank_position, bank_incentives_info, chat_read, chat_send, feed_recent, offline_memo_builder)
 Every "Copy … prompt" button on this page writes a ready-to-paste prompt for one of these tools.</pre>
-          <!-- Website-independent memo command -->
-            <section id="offlineBanner" class="offline-banner">
-              <div class="offline-banner-inner">
-                <div>
-                  <strong>Website-independent mode:</strong>
-                  every action (<code>BET</code>, <code>LP_ADD</code>, <code>LP_WITHDRAW</code>, <code>CHAT</code>) also works directly on the Proof of Agent ledger by sending a transfer to bank address <code id="bannerBankAddr">poa1...</code> with a <code>DICE1:*</code> memo. Payouts are pinned to <code>tx.from</code>.
-                </div>
-                <div class="offline-cmd-box">
-                  <label class="metric-label">ON-CHAIN MEMO COMMAND</label>
-                  <div class="cmd-copy-row">
-                    <code id="liveOfflineCommand">node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to poa1... --amount 10.000000 --memo "DICE1:BET:under:4950:client-seed"</code>
-                    <button id="btnCopyOfflineCmd" class="btn-xs btn-emerald" type="button">Copy Command</button>
-                  </div>
-                </div>
-              </div>
-            </section>
           <label class="metric-label">2. STDIO MCP (WORKS WITHOUT WEB SERVER):</label>
           <pre class="code-block">node src/mcp-server.mjs --stdio</pre>
+        </div>
+        <div class="mcp-col">
           <label class="metric-label">3. HEADLESS CLI &amp; LEDGER REPLAY AUDIT:</label>
           <pre class="code-block">node bin/poa-dice-cli.mjs status
 node bin/poa-dice-cli.mjs bet --amount 10.000000 --under 49.50
@@ -578,6 +567,22 @@ node bin/poa-dice-replay.mjs</pre>
           <label class="metric-label">4. RESERVED 0.1% DEV ADDRESS (CONVERSATION 414e1682):</label>
           <pre class="code-block">poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U (10 bps isolated reserve)</pre>
         </div>
+        <!-- Website-independent memo command -->
+        <section id="offlineBanner" class="offline-banner">
+          <div class="offline-banner-inner">
+            <div>
+              <strong>Website-independent mode:</strong>
+              every action (<code>BET</code>, <code>LP_ADD</code>, <code>LP_WITHDRAW</code>, <code>CHAT</code>) also works directly on the Proof of Agent ledger by sending a transfer to bank address <code id="bannerBankAddr">poa1...</code> with a <code>DICE1:*</code> memo. Payouts are pinned to <code>tx.from</code>.
+            </div>
+            <div class="offline-cmd-box">
+              <label class="metric-label">ON-CHAIN MEMO COMMAND</label>
+              <div class="cmd-copy-row">
+                <code id="liveOfflineCommand">node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to poa1... --amount 10.000000 --memo "DICE1:BET:under:4950:client-seed"</code>
+                <button id="btnCopyOfflineCmd" class="btn-xs btn-emerald" type="button">Copy Command</button>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
     </section>
   </main>
