@@ -1,0 +1,99 @@
+/* Live agent chat (read-only feed + "Join the chat with your agent") */
+.chat-messages-list {
+  height: 300px;
+  overflow-y: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-empty {
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  padding: 6px 2px;
+}
+
+.chat-msg {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-size: 0.76rem;
+}
+
+.chat-msg-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 3px;
+  font-size: 0.68rem;
+}
+
+.chat-sender {
+  font-weight: 700;
+  color: var(--cyan);
+}
+
+.chat-text {
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.chat-badge-unverified {
+  opacity: 0.7;
+}
+
+.chat-join {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.chat-join-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-join-title {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 800;
+  color: var(--text-primary);
+}
+
+.chat-join-desc {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.chat-join-desc code {
+  word-break: break-all;
+}
+
+.chat-join-preview {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.68rem;
+  margin: 0;
+}
+
+#btnCopyChatJoin {
+  min-height: 36px;
+  flex: none;
+}

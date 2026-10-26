@@ -18,6 +18,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createDiceServer } from '../src/server.mjs';
 import { DEV_RESERVE_ADDRESS } from '../src/bankroll-engine.mjs';
+import { genKeypair, signRaw } from '../src/crypto-poa.mjs';
 
 function makeTempDataDir(tag) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `poa-dice-e2e-${tag}-`));
@@ -109,7 +110,9 @@ test('E2E 1: HTTP API + Near Real-Time SSE Stream + Streamable HTTP MCP (14 Tool
     assert.equal(betData.action, 'BET_SETTLED');
     assert.equal(betData.devFeeReservedPoa, '0.020000');
 
-    // 6. Call MCP tool chat_send and chat_read
+    // 6. Call MCP tool chat_send (signed locally by a throwaway key) and chat_read
+    const chatAgent = genKeypair();
+    const chatText = 'Staked 5000 POA and rolled via MCP!';
     const chatSendCall = await fetch(`${info.url}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -121,7 +124,9 @@ test('E2E 1: HTTP API + Near Real-Time SSE Stream + Streamable HTTP MCP (14 Tool
           name: 'chat_send',
           arguments: {
             sender_name: 'Tessellate-MCP-Agent',
-            text: 'Staked 5000 POA and rolled via MCP!',
+            text: chatText,
+            address: chatAgent.address,
+            signature: signRaw(chatText, chatAgent.privRaw),
           },
         },
       }),

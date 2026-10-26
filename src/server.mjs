@@ -15,9 +15,7 @@ import {
   genKeypair,
   isValidPoaAddress,
   redactSecrets,
-  signRaw,
   toMicros,
-  verifyRaw,
   walletFromPrivkey
 } from './crypto-poa.mjs';
 import { verifyRoll } from './provably-fair.mjs';
@@ -25,7 +23,8 @@ import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
 import { MCP_INSTRUCTIONS, MCP_TOOLS, McpHandler, ROLL_FORMULA } from './mcp-server.mjs';
 import { executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
-import { quoteAutoBet, quoteChat, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
+import { postSignedChat } from './chat.mjs';
+import { quoteAutoBet, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
 import { transferTemplates } from './tx-templates.mjs';
 import { isAddress as isPoaAddress, looksLikePrivkey, walletBalance } from './wallet-balance.mjs';
 import crypto from 'node:crypto';
@@ -716,7 +715,7 @@ export function createDiceServer(options = {}) {
         });
       }
 
-      // One call for every non-roll action button on the page (stake/withdraw/claim/auto-bet/chat).
+      // One call for every non-roll action button on the page (stake/withdraw/claim/auto-bet).
       if (pathname === '/api/quote/actions' && req.method === 'GET') {
         const p = Object.fromEntries(urlObj.searchParams);
         const address = p.address && isValidPoaAddress(p.address) ? p.address : '';
@@ -738,8 +737,7 @@ export function createDiceServer(options = {}) {
             rolls: Number(p.autoRolls ?? 5),
             clientSeed: p.clientSeed || 'agent-auto',
             chain
-          }),
-          chat: quoteChat({ text: p.chatText || '' })
+          })
         };
         if (readOnlyState) {
           for (const k of ['stake', 'withdraw', 'claim', 'autoBet']) {
@@ -950,25 +948,13 @@ export function createDiceServer(options = {}) {
         });
       }
 
+      // Signed posts only (same rules as MCP chat_send): text + address + Base58 Ed25519 signature
+      // over the exact text. No unsigned posts and no private keys.
       if (pathname === '/api/chat' && req.method === 'POST') {
         const body = await readJsonBody(req);
-        let addr = body.address || '';
-        let sig = body.signature || null;
-        if (body.privkey) {
-          const w = walletFromPrivkey(body.privkey);
-          addr = w.address;
-          sig = signRaw(body.text || '', w.privRaw);
-        }
-        const verified = Boolean(sig && isValidPoaAddress(addr) && verifyRaw(body.text || '', sig, addr));
-        const msg = engine.postChatMessage({
-          address: addr,
-          senderName: body.senderName || body.sender_name || '',
-          text: body.text || '',
-          isAgent: Boolean(body.isAgent || body.is_agent),
-          signature: verified ? sig : null,
-          verified
-        });
-        return sendJson(res, 200, { ok: true, message: msg });
+        const out = postSignedChat(engine, body || {});
+        if (!out.ok) return sendJson(res, 400, out);
+        return sendJson(res, 200, { ok: true, message: out });
       }
 
       // 11. Model Context Protocol (MCP) Streamable HTTP Endpoint (/mcp)

@@ -1,7 +1,7 @@
 // @ts-nocheck
 /**
  * actions.mjs — Server-side validation for every player action the browser can turn
- * into a copy-paste agent prompt (stake, unstake, claim yield, auto-bet, chat).
+ * into a copy-paste agent prompt (stake, unstake, claim yield, auto-bet).
  * Rolls/batches live in batch-roll.mjs. Each quote returns { valid, code, reason, ... }
  * and is shared by GET /api/quote/actions, the MCP tools and the HTTP action paths.
  */
@@ -145,11 +145,4 @@ export function quoteAutoBet(engine, { address = '', strategy = 'flat', baseWage
     maxTotalSpendPoa: fromMicros(cap),
     quote: q
   };
-}
-
-export function quoteChat({ text = '' } = {}) {
-  const t = String(text || '').trim();
-  if (!t) return bad('empty', 'Type a message first');
-  if (t.length > 240) return bad('too_long', 'Messages are limited to 240 characters');
-  return { valid: true, code: 'ok', reason: null, error: null, text: t, maxTotalSpendPoa: '0.000000' };
 }
