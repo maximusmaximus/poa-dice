@@ -311,7 +311,7 @@ test('LEDGER_UNAVAILABLE and rejections stay separate: a bad-nonce rejection nev
   const player = genKeypair();
   mock.setBalance(player.address, '50.000000');
   mock.setBalance(bank.address, '5.000000');
-  const srv = await boot({ mock, bank, tag: 'probe', extra: { ledgerProbe: undefined, ledgerProbeIntervalMs: 0, ledgerProbeMinHoldMs: 0 } });
+  const srv = await boot({ mock, bank, tag: 'probe', extra: { ledgerProbe: undefined, ledgerProbeIntervalMs: 0, ledgerProbeMinHoldMs: 0, ledgerOutageHoldMs: 0 } }); // outage window 0: every failed probe is "sustained"
   try {
     const probe = srv.app.settlement.ledgerProbe;
     assert.ok(probe, 'probe enabled');

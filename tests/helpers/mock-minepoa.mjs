@@ -66,6 +66,8 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     res.end(JSON.stringify(obj));
   };
 
+  let readBusyReceipts = true; // false: only the explorer is busy, receipts still answer (seen live)
+  const receiptOverrides = new Map(); // txid -> receipt body to serve instead
   let readBusy = 0; // retry_after_seconds: explorer + receipt reads answer 503 "origin busy" (like 2026-10-26)
   let outage = 0; // when set, these paths answer this HTTP status (minepoa can't accept txs)
   let outagePaths = ['/api/txs', '/api/submit'];
@@ -117,7 +119,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       return json(res, 200, { ok: true, txid: id, next_nonce: body.nonce + 1 });
     }
     let m;
-    if (req.method === 'GET' && readBusy && /^\/api\/(explorer\/(tx|address)|receipt)\//.test(p)) {
+    if (req.method === 'GET' && readBusy && (readBusyReceipts ? /^\/api\/(explorer\/(tx|address)|receipt)\// : /^\/api\/explorer\/(tx|address)\//).test(p)) {
       return json(res, 503, { error: 'origin busy — served capacity is reserved for mining/grading right now; retry shortly', retry_after_seconds: readBusy });
     }
     if (req.method === 'GET' && readFaults.length && /^\/api\/(explorer\/tx|receipt)\//.test(p)) {
@@ -155,6 +157,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       return json(res, 200, list);
     }
     if ((m = p.match(/^\/api\/receipt\/(.+)$/))) {
+      if (receiptOverrides.has(m[1])) return json(res, 200, receiptOverrides.get(m[1]));
       if (receipts.has(m[1]) && !txs.has(m[1])) return json(res, 200, receipts.get(m[1]));
       const t = txs.get(m[1]);
       if (!t) return json(res, 404, { error: 'not found' });
@@ -210,8 +213,14 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       readFaults = readFaults.concat(modes);
     },
     /** Explorer and receipt reads answer 503 "origin busy" with retry_after_seconds (0 = off). */
-    setReadBusy: (seconds = 60) => {
+    setReadBusy: (seconds = 60, { receipts = true } = {}) => {
       readBusy = seconds || 0;
+      readBusyReceipts = receipts;
+    },
+    /** Serve this body for GET /api/receipt/<txid> (null = back to normal). */
+    setReceipt: (txid, body) => {
+      if (body === null) receiptOverrides.delete(txid);
+      else receiptOverrides.set(txid, body);
     },
     clearReadFaults: () => {
       readFaults = [];

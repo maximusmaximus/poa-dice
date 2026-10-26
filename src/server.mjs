@@ -210,6 +210,7 @@ export function createDiceServer(options = {}) {
             passEveryMs: options.passEveryMs ?? (Number(signerEnv.POA_DICE_PASS_EVERY_MS) || 15000),
             rebroadcastAfterMs: options.rebroadcastAfterMs ?? 60000,
             payoutRetryMaxMs: options.payoutRetryMaxMs ?? 30000,
+            trustedBalanceMaxAgeMs: options.trustedBalanceMaxAgeMs ?? (Number(signerEnv.POA_DICE_TRUSTED_BALANCE_MAX_AGE_MS) || 10 * 60 * 1000),
             bindOnBoot: bindTarget === key.wallet.address,
             engine,
             watcher,
@@ -234,7 +235,9 @@ export function createDiceServer(options = {}) {
                     nodeUrl: client.nodeUrl || options.nodeUrl || watcher.nodeUrl,
                     fetchImpl: client.fetch || options.minepoaFetch || globalThis.fetch,
                     intervalMs: options.ledgerProbeIntervalMs ?? 20000,
-                    minHoldMs: options.ledgerProbeMinHoldMs ?? 30000
+                    minHoldMs: options.ledgerProbeMinHoldMs ?? 30000,
+                    // Slow / busy minepoa is DEGRADED; trading pauses only after this long with no healthy answer.
+                    outageHoldMs: options.ledgerOutageHoldMs ?? (Number(signerEnv.POA_DICE_LEDGER_OUTAGE_HOLD_MS) || 10 * 60 * 1000)
                   })
           });
           watcher.bankWallet = key.wallet;
