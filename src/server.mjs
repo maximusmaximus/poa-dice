@@ -203,7 +203,13 @@ export function createDiceServer(options = {}) {
             loadRetryBaseMs: options.loadRetryBaseMs ?? 2000,
             loadRetryMaxMs: options.loadRetryMaxMs ?? 60000,
             // Other instances refuse bets when the bank writer's published status is older than this.
-            leaderStatusMaxAgeMs: options.leaderStatusMaxAgeMs ?? (Number(signerEnv.POA_DICE_LEADER_STATUS_MAX_AGE_MS) || 30000),
+            // Bets need a good settlement pass at most this old (any instance's pass counts).
+            leaderStatusMaxAgeMs: options.leaderStatusMaxAgeMs ?? (Number(signerEnv.POA_DICE_PASS_MAX_AGE_MS || signerEnv.POA_DICE_LEADER_STATUS_MAX_AGE_MS) || 90000),
+            // Serverless (Vercel sets VERCEL=1): bounded passes under the lease, released after each pass.
+            passMode: options.passMode !== undefined ? Boolean(options.passMode) : signerEnv.POA_DICE_PASS_MODE === '1' || (signerEnv.POA_DICE_PASS_MODE !== '0' && (signerEnv.VERCEL === '1' || process.env.VERCEL === '1')),
+            passEveryMs: options.passEveryMs ?? (Number(signerEnv.POA_DICE_PASS_EVERY_MS) || 15000),
+            rebroadcastAfterMs: options.rebroadcastAfterMs ?? 60000,
+            payoutRetryMaxMs: options.payoutRetryMaxMs ?? 30000,
             bindOnBoot: bindTarget === key.wallet.address,
             engine,
             watcher,
@@ -266,6 +272,7 @@ export function createDiceServer(options = {}) {
   // Vercel Cron sends `Authorization: Bearer $CRON_SECRET` to /api/settlement/tick.
   const cronSecret = options.cronSecret !== undefined ? options.cronSecret : process.env.CRON_SECRET || null;
   const tickBudgetMs = options.tickBudgetMs ?? 25000;
+  const readPassBudgetMs = options.readPassBudgetMs ?? 4000;
   const chainCache = new Map();
   const pendingSpend = new Map(); // address -> micros reserved by in-flight batches
   let chainDebits = dataDir ? loadDebits(dataDir) : [];
@@ -497,7 +504,12 @@ export function createDiceServer(options = {}) {
       const pathname = urlObj.pathname;
       // Hosts that freeze idle instances stall setInterval; any request nudges a stale settlement loop.
       // Serverless instances have no loop timer at all; the request kick (and the cron tick) drive them.
-      if (settlement && (!readOnlyState || readOnlyState.retrying) && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
+      if (settlement && (!readOnlyState || readOnlyState.retrying) && !settlement.passMode && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
+      // Pass mode: status reads run a bounded settlement pass first when none has completed for
+      // passEveryMs (work after the response is not guaranteed on a host that freezes instances).
+      if (settlement && settlement.passMode && (!readOnlyState || readOnlyState.retrying) && req.method === 'GET' && (pathname === '/api/health' || pathname === '/api/settlement' || /^\/api\/tx\/[0-9a-f]+\/status$/.test(pathname))) {
+        await settlement.maybePass({ budgetMs: readPassBudgetMs }).catch(() => {});
+      }
 
       if (readOnlyState && req.method === 'POST' && WRITE_PATHS.has(pathname)) {
         return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });

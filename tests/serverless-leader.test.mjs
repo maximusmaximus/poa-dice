@@ -137,7 +137,7 @@ test('stale writer status: every other instance reports no active writer and ref
     const x = bet(mock, p, bank, 'stale-writer');
     const r = await b.req('/api/tx/submit', { method: 'POST', body: { tx: x } });
     assert.equal(r.status, 503, JSON.stringify(r.body));
-    assert.match(JSON.stringify(r.body), /No bank writer is active/);
+    assert.match(JSON.stringify(r.body), /No settlement pass has completed recently/);
     assert.equal(mock.tx(x.id), undefined, 'not broadcast');
     assert.equal(await t.store.peek(`accepted:${x.id}`), null, 'nothing recorded');
     const q = b.s.coverageLimit();
