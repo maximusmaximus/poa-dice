@@ -76,6 +76,7 @@ export const LEADER_STATUS_KEY = 'leader-status';
 /** Trading hold when no bank writer has published a fresh status. */
 export const NO_ACTIVE_LEADER = 'NO_ACTIVE_LEADER';
 const STANDBY_STATUS_REFRESH_MS = 2000;
+const REPLICA_RELOAD_MS = 30000;
 
 export function tradingLabel(hold) {
   if (!hold) return 'OPEN';
@@ -126,7 +127,11 @@ export class ChainSettlement {
     onLoadStateChange = null,
     loadRetryBaseMs = 2000,
     loadRetryMaxMs = 60000,
-    leaderStatusMaxAgeMs = 30000,
+    leaderStatusMaxAgeMs = 90000,
+    passMode = false,
+    passEveryMs = 15000,
+    rebroadcastAfterMs = 60000,
+    payoutRetryMaxMs = 30000,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -155,7 +160,16 @@ export class ChainSettlement {
     this.foreign = []; // bank outflows this vault did not create (see _foreignOutflows)
     // Serverless: many instances share one Postgres vault. The bank writer (lease holder) publishes its
     // status every tick; every other instance reads it and refuses bets when it is older than this.
-    this.leaderStatusMaxAgeMs = leaderStatusMaxAgeMs;
+    this.leaderStatusMaxAgeMs = leaderStatusMaxAgeMs; // bets need a good settlement pass at most this old
+    // Pass mode (serverless): no long-lived writer. Any instance runs a bounded pass under the lease
+    // (taken at the start, released at the end), triggered by the cron tick and by requests.
+    this.passMode = Boolean(passMode);
+    this.passEveryMs = passEveryMs;
+    this.rebroadcastAfterMs = rebroadcastAfterMs;
+    this.payoutRetryMaxMs = payoutRetryMaxMs;
+    this._lastPass = null; // {holder, token, savedAt, at}: the last pass THIS instance completed as writer
+    this._observePromise = null;
+    this.passes = { started: 0, completed: 0, lastStartedAt: null, lastCompletedAt: null, lastMs: null };
     this.shared = null; // last leader status read from (or written to) the store
     this._sharedReadAt = 0;
     this._replicaSavedAt = null; // savedAt of the vault document this standby last loaded
@@ -404,7 +418,8 @@ export class ChainSettlement {
     // and broadcasts them and records them in the shared store for the writer; it never signs or settles.
     if (!this.writer.canWrite()) {
       const known = Boolean(this.state.inbound[txid]) || this.engine.processedTxids.has(txid);
-      if (!known || this.writer.status === 'STANDBY') await this.tick().catch(() => {});
+      if (this.passMode && this.writer.status === 'STANDBY') await this._observe(STANDBY_STATUS_REFRESH_MS).catch(() => {});
+      else if (!known || this.writer.status === 'STANDBY') await this.tick().catch(() => {});
       if (!this.writer.canWrite()) {
         if (this.writer.status === 'STANDBY') return this._submitAsStandby({ body, txid, parsed, reserve, groupId, coverage });
         if (!known) {
@@ -651,7 +666,8 @@ export class ChainSettlement {
       }
     }
     this._emit('settlement.updated', this._inboundView(rec));
-    return this._inboundView(rec, { acceptedBy: 'standby' });
+    if (this.passMode) await this.maybePass({ force: true, budgetMs: 8000 }).catch(() => {});
+    return this._inboundView(this.state.inbound[txid] || rec, { acceptedBy: 'standby' });
   }
 
   _inboundView(rec, extra = {}) {
@@ -1145,18 +1161,30 @@ export class ChainSettlement {
     return Math.round(base * (0.8 + Math.random() * 0.4));
   }
 
+  _payoutRetryAt(attempts, err = null) {
+    const wait = err?.busy && err.retryAfterMs ? err.retryAfterMs : this._backoff(attempts);
+    return now() + Math.min(wait, this.payoutRetryMaxMs);
+  }
+
   async _broadcastSigned(rec) {
     // Never pay twice: if this exact txid is already known to the node, it is sent.
-    const known = await this.client.getTx(rec.txid).catch(() => undefined);
-    if (known === undefined) {
-      rec.nextAttemptAt = now() + this._backoff(++rec.attempts);
+    let readErr = null;
+    const known = await this.client.getTx(rec.txid).catch((err) => {
+      readErr = err;
+      return undefined;
+    });
+    // The read node being busy says nothing about the tx. The SAME signed body (same txid, same nonce)
+    // is still sent: it can land at most once, so this never pays twice.
+    const readBusy = known === undefined && Boolean(readErr?.busy);
+    if (known === undefined && !readBusy) {
+      rec.nextAttemptAt = this._payoutRetryAt(++rec.attempts);
       rec.lastError = 'minepoa unreachable';
       return false;
     }
     if (known) return this._markSent(rec, {});
     // Never resend a body minepoa already rejected for good (e.g. bad nonce): the reconciler decides what
     // happens to the order. A NONCE_GAP body is the exception: it is resent unchanged once the gap is filled.
-    if (!rec.forceRebroadcast) {
+    if (!rec.forceRebroadcast && !readBusy) {
       const receipt = await this._receipt(rec.txid);
       if (isRejectedReceipt(receipt)) {
         this._markRejected(rec, String(receipt.error || 'rejected'), 'receipt');
@@ -1180,7 +1208,8 @@ export class ChainSettlement {
         return false;
       }
       // Stays signed and retries with backoff (same signed body, same txid: never paid twice).
-      rec.nextAttemptAt = now() + this._backoff(rec.attempts);
+      // Busy: wait for minepoa's retry_after; this is ledger-degraded, not a trading hold.
+      rec.nextAttemptAt = this._payoutRetryAt(rec.attempts, err);
       this._save();
       this._emit('settlement.updated', this._outboundView(rec));
       return false;
@@ -1421,11 +1450,54 @@ export class ChainSettlement {
 
   // ─── Shared writer status (serverless: many instances, one bank writer) ──
 
-  /** Is the published writer status fresh (written within leaderStatusMaxAgeMs, lease not expired)? */
+  /**
+   * Is there a recent GOOD settlement pass? Measured from the last pass that finished without errors
+   * (status.goodAt), not from the lease: between passes nobody holds the lease, and that is normal.
+   */
   _sharedFresh(s = this.shared) {
-    if (!s || !Number.isFinite(Number(s.at))) return false;
-    const t = now();
-    return t - Number(s.at) <= this.leaderStatusMaxAgeMs && Number(s.leaseExpiresAt || 0) > t;
+    if (!s) return false;
+    const good = Number(s.goodAt ?? s.lastGoodTick ?? 0);
+    if (!Number.isFinite(good) || good <= 0) return false;
+    return now() - good <= this.leaderStatusMaxAgeMs;
+  }
+
+  /** Is a settlement pass due (no pass has completed anywhere for passEveryMs)? */
+  async passDue() {
+    if (now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS) await this._readShared();
+    const at = Number(this.shared?.at || 0);
+    return !at || now() - at > this.passEveryMs;
+  }
+
+  /**
+   * Run one settlement pass if one is due (or force), waiting at most budgetMs. The pass itself is
+   * idempotent; if this instance is frozen mid-pass, its lease expires and the next pass (any
+   * instance) carries on from the stored vault.
+   */
+  async maybePass({ force = false, budgetMs = 8000 } = {}) {
+    if (!this._loaded && this.vaultLoad.status !== 'FAILED') return { ran: false };
+    if (!force && !(await this.passDue())) return { ran: false };
+    let timer;
+    const finished = await Promise.race([
+      this.tick().then(() => true),
+      new Promise((r) => {
+        timer = setTimeout(() => r(false), budgetMs);
+        if (timer.unref) timer.unref();
+      })
+    ]).finally(() => clearTimeout(timer));
+    return { ran: true, finished };
+  }
+
+  /** Standby: refresh the writer status / replica (never during this instance's own pass). */
+  async _observe(maxAgeMs = 0) {
+    if (this._tickPromise) return this._tickPromise;
+    if (maxAgeMs && now() - this._sharedReadAt <= maxAgeMs) return;
+    if (this.writer.status !== 'STANDBY' || this.writer.canWrite()) return this.tick();
+    if (!this._observePromise) {
+      this._observePromise = this._standbyTick().finally(() => {
+        this._observePromise = null;
+      });
+    }
+    return this._observePromise;
   }
 
   async _readShared() {
@@ -1458,6 +1530,10 @@ export class ChainSettlement {
       seed: { epoch: this.engine.seedManager.epochId, hash: this.engine.seedManager.currentSeedHash },
       docSavedAt: this.state.savedAt ?? null,
       lastGoodTick: this.lastGoodTick || null,
+      goodAt: this.lastGoodTick || null,
+      passMs: this.passes.lastStartedAt ? now() - this.passes.lastStartedAt : null,
+      passMode: this.passMode,
+      ledger: this.ledgerProbe ? { status: this.ledgerProbe.status, lastError: this.ledgerProbe.lastError || null } : null,
       lastError: this.lastError || null
     };
   }
@@ -1478,7 +1554,7 @@ export class ChainSettlement {
   /** Standby: follow the shared vault document (read-only) and the writer's status. Never writes. */
   async _standbyTick() {
     const s = await this._readShared();
-    const due = !this._replicaAt || now() - this._replicaAt > this.leaderStatusMaxAgeMs;
+    const due = !this._replicaAt || now() - this._replicaAt > REPLICA_RELOAD_MS;
     if (due || (s && s.docSavedAt !== this._replicaSavedAt)) {
       try {
         const doc = await this._reloadFromStore();
@@ -1504,6 +1580,11 @@ export class ChainSettlement {
     const self = this.writer.canWrite();
     return {
       active: self || this._sharedFresh(),
+      passMode: this.passMode,
+      lastPassAt: s?.at ? new Date(Number(s.at)).toISOString() : null,
+      lastGoodPassAt: s?.goodAt ? new Date(Number(s.goodAt)).toISOString() : null,
+      goodPassAgeMs: s?.goodAt ? Math.max(0, now() - Number(s.goodAt)) : null,
+      passRunningHere: Boolean(this._tickPromise),
       thisInstance: self ? 'WRITER' : this.writer.status,
       statusAt: s?.at ? new Date(Number(s.at)).toISOString() : null,
       statusAgeMs: s?.at ? Math.max(0, now() - Number(s.at)) : null,
@@ -1725,7 +1806,14 @@ export class ChainSettlement {
       const res = await this.store.claim(`foreign-ack:${id}`, { txid: id, mode, at: new Date(now()).toISOString(), ...(note ? { note: String(note).slice(0, 200) } : {}) });
       done.push({ txid: id, mode: res.value.mode, ...(res.claimed ? {} : { alreadyAcknowledged: true }) });
     }
-    if (!writer) return { acknowledged: done, appliedBy: 'the bank writer on its next pass', foreign: list };
+    if (!writer) {
+      if (this.passMode) {
+        const r = await this.maybePass({ force: true, budgetMs: 8000 }).catch(() => ({ finished: false }));
+        await this._observe().catch(() => {});
+        if (r.finished && this._sharedFresh()) return { acknowledged: done, appliedBy: 'settlement pass', foreign: this.shared.foreignOutflows || [] };
+      }
+      return { acknowledged: done, appliedBy: 'the bank writer on its next pass', foreign: list };
+    }
     await this._applyForeignAcks();
     await this.flush();
     await this.tick();
@@ -1900,7 +1988,10 @@ export class ChainSettlement {
         if (rec.nextReceiptCheckAt && now() < rec.nextReceiptCheckAt) continue;
         rec.nextReceiptCheckAt = now() + this.rejectCheckIntervalMs;
         const receipt = await this._receipt(rec.txid);
-        if (!isRejectedReceipt(receipt)) continue;
+        if (!isRejectedReceipt(receipt)) {
+          await this._maybeRebroadcast(rec, receipt);
+          continue;
+        }
         const tx = await this.client.getTx(rec.txid).catch(() => undefined);
         if (tx !== null) continue; // on the ledger after all, or the explorer could not say
         this._markRejected(rec, String(receipt.error || 'rejected'), 'receipt');
@@ -1908,6 +1999,35 @@ export class ChainSettlement {
       }
       if (rec.status === 'REJECTED') await this._checkRejected(rec);
     }
+  }
+
+  /**
+   * A SENT payout the ledger has not seen after rebroadcastAfterMs (no receipt, explorer says unknown):
+   * send the SAME signed body again (same txid, same nonce). Never re-signed here: a new body or nonce
+   * only comes from the rejected-payout reconciler, after minepoa proves the old one can never land.
+   */
+  async _maybeRebroadcast(rec, receipt) {
+    if (!rec.body || rec.recoveredFromLedger || txidOf(rec.body) !== rec.txid) return false;
+    if (receipt !== null) return false; // included / pending (read node behind), or no answer: not lost
+    if (now() - (rec.lastBroadcastAt || rec.sentAt || 0) < this.rebroadcastAfterMs) return false;
+    if (rec.nextRebroadcastAt && now() < rec.nextRebroadcastAt) return false;
+    const seen = await this.client.getTx(rec.txid).catch(() => undefined);
+    if (seen !== null) return false; // on the ledger, or the explorer cannot say: never act on "unknown"
+    rec.rebroadcasts = (rec.rebroadcasts || 0) + 1;
+    rec.lastBroadcastAt = now();
+    try {
+      await this.client.submitTx(rec.body);
+      rec.lastError = null;
+      if (this.logger) this.logger(`payout ${rec.orderId} rebroadcast (same body ${rec.txid.slice(0, 16)}, nonce ${rec.nonce})`);
+    } catch (err) {
+      // Best effort only: a refusal here is judged by the receipt checks above, never by this call.
+      rec.lastError = `rebroadcast: ${String(err.message || err).slice(0, 160)}`;
+      rec.nextRebroadcastAt = this._payoutRetryAt(rec.rebroadcasts, err);
+      this.ledgerProbe?.reportFailure('payout rebroadcast', err);
+    }
+    this._save();
+    this._emit('settlement.updated', this._outboundView(rec));
+    return true;
   }
 
   async _checkRejected(rec) {
@@ -2056,7 +2176,9 @@ export class ChainSettlement {
       // Yield first: an early return must not run `finally` before this._tickPromise is assigned
       // (that would leave a settled promise in place and block every later tick).
       await null;
+      if (this._observePromise) await this._observePromise.catch(() => {}); // never mix a replica reload into a pass
       this._tickErrors = [];
+      let passStarted = false;
       try {
         if (this.fatalError) return;
         if (!this._loaded) {
@@ -2088,11 +2210,17 @@ export class ChainSettlement {
           else await this._readOnlyTick();
           return;
         }
+        passStarted = true;
+        this.passes.started += 1;
+        this.passes.lastStartedAt = now();
         if (this._leaderToken !== this.writer.lease.token) {
           // Newly the writer (or the lease changed hands): start from the shared document, not our copy,
           // and only if that document accounts for every bank outflow on the ledger.
           const doc = await this._reloadFromStore();
-          const missing = await this._unaccountedOutflows(doc);
+          // Pass mode: re-taking the lease right after our own pass (nobody held it in between, the
+          // document is exactly what we left) is the same writer continuing; the check already passed.
+          const continuing = Boolean(this._lastPass && doc && this._lastPass.holder === this.writer.holderId && this.writer.lease.token === this._lastPass.token + 1 && doc.savedAt === this._lastPass.savedAt);
+          const missing = continuing ? [] : await this._unaccountedOutflows(doc);
           const attest = new Set(this._attestPending || []);
           this._attestPending = null;
           const unexplained = (missing || []).filter((id) => !attest.has(id));
@@ -2135,10 +2263,23 @@ export class ChainSettlement {
         this.lastGoodTick = this._tickErrors.length ? this.lastGoodTick : now();
         await this._publishStatus();
         this.writer.tokenAtTickStart = null;
+        this.passes.completed += 1;
+        this.passes.lastCompletedAt = now();
+        this.passes.lastMs = now() - this.passes.lastStartedAt;
+        if (this.passMode && this.writer.canWrite()) {
+          // Hand the lease back: the next pass (any instance) can start at once instead of waiting for
+          // this instance's lease to expire while it is frozen between requests.
+          this._lastPass = { holder: this.writer.holderId, token: this.writer.lease.token, savedAt: this.state.savedAt ?? null, at: now() };
+          await this.writer.release();
+        }
       } catch (err) {
         this.lastError = String(err.message || err);
         this.lastErrorAt = now();
         if (this.logger) this.logger(`settlement tick error: ${this.lastError}`);
+        if (this.passMode && passStarted && this.writer.status === 'LEADER') {
+          this._lastPass = null; // the next writer reloads and re-checks the stored vault
+          await this.writer.release().catch(() => {});
+        }
       } finally {
         this._tickPromise = null;
       }
@@ -2208,7 +2349,7 @@ export class ChainSettlement {
     if (!row || typeof row.effectiveMicros !== 'bigint') return { known: false, code: 'BANK_BALANCE_UNKNOWN', reason: 'The bank balance on minepoa is unknown right now; bets are paused until it can be read.' };
     if (now() - this._lastRowAt > this.balanceStaleMs) return { known: false, code: 'BANK_BALANCE_STALE', reason: `The bank balance was last read ${Math.round((now() - this._lastRowAt) / 1000)}s ago; bets are paused until it is refreshed.` };
     let pendingOut = 0n;
-    for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT') pendingOut += toMicros(o.amountPoa);
+    for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
     for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
     const onChainFree = row.effectiveMicros - this._inFlightOutMicros(row.listedIds) - pendingOut - this.engine.devReserveMicros - this.engine.incentivePoolMicros;
     const nav = this.engine.bankNavMicros;
@@ -2233,7 +2374,7 @@ export class ChainSettlement {
   /** Refresh the bank balance (one tick) if it is missing or stale. */
   async ensureFreshBalance() {
     if (this.writer.status === 'STANDBY') {
-      if (now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS) await this.tick().catch(() => {});
+      if (now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS) await (this.passMode ? this._observe() : this.tick()).catch(() => {});
       return;
     }
     if (!this._lastRow || now() - this._lastRowAt > this.balanceStaleMs || !this.reconcile.at) await this.tick().catch(() => {});
@@ -2302,7 +2443,8 @@ export class ChainSettlement {
   /** Run one tick first if no reconcile pass has finished yet (cold start), then report the hold. */
   async ensureReconciled() {
     const standby = this.writer.status === 'STANDBY';
-    if (standby ? now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS : !this.reconcile.at) await this.tick().catch(() => {});
+    if (standby && this.passMode) await this._observe(STANDBY_STATUS_REFRESH_MS).catch(() => {});
+    else if (standby ? now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS : !this.reconcile.at) await this.tick().catch(() => {});
     if (this.ledgerProbe) await this.ledgerProbe.maybeProbe().catch(() => {});
     return this.tradingHold();
   }
@@ -2323,7 +2465,8 @@ export class ChainSettlement {
   _standbyHold() {
     if (!this._sharedFresh()) {
       const age = this.shared?.at ? `${Math.round((now() - Number(this.shared.at)) / 1000)} s ago` : 'never';
-      return { status: NO_ACTIVE_LEADER, reason: `No bank writer is active (last status: ${age}; limit ${Math.round(this.leaderStatusMaxAgeMs / 1000)} s). Bets and withdrawals are refused until one reports in.`, writer: NO_ACTIVE_LEADER };
+      const good = this.shared?.goodAt ? `${Math.round((now() - Number(this.shared.goodAt)) / 1000)} s ago` : 'never';
+      return { status: NO_ACTIVE_LEADER, reason: `No settlement pass has completed recently (last good pass: ${good}; last status: ${age}; limit ${Math.round(this.leaderStatusMaxAgeMs / 1000)} s). Bets and withdrawals are refused until one does.`, writer: NO_ACTIVE_LEADER };
     }
     if (this.shared.hold) return { status: this.shared.hold.status, reason: this.shared.hold.reason };
     return this.ledgerProbe ? this.ledgerProbe.hold() : null;
@@ -2528,9 +2671,11 @@ export class ChainSettlement {
         if (this.logger) this.logger(`reconcile: booked unmatched bank outflow ${id.slice(0, 16)} (${o.amountPoa} POA)`);
       }
       if (recovered) this._save();
-      // 3. the books must be covered by the confirmed on-chain balance
+      // 3. the books must be covered by the confirmed on-chain balance. A signed or sent payout that the
+      //    ledger view does not show yet is subtracted from the balance (in flight) and is NOT counted as
+      //    owed again, so a payout in flight never trips SOLVENCY_HOLD.
       let pendingOut = 0n;
-      for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT') pendingOut += toMicros(o.amountPoa);
+      for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
       for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
       const required = this.engine.bankNavMicros + this.engine.devReserveMicros + this.engine.incentivePoolMicros + pendingOut;
       const available = row.effectiveMicros - this._inFlightOutMicros(row.listedIds);

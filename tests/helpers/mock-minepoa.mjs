@@ -66,6 +66,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     res.end(JSON.stringify(obj));
   };
 
+  let readBusy = 0; // retry_after_seconds: explorer + receipt reads answer 503 "origin busy" (like 2026-10-26)
   let outage = 0; // when set, these paths answer this HTTP status (minepoa can't accept txs)
   let outagePaths = ['/api/txs', '/api/submit'];
   const server = http.createServer(async (req, res) => {
@@ -99,6 +100,9 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       if (fault?.kind === '503') return json(res, 503, { error: 'node busy' });
       if (fault?.kind === 'drop') return req.socket.destroy();
       if (fault?.kind === 'reject') return json(res, 400, { error: fault.message || 'rejected' });
+      if (fault?.kind === 'busy') return json(res, 503, { error: 'origin busy — retry shortly', retry_after_seconds: fault.retryAfter ?? 1 });
+      // blackhole: the node says "queued" but the tx never reaches the ledger (and has no receipt)
+      if (fault?.kind === 'blackhole') return json(res, 200, { ok: true, id: txidOf(body), queued: true });
       if (kind !== 'tx') return json(res, 400, { error: 'kind must be tx' });
       const id = txidOf(body);
       if (txs.has(id)) return json(res, 409, { error: 'duplicate tx' });
@@ -113,6 +117,9 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       return json(res, 200, { ok: true, txid: id, next_nonce: body.nonce + 1 });
     }
     let m;
+    if (req.method === 'GET' && readBusy && /^\/api\/(explorer\/(tx|address)|receipt)\//.test(p)) {
+      return json(res, 503, { error: 'origin busy — served capacity is reserved for mining/grading right now; retry shortly', retry_after_seconds: readBusy });
+    }
     if (req.method === 'GET' && readFaults.length && /^\/api\/(explorer\/tx|receipt)\//.test(p)) {
       const f = readFaults.shift();
       if (f === 'busy') return json(res, 200, { error: 'origin busy, retry' });
@@ -201,6 +208,10 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     /** The next GETs of /api/explorer/tx/* and /api/receipt/* fail: '503' or 'busy' (200 with an error). */
     failReads: (...modes) => {
       readFaults = readFaults.concat(modes);
+    },
+    /** Explorer and receipt reads answer 503 "origin busy" with retry_after_seconds (0 = off). */
+    setReadBusy: (seconds = 60) => {
+      readBusy = seconds || 0;
     },
     clearReadFaults: () => {
       readFaults = [];

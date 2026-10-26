@@ -15,7 +15,10 @@
  *     silently drops every DICE1 transfer. Memos come from /api/explorer/tx/<id> (cached here).
  *   - The address `balance` is the balance as of the last signed checkpoint
  *     (`balance_as_of.checkpoint_height`). Final txs above that height are NOT in it yet.
- *   - The read node sometimes answers 503 "origin busy" with retry_after_seconds.
+ *   - The read node sometimes answers 503 "origin busy" with retry_after_seconds. A short retry_after
+ *     (up to 5 s) is retried inside the call; a longer one opens a busy window (reads and submits are
+ *     tracked separately): calls in that window fail fast with BusyError instead of waiting, so a
+ *     bounded settlement pass is not spent sleeping. Callers treat it as "unknown", never as a verdict.
  *
  * Tx bodies follow poa.mjs buildTx: {type, from, to, amount, memo, nonce, parents[2], ts, cid, sig},
  * txid = sha256(canonical(body without sig)).
@@ -36,6 +39,21 @@ export class SubmitError extends Error {
   }
 }
 
+/** minepoa asked us to come back later (retry_after) or is inside such a window. Never a verdict on a tx. */
+export class BusyError extends Error {
+  constructor(message, { retryAfterMs = 0, scope = 'read' } = {}) {
+    super(message);
+    this.name = 'BusyError';
+    this.busy = true;
+    this.status = 503;
+    this.definitive = false;
+    this.retryAfterMs = retryAfterMs;
+    this.scope = scope;
+  }
+}
+
+const IN_CALL_RETRY_AFTER_MS = 5000;
+
 export class MinepoaClient {
   constructor({
     nodeUrl = 'https://minepoa.com',
@@ -44,7 +62,8 @@ export class MinepoaClient {
     timeoutMs = Number(process.env.POA_MINEPOA_TIMEOUT_MS || 25000),
     retries = Number(process.env.POA_MINEPOA_RETRIES || 3),
     retryBaseMs = 400,
-    sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    busyMaxMs = 60000
   } = {}) {
     this.nodeUrl = String(nodeUrl).replace(/\/+$/, '');
     this.fetch = fetchImpl;
@@ -54,7 +73,34 @@ export class MinepoaClient {
     this.retryBaseMs = retryBaseMs;
     this.sleep = sleep;
     this._memoCache = new Map(); // txid -> memo (memos are immutable once on the ledger)
-    this.stats = { calls: 0, retries: 0, timeouts: 0, lastLatencyMs: null };
+    this.stats = { calls: 0, retries: 0, timeouts: 0, lastLatencyMs: null, busy: 0, busyFastFails: 0 };
+    this.busyMaxMs = busyMaxMs;
+    this._busyUntil = { read: 0, submit: 0 };
+  }
+
+  /** {until, scope} while minepoa's retry_after window for this scope is open; else null. */
+  busy(scope = 'read') {
+    const until = this._busyUntil[scope] || 0;
+    return until > Date.now() ? { scope, until, retryAfterMs: until - Date.now() } : null;
+  }
+
+  busyView() {
+    const iso = (t) => (t > Date.now() ? new Date(t).toISOString() : null);
+    return { readBusyUntil: iso(this._busyUntil.read), submitBusyUntil: iso(this._busyUntil.submit) };
+  }
+
+  _noteBusy(scope, retryAfterMs) {
+    const ms = Math.min(this.busyMaxMs, Math.max(1000, retryAfterMs));
+    this._busyUntil[scope] = Math.max(this._busyUntil[scope] || 0, Date.now() + ms);
+    this.stats.busy += 1;
+    return ms;
+  }
+
+  _failFast(scope, what) {
+    const b = this.busy(scope);
+    if (!b) return;
+    this.stats.busyFastFails += 1;
+    throw new BusyError(`minepoa ${what} -> busy (retry after ${Math.ceil(b.retryAfterMs / 1000)} s)`, { retryAfterMs: b.retryAfterMs, scope });
   }
 
   explorerTxUrl(txid) {
@@ -68,6 +114,7 @@ export class MinepoaClient {
    */
   async _get(path) {
     let lastErr = null;
+    this._failFast('read', path.split('?')[0]);
     for (let attempt = 1; attempt <= this.retries; attempt++) {
       const t0 = Date.now();
       this.stats.calls += 1;
@@ -88,11 +135,24 @@ export class MinepoaClient {
       }
       this.stats.lastLatencyMs = Date.now() - t0;
       if (resp.status === 404) return null;
-      if (resp.ok) return resp.json();
+      if (resp.ok) {
+        const body = await resp.json();
+        const ra = Number(body?.retry_after_seconds || 0) * 1000;
+        if (body && !body.id && body.error && ra > IN_CALL_RETRY_AFTER_MS) {
+          const ms = this._noteBusy('read', ra);
+          throw new BusyError(`minepoa ${path.split('?')[0]} -> busy: ${String(body.error).slice(0, 80)}`, { retryAfterMs: ms, scope: 'read' });
+        }
+        return body;
+      }
       let retryAfterMs = 0;
       if (resp.status === 429 || resp.status >= 500) {
         const j = await resp.json().catch(() => null);
-        retryAfterMs = Math.min(5000, Number(j?.retry_after_seconds || resp.headers?.get?.('retry-after') || 0) * 1000) || 0;
+        const ra = Number(j?.retry_after_seconds || resp.headers?.get?.('retry-after') || 0) * 1000 || 0;
+        if (ra > IN_CALL_RETRY_AFTER_MS) {
+          const ms = this._noteBusy('read', ra);
+          throw new BusyError(`minepoa ${path.split('?')[0]} -> HTTP ${resp.status} busy${j?.error ? `: ${String(j.error).slice(0, 80)}` : ''}`, { retryAfterMs: ms, scope: 'read' });
+        }
+        retryAfterMs = Math.min(IN_CALL_RETRY_AFTER_MS, ra);
         lastErr = new Error(`minepoa ${path.split('?')[0]} -> HTTP ${resp.status}`);
         if (attempt < this.retries) {
           this.stats.retries += 1;
@@ -204,6 +264,7 @@ export class MinepoaClient {
 
   /** Broadcast. Throws SubmitError; .definitive=true for a 4xx rejection (except 408/409 dup/429). */
   async submitTx(body) {
+    this._failFast('submit', '/api/submit');
     let resp;
     try {
       resp = await this.fetch(`${this.nodeUrl}/api/submit`, {
@@ -213,10 +274,20 @@ export class MinepoaClient {
         signal: AbortSignal.timeout(this.timeoutMs)
       });
     } catch (err) {
-      throw new SubmitError(`minepoa submit network error: ${err.message}`, { status: 0, definitive: false });
+      const e = new SubmitError(`minepoa submit network error: ${err.message}`, { status: 0, definitive: false });
+      e.timeout = err?.name === 'TimeoutError' || /timeout|aborted/i.test(String(err?.message));
+      throw e;
     }
     const j = await resp.json().catch(() => ({}));
     if (resp.ok) return j || {};
+    const ra = Number(j?.retry_after_seconds || resp.headers?.get?.('retry-after') || 0) * 1000 || 0;
+    if ((resp.status === 429 || resp.status === 503) && ra > 0) {
+      const ms = this._noteBusy('submit', ra);
+      const e = new SubmitError(`minepoa submit busy: ${String(j?.error || `HTTP ${resp.status}`).slice(0, 120)}`, { status: resp.status, definitive: false, body: j });
+      e.busy = true;
+      e.retryAfterMs = ms;
+      throw e;
+    }
     const msg = String(j?.error || `HTTP ${resp.status}`);
     // 401/403 (auth / gateway) and 404/405 (route gone) say nothing about the tx itself: not definitive.
     const definitive = resp.status >= 400 && resp.status < 500 && ![401, 403, 404, 405, 408, 409, 425, 429].includes(resp.status);
