@@ -255,7 +255,7 @@ The minepoa ledger is the source of truth, and every tick rescans the bank addre
   - the order is `CONFIRMED` from a receipt alone, more than `stuckAfterMs` ago, and was never re-paid;
   - the ledger probe is `OK` (not `DEGRADED` or `UNAVAILABLE`), and a fresh, complete read of the bank's history (not the last trusted read) does not list the original txid;
   - no bank transfer on the ledger carries the order's `:ord=` tag, and no other payout or refund for the same bet exists;
-  - the explorer answers "not found" for the original txid (an error or busy answer refuses);
+  - an independent index, POAScan (`https://poascan.io`, set with `POA_DICE_POASCAN_URL`; `off` disables it and every re-pay then refuses), answers a definite "not found" for the original txid (HTTP 404, `found: false`, `node: "not_found"`), and lists neither the original txid nor any bank transfer tagged with the order's `:ord=` in the bank's or the recipient's history. minepoa's explorer is asked too and a "found" there refuses, but its "not found" alone never passes: its read node has answered "not in segments" or "origin busy" for, and left out of address pages, a payout that was final and in a signed checkpoint. A busy, failed or unclear answer from POAScan refuses. The check's detail names the source that answered;
   - the recipient's history does not list the original txid, and no bank transfer of that exact amount to the recipient carries the order's tag;
   - another final bank transaction used the original nonce, so the original body can never land later.
 
