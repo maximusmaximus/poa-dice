@@ -10,6 +10,10 @@
  * (/api/stream) with reconnect + polling fallback.
  */
 
+import { createChatFeed } from './chat/chat-feed.js';
+import { buildChatJoinPrompt } from './chat/chat-join-prompt.js';
+import { initDismissibleNotice } from './notice-dismiss.js';
+
 const BATCH_COUNTS = [1, 5, 100, 1000];
 const SEED_RE = /^[A-Za-z0-9._-]{1,48}$/;
 const AMOUNT_RE = /^\d+(?:\.\d{1,6})?$/;
@@ -30,7 +34,6 @@ const state = {
   batchQuotes: null,
   actionQuotes: null,
   recentBets: [],
-  chatMessages: [],
   stakers: [],
   sseConnected: false,
   batch: null,
@@ -144,7 +147,7 @@ function transferLines(tpl) {
 
 /**
  * signing: 'signed_tx' | 'signed_txs' (self-custody transfers from `transfer`),
- *          'signature' (chat), 'privkey_only' (auto-bet), 'from_quote' (claim: memo comes from the dry run).
+ *          'privkey_only' (auto-bet), 'from_quote' (claim: memo comes from the dry run).
  */
 export function buildAgentPrompt({ title, tool, args, quoteTool, quoteArgs, spendCapPoa, stop, report, transfer = null, signing = 'signed_tx', address = '' }) {
   const lines = [
@@ -174,11 +177,6 @@ export function buildAgentPrompt({ title, tool, args, quoteTool, quoteArgs, spen
     lines.push(
       `${step++}. Build and sign LOCALLY exactly 1 minepoa transfer from my wallet: chain id ${transfer?.chainId || state.summary?.chainId || 'poa-mainnet-1'}, to ${to}, amount ${WITHDRAW_TRIGGER} POA, memo exactly as in the dry run's "transferTemplate" (it carries the exact share units). No fee field, no other transfers.`,
       `${step++}. Then call \`${tool}\` with exactly these arguments, plus "signed_tx": <the signed transfer>:`,
-      JSON.stringify(args, null, 2)
-    );
-  } else if (signing === 'signature') {
-    lines.push(
-      `${step++}. Sign the exact message text below with my Ed25519 key LOCALLY (no transfer, no POA spent), then call \`${tool}\` with exactly these arguments plus "address" (my poa1 address) and "signature" (Base58):`,
       JSON.stringify(args, null, 2)
     );
   } else if (signing === 'privkey_only') {
@@ -322,20 +320,6 @@ function actionPrompt(kind) {
       report: 'rolls executed, wins/losses, net POA, stopped reason and each bet_txid.',
     });
   }
-  if (kind === 'chat') {
-    const text = String($('chatTextInput').value || '').trim();
-    return buildAgentPrompt({
-      title: 'Post a signed chat message in the POA Dice room',
-      tool: 'chat_send',
-      args: { text, sender_name: String($('chatSenderInput').value || 'Agent').trim() },
-      quoteTool: null,
-      spendCapPoa: '0',
-      signing: 'signature',
-      address: addr,
-      stop: 'post once.',
-      report: 'the posted message id and whether the signature verified.',
-    });
-  }
   return '';
 }
 
@@ -420,7 +404,6 @@ const ACTIONS = [
   { kind: 'withdraw', btn: 'btnSubmitWithdraw', reason: 'withdrawReason', label: 'Copy withdraw prompt' },
   { kind: 'claim', btn: 'btnCopyClaim', reason: 'claimReason', label: 'Copy claim-yield prompt' },
   { kind: 'autoBet', btn: 'btnCopyAutoPrompt', reason: 'autoBetReason', label: 'Copy auto-bet prompt' },
-  { kind: 'chat', btn: 'btnCopyChatPrompt', reason: 'chatReason', label: 'Copy agent chat prompt (signed)' },
 ];
 
 function renderActionAvailability() {
@@ -428,9 +411,9 @@ function renderActionAvailability() {
   for (const a of ACTIONS) {
     const aq = q?.[a.kind];
     let reason = null;
-    if (state.ledgerPaused && a.kind !== 'chat') reason = LEDGER_PAUSED_TEXT;
+    if (state.ledgerPaused) reason = LEDGER_PAUSED_TEXT;
     else if (!q) reason = 'Checking availability…';
-    else if (q.addressError && a.kind !== 'chat') reason = q.addressError;
+    else if (q.addressError) reason = q.addressError;
     else if (!aq?.valid) reason = aq?.reason || 'Unavailable';
     if (a.kind === 'autoBet' && !reason) {
       const local = localRollProblem();
@@ -459,13 +442,12 @@ async function fetchActionQuotes() {
       strategy: $('autoStrategySelect').value || 'flat',
       autoRolls: String($('autoRollsInput').value || 5),
       clientSeed: seedValue(),
-      chatText: String($('chatTextInput').value || ''),
     });
     const res = await fetch(api(`/api/quote/actions?${qs}`));
     state.actionQuotes = await res.json();
   } catch {
     const down = { valid: false, reason: 'Server unreachable' };
-    state.actionQuotes = { stake: down, withdraw: down, claim: down, autoBet: down, chat: down };
+    state.actionQuotes = { stake: down, withdraw: down, claim: down, autoBet: down };
   }
   renderActionAvailability();
 }
@@ -608,10 +590,7 @@ function applyStateSnapshot(data) {
     mergeBets(data.recentBets);
     renderBetsSoon();
   }
-  if (Array.isArray(data.recentChat)) {
-    state.chatMessages = [...data.recentChat].reverse();
-    renderChatMessages();
-  }
+  chatFeed?.setSnapshot(data.recentChat);
   updateOfflineCommandPreview();
 }
 
@@ -795,21 +774,17 @@ function renderBatchProgress() {
   el.innerHTML = `<div class="batch-bar"><span style="width:${pct}%"></span></div><span id="batchProgressText">${b.completed ? 'Batch finished' : 'Agent batch running'}: ${b.done || 0}/${b.count} rolls · ${b.wins || 0} wins · net ${formatNum(b.netPoa || 0, 4)} POA${b.stoppedReason && b.stoppedReason !== 'completed_all_rolls' ? ` · stopped: ${escapeHtml(b.stoppedReason)}` : ''}</span>`;
 }
 
-function renderChatMessages() {
-  $('chatCountBadge').textContent = String(state.chatMessages.length);
-  const list = $('chatMessagesList');
-  if (state.chatMessages.length === 0) {
-    list.innerHTML = '<div class="chat-msg"><div class="chat-text">No messages yet.</div></div>';
-    return;
-  }
-  list.innerHTML = state.chatMessages
-    .slice(-50)
-    .map((m) => {
-      const time = m.ts ? new Date(m.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
-      return `<div class="chat-msg"><div class="chat-msg-header"><div><span class="chat-sender">${escapeHtml(m.senderName || shortAddr(m.address))}</span>${m.isAgent ? ' <span class="badge badge-cyan">AGENT</span>' : ' <span class="badge">HUMAN</span>'}${m.verified ? ' <span class="badge badge-emerald" title="Ed25519 Signature Verified">✓ SIG</span>' : ''}</div><span>${escapeHtml(time)}</span></div><div class="chat-text">${escapeHtml(m.text)}</div></div>`;
-    })
-    .join('');
-  list.scrollTop = list.scrollHeight;
+// ─── Chat: read-only feed + "Join the chat with your agent" prompt ─────────
+
+let chatFeed = null;
+
+function chatJoinPrompt() {
+  return buildChatJoinPrompt({ mcpUrl: mcpUrl(), address: state.playerAddress, pageUrl: `${window.location.origin}${window.location.pathname}` });
+}
+
+function renderChatJoin() {
+  $('chatJoinMcpUrl').textContent = mcpUrl();
+  $('chatJoinPreview').textContent = chatJoinPrompt();
 }
 
 async function runVerifyRoll() {
@@ -1072,12 +1047,18 @@ export function bootPoaDice() {
   const myGen = ++bootGeneration;
   const alive = () => myGen === bootGeneration && !!document.getElementById('btnCopyPrompt');
   try { applyBrandLogo(); } catch { /* keep the default logo */ }
+  let storage = null;
+  try { storage = window.localStorage; } catch { storage = null; }
+  initDismissibleNotice({ noticeEl: document.getElementById('legalNotice'), closeEl: document.getElementById('legalNoticeClose'), storage, rootEl: document.documentElement });
+  chatFeed = createChatFeed({ listEl: document.getElementById('chatMessagesList'), countEl: document.getElementById('chatCountBadge') });
+  chatFeed.render();
   bindEvents();
   const saved = loadSavedAddress();
   if (saved && !String($('playerAddressInput').value || '').trim()) {
     $('playerAddressInput').value = saved;
     state.playerAddress = saved;
   }
+  renderChatJoin();
   updateSliderVisuals();
   renderRollAvailability();
   void (async () => {
@@ -1169,10 +1150,7 @@ function handleRealtimeEvent(msg) {
       refreshQuotesSoon();
       break;
     case 'chat.message':
-      if (!state.chatMessages.some((c) => c.id === p.id)) {
-        state.chatMessages.push(p);
-        renderChatMessages();
-      }
+      chatFeed?.add(p);
       break;
     default:
       // bank.deposit / bank.withdraw / seed.rotated / dev.swept / epoch.advanced / refunds …
@@ -1239,6 +1217,7 @@ function bindEvents() {
     const a = String($('playerAddressInput').value || '').trim();
     state.playerAddress = ADDR_RE.test(a) ? a : '';
     if (state.playerAddress || !a) saveAddress(state.playerAddress);
+    renderChatJoin();
     onRollInput();
     refreshStateSoon();
   });
@@ -1269,7 +1248,7 @@ function bindEvents() {
     fetchActionQuotes();
     fetchDepositQuote();
   }, 150);
-  ['depositAmountInput', 'lockEpochsInput', 'referrerInput', 'autoStrategySelect', 'autoRollsInput', 'chatTextInput', 'chatSenderInput'].forEach((id) => {
+  ['depositAmountInput', 'lockEpochsInput', 'referrerInput', 'autoStrategySelect', 'autoRollsInput'].forEach((id) => {
     $(id).addEventListener('input', onActionInput);
     $(id).addEventListener('change', onActionInput);
   });
@@ -1310,18 +1289,10 @@ function bindEvents() {
   $('btnCopyOfflineCmd').addEventListener('click', async () => {
     if (await copyText($('liveOfflineCommand').textContent)) flashCopied($('btnCopyOfflineCmd'), null, 'Copy Command');
   });
-  // Plain human chat (unsigned, no key). Signed agent chat goes through the copy-prompt button.
-  $('chatForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const text = $('chatTextInput').value.trim();
-    if (!text) return;
-    $('chatTextInput').value = '';
-    await fetch(api('/api/chat'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ senderName: $('chatSenderInput').value.trim() || 'Guest', text, isAgent: false }),
-    });
-    fetchActionQuotes();
+  $('btnCopyChatJoin').addEventListener('click', async () => {
+    const text = chatJoinPrompt();
+    $('chatJoinPreview').textContent = text;
+    if (await copyText(text)) flashCopied($('btnCopyChatJoin'), null, 'Copy prompt');
   });
   $('btnRunVerify').addEventListener('click', runVerifyRoll);
 }

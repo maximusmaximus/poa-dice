@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createDiceServer } from '../src/server.mjs';
-import { genKeypair } from '../src/crypto-poa.mjs';
+import { genKeypair, signRaw } from '../src/crypto-poa.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from '../src/bankroll-engine.mjs';
 
 const CHROME = process.env.CHROME_PATH || '/usr/bin/google-chrome';
@@ -76,6 +76,7 @@ async function openPage(browser, url) {
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()} @ ${m.location()?.url || ''}`); });
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('[data-roll-count]:not([disabled])').length > 0 || /0 available|CHAIN DOWN|unreachable/i.test(document.getElementById('promptBlockReason')?.textContent || ''), null, { timeout: 10000 });
   return { page, context, errors };
@@ -439,19 +440,33 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       assert.equal(auto.isError, false, JSON.stringify(auto.data).slice(0, 300));
       await page.waitForFunction((b) => Number(document.getElementById('statTotalBets').textContent) >= b + 3, before, { timeout: 5000 });
 
-      // Chat
+      // Chat: read-only feed, no human posting, copy-paste "join with your agent" prompt
       await page.click('[data-feed-tab="chat"]');
-      await page.waitForFunction(() => document.getElementById('btnCopyChatPrompt').disabled);
-      await setInput(page, '#chatTextInput', 'gm from the e2e agent');
-      await page.waitForFunction(() => !document.getElementById('btnCopyChatPrompt').disabled);
-      await page.click('#btnCopyChatPrompt');
+      for (const id of ['chatForm', 'chatTextInput', 'chatSenderInput', 'chatIsAgentCheck', 'btnCopyChatPrompt']) {
+        assert.equal(await page.$(`#${id}`), null, `#${id} must not exist`);
+      }
+      assert.equal(await page.$('#feedTabChat input, #feedTabChat textarea, #feedTabChat form'), null, 'no typing field in the chat');
+      assert.match(await page.textContent('#chatJoinTitle'), /Join the chat with your agent/);
+      assert.equal(await page.textContent('#chatJoinMcpUrl'), `${srv.url}/mcp`);
+      await page.click('#btnCopyChatJoin');
       const chatText = await clipboard(page);
-      assert.match(chatText, /chat_send[\s\S]*gm from the e2e agent/);
-      assert.match(chatText, /no transfer, no POA spent[\s\S]*"signature"/);
+      assert.equal(chatText, await page.textContent('#chatJoinPreview'), 'preview shows exactly what is copied');
+      assert.ok(chatText.includes(`MCP server: ${srv.url}/mcp`));
+      assert.match(chatText, /`chat_read`[\s\S]*`chat_send`/);
+      assert.match(chatText, /"signature": "<Base58 signature>"/);
+      assert.match(chatText, /never send my private key/);
+      assert.ok(!/"privkey":/.test(chatText), 'prompt never asks for a privkey argument');
       t0 = Date.now();
-      const chat = await mcp(srv.url, 'chat_send', { text: 'signed hello', sender_name: 'E2E', privkey: player.privkey });
-      assert.equal(chat.isError, false);
+      const unsigned = await mcp(srv.url, 'chat_send', { text: 'unsigned hello', sender_name: 'E2E' });
+      assert.equal(unsigned.isError, true);
+      const viaKey = await mcp(srv.url, 'chat_send', { text: 'key hello', sender_name: 'E2E', privkey: player.privkey });
+      assert.equal(viaKey.isError, true);
+      assert.equal(viaKey.data.code, 'privkey_refused');
+      const chat = await mcp(srv.url, 'chat_send', { text: 'signed hello', sender_name: 'E2E', address: player.address, signature: signRaw('signed hello', player.privRaw) });
+      assert.equal(chat.isError, false, JSON.stringify(chat.data));
       await page.waitForFunction(() => /signed hello/.test(document.getElementById('chatMessagesList').textContent), null, { timeout: 5000 });
+      assert.match(await page.textContent('#chatMessagesList'), /✓ SIG/);
+      assert.ok(!/unsigned hello|key hello/.test(await page.textContent('#chatMessagesList')));
       latency.chatMs = Date.now() - t0;
       assert.equal(await page.evaluate(() => window.__noReload), 'still-here');
     });
@@ -467,6 +482,23 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       await setInput(page, '#playerAddressInput', '');
       assert.equal(await page.evaluate(() => localStorage.getItem('poaDice.playerAddress')), null);
       await page.waitForFunction(() => /My PoA address: not given/.test(document.getElementById('promptPreview').textContent));
+    });
+
+    await t.test('the "Governance token utility only" notice closes with X and stays closed after a reload', async () => {
+      await page.evaluate(() => localStorage.removeItem('poaDice.legalNoticeDismissed'));
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('#legalNotice', { state: 'visible' });
+      assert.match(await page.textContent('#legalNotice'), /Governance token utility only/);
+      assert.equal(await page.getAttribute('#legalNoticeClose', 'aria-label'), 'Close this notice');
+      await page.click('#legalNoticeClose');
+      assert.equal(await page.isVisible('#legalNotice'), false);
+      assert.equal(await page.evaluate(() => localStorage.getItem('poaDice.legalNoticeDismissed')), '1');
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('legalNotice')).display), 'none', 'hidden on first paint after reload');
+      await page.waitForFunction(() => document.getElementById('legalNotice').hidden === true, null, { timeout: 5000 });
+      assert.equal(await page.isVisible('#legalNotice'), false);
+      assert.equal(await page.getAttribute('.site-footer a#footerTermsLink', 'href'), '/terms.html', 'Terms stay reachable after closing');
+      if (shotsDir) await page.screenshot({ path: path.join(shotsDir, 'legal-dismissed.png'), clip: { x: 0, y: 0, width: 1400, height: 400 } });
     });
 
     assert.deepEqual(errors, [], 'no page errors');

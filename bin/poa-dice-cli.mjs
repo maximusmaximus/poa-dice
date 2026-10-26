@@ -16,6 +16,7 @@ import {
   buildSignedTransfer,
   formatDiceMemo,
   redactSecrets,
+  signRaw,
 } from '../src/crypto-poa.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from '../src/bankroll-engine.mjs';
 import { LedgerWatcher } from '../src/ledger-watcher.mjs';
@@ -255,9 +256,10 @@ async function main() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             address: wallet.address,
-            senderName: args.name || 'CLI-Agent',
+            sender_name: args.name || 'CLI-Agent',
             text,
-            isAgent: true,
+            // Signed locally; the key never leaves this machine.
+            signature: signRaw(text, wallet.privRaw),
           }),
         }),
       (engine, watcher) => {
