@@ -158,14 +158,17 @@ test('second instance without the lease is read-only; after the writer stops it 
     await b.settle();
     assert.equal(a.app.settlement.writer.status, 'LEADER');
     assert.equal(b.app.settlement.writer.status, 'STANDBY');
-    assert.equal(b.app.settlement.tradingHold().status, 'SIGNER_READ_ONLY');
+    assert.equal(b.app.settlement.writer.canWrite(), false, 'the standby never signs');
+    assert.equal(b.app.settlement.tradingHold(), null, 'the standby follows the writer\'s published status (open)');
     const x = bet(mock, p, bank, 'shared-store', 9500);
     mock.directSubmit(x.body);
     for (let i = 0; i < 6; i++) await Promise.all([a.app.settlement.tick(), b.app.settlement.tick()]);
     await Promise.all([a.app.settlement.idle(), b.app.settlement.idle()]);
     const ra = a.app.engine.processedTxids.get(x.id);
     assert.ok(ra, 'the writer rolled the bet');
-    assert.equal(b.app.engine.processedTxids.has(x.id), false, 'the standby did not');
+    assert.equal(b.app.settlement.writer.canWrite(), false, 'the standby did not roll it (it only mirrors the shared books)');
+    const mirrored = b.app.engine.processedTxids.get(x.id);
+    if (mirrored) assert.equal(mirrored.rollBps, ra.rollBps, 'the standby mirror shows the writer\'s roll');
     const sentBefore = mock.transfersFrom(bank.address).length;
     await a.close(); // releases the lease
     await b.settle(6);

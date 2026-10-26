@@ -207,7 +207,8 @@ test('two rebuilt instances on one shared store: only the lease holder reconcile
     assert.equal(w.app.engine.processedTxids.get(h.bet.id).payoutTxid, h.payoutTxid);
     assert.equal(w.app.settlement.tradingHold(), null);
     assert.equal(standby.app.engine.processedTxids.has(h.bet.id), false, 'standby copy books nothing');
-    assert.equal(standby.app.settlement.tradingHold().status, 'SIGNER_READ_ONLY');
+    assert.equal(standby.app.settlement.writer.canWrite(), false, 'the standby never signs');
+    assert.equal(standby.app.settlement.tradingHold(), null, 'the standby follows the writer\'s published status (open)');
     assert.ok(claims.has(`reconcile:${h.payoutTxid}`), 'decision claimed once in the shared store');
     assert.equal(h.mock.transfersFrom(h.bank.address).length, 1);
   } finally {

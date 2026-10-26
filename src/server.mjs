@@ -202,6 +202,8 @@ export function createDiceServer(options = {}) {
             },
             loadRetryBaseMs: options.loadRetryBaseMs ?? 2000,
             loadRetryMaxMs: options.loadRetryMaxMs ?? 60000,
+            // Other instances refuse bets when the bank writer's published status is older than this.
+            leaderStatusMaxAgeMs: options.leaderStatusMaxAgeMs ?? (Number(signerEnv.POA_DICE_LEADER_STATUS_MAX_AGE_MS) || 30000),
             bindOnBoot: bindTarget === key.wallet.address,
             engine,
             watcher,
@@ -261,6 +263,9 @@ export function createDiceServer(options = {}) {
   const chainCacheMs = options.chainCacheMs ?? 15000;
   const devEndpoints = options.devEndpoints !== undefined ? Boolean(options.devEndpoints) : process.env.POA_DICE_DEV_ENDPOINTS === '1';
   const adminToken = options.adminToken !== undefined ? options.adminToken : process.env.POA_DICE_ADMIN_TOKEN || null;
+  // Vercel Cron sends `Authorization: Bearer $CRON_SECRET` to /api/settlement/tick.
+  const cronSecret = options.cronSecret !== undefined ? options.cronSecret : process.env.CRON_SECRET || null;
+  const tickBudgetMs = options.tickBudgetMs ?? 25000;
   const chainCache = new Map();
   const pendingSpend = new Map(); // address -> micros reserved by in-flight batches
   let chainDebits = dataDir ? loadDebits(dataDir) : [];
@@ -365,6 +370,15 @@ export function createDiceServer(options = {}) {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
+  function bearerIs(req, secret) {
+    if (!secret) return false;
+    const auth = String(req.headers.authorization || '');
+    const given = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const a = Buffer.from(given);
+    const b = Buffer.from(String(secret));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
   function denyAdmin(res) {
     return sendJson(res, adminToken ? 401 : 403, {
       ok: false,
@@ -461,6 +475,7 @@ export function createDiceServer(options = {}) {
       outbound: sum.outbound,
       stuckPayouts: sum.stuckPayouts,
       writer: sum.writer,
+      leader: sum.leader,
       foreignOutflows: sum.foreignOutflows,
       vaultLoad: sum.vaultLoad
     };
@@ -481,10 +496,44 @@ export function createDiceServer(options = {}) {
       const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       const pathname = urlObj.pathname;
       // Hosts that freeze idle instances stall setInterval; any request nudges a stale settlement loop.
-      if (settlement && (!readOnlyState || readOnlyState.retrying) && settlement._timer && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
+      // Serverless instances have no loop timer at all; the request kick (and the cron tick) drive them.
+      if (settlement && (!readOnlyState || readOnlyState.retrying) && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
 
       if (readOnlyState && req.method === 'POST' && WRITE_PATHS.has(pathname)) {
         return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });
+      }
+
+      // One bounded settlement pass (Vercel Cron, every minute): take or renew the bank writer lease and,
+      // as the writer, settle / reconcile once and publish the shared status. Idempotent; work left over
+      // is finished by whichever instance holds the lease next. Bearer CRON_SECRET or the admin token.
+      if (pathname === '/api/settlement/tick' && (req.method === 'GET' || req.method === 'POST')) {
+        if (!bearerIs(req, cronSecret) && !isAdmin(req)) {
+          return sendJson(res, cronSecret || adminToken ? 401 : 403, { ok: false, error: cronSecret || adminToken ? 'Send Authorization: Bearer <CRON_SECRET>' : 'The tick endpoint is disabled (set CRON_SECRET on the server)' });
+        }
+        if (!settlement) return sendJson(res, 503, { ok: false, error: readOnlyState ? readOnlyState.status : 'chain settlement is not running on this instance' });
+        const started = Date.now();
+        let timer;
+        const finished = await Promise.race([
+          settlement.tick().then(() => true),
+          new Promise((r) => {
+            timer = setTimeout(() => r(false), tickBudgetMs);
+          })
+        ]).finally(() => clearTimeout(timer));
+        const sum = settlement.summary();
+        return sendJson(res, 200, {
+          ok: true,
+          finished,
+          tookMs: Date.now() - started,
+          writer: sum.writer,
+          leader: sum.leader,
+          trading: sum.trading,
+          reconcile: { status: sum.reconcile.status, reason: sum.reconcile.reason },
+          lastTick: sum.lastTick,
+          lastGoodTick: sum.lastGoodTick,
+          lastError: sum.lastError ? redactSecrets(sum.lastError) : null,
+          inbound: sum.inbound,
+          outbound: sum.outbound
+        });
       }
 
       if (pathname === '/api/settlement' && req.method === 'GET') {
@@ -849,7 +898,7 @@ export function createDiceServer(options = {}) {
         if (!settlement) return sendJson(res, 503, { ok: false, error: 'chain settlement is not running on this instance' });
         const body = await readJsonBody(req);
         try {
-          return sendJson(res, 200, { ok: true, ...(await settlement.ackForeignOutflows({ txids: Array.isArray(body.txids) ? body.txids : [], mode: body.mode })) });
+          return sendJson(res, 200, { ok: true, ...(await settlement.ackForeignOutflows({ txids: Array.isArray(body.txids) ? body.txids : [], mode: body.mode, note: typeof body.note === 'string' ? body.note : null })) });
         } catch (err) {
           return sendJson(res, 409, { ok: false, error: redactSecrets(err.message) });
         }

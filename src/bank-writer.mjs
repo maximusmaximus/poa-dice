@@ -30,7 +30,7 @@ export const WRITER_REASONS = {
   UNSUPPORTED_STORE: 'The vault store has no single-writer lease (Redis or an ephemeral file). Read-only: bank signing needs the shared Postgres store.',
   UNBOUND: 'This vault store is not bound to the bank yet. Read-only until the one-time binding step (POA_DICE_BIND_STORE or POST /api/admin/store-binding) succeeds.',
   BINDING_MISMATCH: 'This vault store is bound to a different bank or store id. Read-only.',
-  STANDBY: 'Another server instance holds the bank writer lease. This one is a read-only standby.',
+  STANDBY: 'Another server instance holds the bank writer lease. This one is a standby: it never signs, and it passes player-signed transactions to the writer.',
   STORE_ERROR: 'The vault store could not be reached to confirm the bank writer lease. Read-only until it answers.',
   STALE_STORE: 'The stored vault does not account for every bank transfer on the ledger (an old copy of the store, or a transfer made outside this vault). Read-only until an operator reviews it (POST /api/admin/store-binding with recovery: true).',
   NOT_PRODUCTION: 'This is not a production deployment (VERCEL_ENV is not "production"). Read-only: previews never sign with the bank key.'

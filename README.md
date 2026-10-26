@@ -204,7 +204,7 @@ All vault state (the settlement queue **and** the engine's books) is one JSON do
 - **Anything else** (the default `data/` dir, or any file on Vercel) is **ephemeral**. The server goes read-only (`STORAGE_EPHEMERAL`) and advertises no bank address. `POA_DICE_ALLOW_EPHEMERAL=1` overrides this, at your own risk.
 
 ### Single bank writer (required to sign)
-Only one server instance may roll bets, book settlement and sign with the bank key. Every other instance (a second copy, a preview deployment, an instance pointed at an empty or older store) is read-only: it serves pages and status, but never rolls, books, claims or signs, and refuses new bets with `503 SIGNER_READ_ONLY`. An instance is the writer only when **all** of these hold:
+Only one server instance may roll bets, book settlement and sign with the bank key. An instance that is not the writer never rolls, books, pays, refunds or signs. A **standby** (signer flag set, store bound, another instance holds the lease) still takes player-signed transactions, see Serverless below. Any other instance (no signer flag, a preview deployment, an instance pointed at an empty or older store) is read-only and refuses new bets with `503 SIGNER_READ_ONLY`. An instance is the writer only when **all** of these hold:
 
 1. `POA_DICE_BANK_SIGNER=1` is set on it. **Default off: without it the bank key never signs.** Set it for the Production environment only, never for Preview or Development.
 2. It is not a Vercel preview or development deployment (`VERCEL_ENV`, when present, must be `production`).
@@ -222,6 +222,14 @@ Only one server instance may roll bets, book settlement and sign with the bank k
 **Payouts.** Before signing a WIN or REFUND, the writer checks the ledger for any bank transfer that references the same bet id (with or without an `:ord=` tag). An identical one is adopted; a different one, or a WIN for a bet booked as a loss, makes the order `REFUSED_DUPLICATE` (listed in `refusedDuplicatePayouts`). The bet is never paid twice.
 
 **Foreign outflows.** A final bank transfer this vault did not create, that either pays a bet or transaction the vault already settled or was signed after the binding, is a **foreign outflow**. It is listed in `/api/health` (`settlement.foreignOutflows`) and the audit (`foreignOutflows`, `foreignOutflowsOk`), and holds bets and withdrawals (`FOREIGN_OUTFLOW_HOLD`; `SOLVENCY_HOLD` wins while the books exceed the on-chain balance). An operator resolves them with `POST /api/admin/foreign-outflows/ack` and `{"txids": [...], "mode": "book_loss"}` (charge them to the bankroll) or `"mode": "reimbursed"` (the funds came back to the bank).
+
+### Serverless (Vercel): many instances, one writer
+On Vercel, requests are spread over many instances, and only one of them holds the writer lease.
+
+- **Writer status.** Every writer tick publishes a status row to Postgres (`poa_dice_status`, written only while the writer's lease and fencing token are live). It includes trading state and hold reason, reconcile state, audit summary, foreign outflows, the bank's free funds for new bets, the server-seed commitment, and the lease token and expiry. Every other instance reads it for `/api/health`, `/api/settlement`, quotes and the trading gate. If the status is older than 30 s (`POA_DICE_LEADER_STATUS_MAX_AGE_MS`), or the writer's lease has expired, the instance reports `NO_ACTIVE_LEADER` and refuses bets and withdrawals. A standby never opens trading on its own; `settlement.leader` shows what it sees.
+- **Standby submissions.** A standby validates a player-signed bet, deposit or LP transaction and applies the writer's hold. For a bet, it reserves the worst-case payout in the shared coverage book. It then records the transaction in Postgres (claim `accepted:<txid>`, with the writer's seed commitment) before it broadcasts to minepoa. The writer books it from the ledger with that acceptance. Ledger-only, replay and seed checks apply as usual, and the duplicate-payout guard is unchanged. A standby never signs, settles, pays, refunds or re-rolls. A signed transaction that was submitted once and never reached the ledger is not broadcast again (`409 ALREADY_SUBMITTED`).
+- **Cron tick.** `GET`/`POST /api/settlement/tick` with `Authorization: Bearer <CRON_SECRET>` (or the admin token) takes or renews the writer lease and runs one settle/reconcile pass, then returns. A pass is idempotent, and work it leaves is finished by whichever instance holds the lease next. The response returns after at most 25 s, even if the pass is still running. `vercel.json` calls it every minute (Vercel Cron sends the `CRON_SECRET` bearer). Per-minute cron schedules need a Vercel plan that allows them.
+- **Foreign-outflow ack from any instance.** `POST /api/admin/foreign-outflows/ack` checks the txids against the writer's published list and records the decision in Postgres (claim `foreign-ack:<txid>`, optional `note`). The writer applies it on its next pass.
 
 ### Ledger recovery (state lost or never written)
 The minepoa ledger is the source of truth, and every tick rescans the bank address:
@@ -245,6 +253,8 @@ The minepoa ledger is the source of truth, and every tick rescans the bank addre
 | `POA_DICE_ALLOW_EPHEMERAL=1` | Run with an ephemeral store anyway (relies on ledger replay; not recommended) |
 | `POA_MINEPOA_TIMEOUT_MS` / `POA_MINEPOA_RETRIES` | minepoa read timeout per attempt (25000) / attempts (3) |
 | `POA_DICE_ADMIN_TOKEN` | Admin/house actions |
+| `CRON_SECRET` | Bearer secret for `/api/settlement/tick` (Vercel Cron sends it automatically) |
+| `POA_DICE_LEADER_STATUS_MAX_AGE_MS` | Writer status older than this means no active writer; bets refused (default 30000) |
 | `POA_DICE_CONFIRM` | `final` (default) or `included` |
 | `POA_DICE_REQUIRE_BANK_KEY=1` | Exit instead of running read-only |
 | `POA_BASE_URL` | minepoa node (default `https://minepoa.com`) |

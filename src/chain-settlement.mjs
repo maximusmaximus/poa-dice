@@ -71,9 +71,16 @@ const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
 const HOLD_ACTIONS = new Set(['BET', 'LP_WITHDRAW', 'WITHDRAW', 'CLAIM']);
 
 /** Public trading state: OPEN, HOLD (reconciling / solvency) or PAUSED_LEDGER_UNAVAILABLE. */
+/** Shared status row the bank writer publishes every tick (see _publishStatus). */
+export const LEADER_STATUS_KEY = 'leader-status';
+/** Trading hold when no bank writer has published a fresh status. */
+export const NO_ACTIVE_LEADER = 'NO_ACTIVE_LEADER';
+const STANDBY_STATUS_REFRESH_MS = 2000;
+
 export function tradingLabel(hold) {
   if (!hold) return 'OPEN';
   if (hold.status === 'SIGNER_READ_ONLY') return 'READ_ONLY';
+  if (hold.status === NO_ACTIVE_LEADER) return NO_ACTIVE_LEADER;
   return hold.status === LEDGER_HOLD ? 'PAUSED_LEDGER_UNAVAILABLE' : 'HOLD';
 }
 
@@ -119,6 +126,7 @@ export class ChainSettlement {
     onLoadStateChange = null,
     loadRetryBaseMs = 2000,
     loadRetryMaxMs = 60000,
+    leaderStatusMaxAgeMs = 30000,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -145,6 +153,15 @@ export class ChainSettlement {
     this.bindOnBoot = Boolean(bindOnBoot);
     this._leaderToken = null; // fencing token the in-memory state was (re)loaded under
     this.foreign = []; // bank outflows this vault did not create (see _foreignOutflows)
+    // Serverless: many instances share one Postgres vault. The bank writer (lease holder) publishes its
+    // status every tick; every other instance reads it and refuses bets when it is older than this.
+    this.leaderStatusMaxAgeMs = leaderStatusMaxAgeMs;
+    this.shared = null; // last leader status read from (or written to) the store
+    this._sharedReadAt = 0;
+    this._replicaSavedAt = null; // savedAt of the vault document this standby last loaded
+    this._replicaAt = 0;
+    this._standbyLocal = new Map(); // txid -> inbound rec this standby broadcast (kept across replica reloads)
+    this._groupClaims = new Map(); // groupId -> pending group claim (standby batches)
     this.inboundExpireMs = inboundExpireMs;
     this.balanceStaleMs = balanceStaleMs;
     this._lastRow = null;
@@ -383,12 +400,17 @@ export class ChainSettlement {
     }
     await this.ready();
     const { body, txid, parsed } = this._validateInbound(txEnvelope);
-    // Only the bank writer takes new money-moving txs (it is the one that will settle them).
-    if (!this.writer.canWrite() && !this.state.inbound[txid] && !this.engine.processedTxids.has(txid)) {
-      await this.tick().catch(() => {});
+    // The bank writer takes new txs itself. A standby (another instance holds the writer lease) validates
+    // and broadcasts them and records them in the shared store for the writer; it never signs or settles.
+    if (!this.writer.canWrite()) {
+      const known = Boolean(this.state.inbound[txid]) || this.engine.processedTxids.has(txid);
+      if (!known || this.writer.status === 'STANDBY') await this.tick().catch(() => {});
       if (!this.writer.canWrite()) {
-        const h = this.writer.hold();
-        throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY', txid });
+        if (this.writer.status === 'STANDBY') return this._submitAsStandby({ body, txid, parsed, reserve, groupId, coverage });
+        if (!known) {
+          const h = this.writer.hold();
+          throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY', txid });
+        }
       }
     }
     // Ledger can't accept transactions: refuse every NEW broadcast (bets, stakes, withdrawals, chat) up front.
@@ -511,7 +533,125 @@ export class ChainSettlement {
 
   openGroup(groupId, { count, address }) {
     this.state.groups[groupId] = { count, address, resolved: 0, done: 0, wins: 0, losses: 0, netMicros: '0', completed: false, createdAt: now() };
+    if (!this.writer.canWrite() && this.writer.status === 'STANDBY') {
+      // The writer creates the group from this claim when it books the first member.
+      const p = Promise.resolve(this.store.claim(`group:${groupId}`, { count, address, createdAt: now() }));
+      p.catch(() => {});
+      this._groupClaims.set(groupId, p);
+      return;
+    }
     this._save();
+  }
+
+  /**
+   * Standby path of submitInbound: the bank writer is another instance. Requires a fresh writer status
+   * (else NO_ACTIVE_LEADER), applies the writer's trading hold, reserves bet coverage in the shared store,
+   * records the tx as accepted (claim `accepted:<txid>`, with the writer's seed commitment) and only then
+   * broadcasts it. The writer books it from the ledger. Nothing here signs, settles, pays or refunds.
+   */
+  async _submitAsStandby({ body, txid, parsed, reserve, groupId, coverage }) {
+    const refuse = (msg, status, code) => Object.assign(new Error(msg), { status, code, txid });
+    const existing = this.state.inbound[txid];
+    if (existing && existing.status !== 'FAILED' && existing.status !== 'EXPIRED') return this._inboundView(existing, { duplicate: true });
+    if (this.engine.processedTxids.has(txid)) return { txid, status: 'BOOKED', duplicate: true, result: this.engine.processedTxids.get(txid) };
+    if (now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS) await this._readShared();
+    if (!this._sharedFresh()) {
+      const h = this._standbyHold();
+      throw refuse(`${h.reason} Not broadcast; nothing was booked.`, 503, NO_ACTIVE_LEADER);
+    }
+    if (this.ledgerProbe) {
+      await this.ledgerProbe.maybeProbe().catch(() => {});
+      const lh = this.ledgerProbe.hold();
+      if (lh) throw refuse(`${lh.reason} Not broadcast; nothing was booked.`, 503, LEDGER_HOLD);
+    }
+    if (HOLD_ACTIONS.has(parsed.action)) {
+      const hold = this.tradingHold();
+      if (hold) throw refuse(`${hold.reason} Not broadcast; try again shortly.`, 503, hold.status);
+    }
+    let prior;
+    try {
+      prior = await this.store.peek(`accepted:${txid}`);
+    } catch (err) {
+      throw refuse(`Vault store unavailable; not broadcast: ${err.message}`, 503, 'SETTLEMENT_STORE_ERROR');
+    }
+    if (prior) {
+      const seen = await this.client.getTx(txid).catch(() => null);
+      if (seen) return { direction: 'inbound', txid, status: 'PENDING_CONFIRMATION', rawStatus: 'BROADCAST', action: parsed.action, from: body.from, amountPoa: body.amount, explorer: this.client.explorerTxUrl(txid), duplicate: true };
+      throw refuse('This signed transaction was already submitted once and is not on the ledger; it is not broadcast again. Sign a new one.', 409, 'ALREADY_SUBMITTED');
+    }
+    const seed = this.shared.seed;
+    if (parsed.action === 'BET' && (!seed || !seed.hash)) throw refuse('The bank writer has not published its seed commitment yet; not broadcast.', 503, NO_ACTIVE_LEADER);
+    let cov = coverage;
+    if (parsed.action === 'BET' && !cov) {
+      const q = this.engine.quoteBet({ address: body.from, amountPoa: body.amount, targetBps: parsed.targetBps, direction: parsed.direction });
+      if (!q.payoutOnWinMicros) throw Object.assign(new Error(q.error || 'Bet outside allowed limits'), { status: 400, code: 'BET_LIMITS', quote: q });
+      await this.reserveBetCoverage(txid, BigInt(q.payoutOnWinMicros));
+      cov = { key: txid, micros: String(q.payoutOnWinMicros) };
+    }
+    const rec = {
+      txid,
+      seq: 0,
+      from: body.from,
+      amountPoa: body.amount,
+      memo: body.memo,
+      action: parsed.action,
+      seedCommit: parsed.action === 'BET' ? { epoch: seed.epoch, hash: seed.hash, at: now() } : null,
+      status: 'SUBMITTING',
+      submittedAt: now(),
+      reserve,
+      coverage: cov ? { key: cov.key, micros: String(cov.micros) } : null,
+      groupId,
+      attempts: 0,
+      error: null,
+      result: null,
+      ledger: null,
+      acceptedBy: 'standby'
+    };
+    try {
+      if (groupId && this._groupClaims.has(groupId)) await this._groupClaims.get(groupId);
+      const res = await this.store.claim(`accepted:${txid}`, {
+        v: 1,
+        txid,
+        from: rec.from,
+        amountPoa: rec.amountPoa,
+        memo: rec.memo,
+        action: rec.action,
+        seedCommit: rec.seedCommit,
+        coverage: rec.coverage,
+        groupId,
+        submittedAt: rec.submittedAt,
+        via: 'standby',
+        instance: this.writer.holderId,
+        writerToken: this.shared.token ?? null
+      });
+      if (!res.claimed) throw new Error('accepted concurrently by another request');
+    } catch (err) {
+      if (cov && cov.key === txid && !String(err.message).includes('concurrently')) this._releaseCoverage(rec);
+      throw refuse(`Vault store unavailable; not broadcast: ${err.message}`, 503, 'SETTLEMENT_STORE_ERROR');
+    }
+    this.state.inbound[txid] = rec;
+    this._standbyLocal.set(txid, rec);
+    try {
+      rec.attempts += 1;
+      const resp = await this.client.submitTx(body);
+      if (resp && Number.isInteger(Number(resp.next_nonce))) this._nonceCache.set(body.from, { next: Number(resp.next_nonce), at: now() });
+      rec.status = 'BROADCAST';
+    } catch (err) {
+      this.ledgerProbe?.reportFailure('player broadcast', err);
+      const seen = await this.client.getTx(txid).catch(() => null);
+      if (seen) {
+        rec.status = 'BROADCAST';
+      } else {
+        rec.status = 'FAILED';
+        rec.error = String(err.message || err);
+        this._nonceCache.delete(body.from);
+        this._releaseCoverage(rec);
+        this._emit('settlement.updated', this._inboundView(rec));
+        throw refuse(`Broadcast to minepoa failed; nothing was booked: ${rec.error}`, 502, 'BROADCAST_FAILED');
+      }
+    }
+    this._emit('settlement.updated', this._inboundView(rec));
+    return this._inboundView(rec, { acceptedBy: 'standby' });
   }
 
   _inboundView(rec, extra = {}) {
@@ -812,6 +952,13 @@ export class ChainSettlement {
           }
         }
         if (memo === null || !String(memo).startsWith('DICE1:')) continue; // plain donation / unknown
+        let accepted = null;
+        try {
+          accepted = await this._acceptedClaim(t, memo);
+        } catch (err) {
+          this._tickErrors.push(`acceptance ${t.id.slice(0, 12)}: ${err.message}`);
+          continue; // retried next tick: never book a standby-accepted bet without its seed commitment
+        }
         this.state.inbound[t.id] = {
           txid: t.id,
           seq: ++this.state.seq,
@@ -831,6 +978,7 @@ export class ChainSettlement {
           result: null,
           ledger: null
         };
+        if (accepted) Object.assign(this.state.inbound[t.id], accepted);
         this._save();
       } else if (t.from === this.bankAddress) {
         if (this.state.ledgerOut[t.id]) {
@@ -1249,6 +1397,146 @@ export class ChainSettlement {
     return { epoch: this.engine.seedManager.epochId, hash: this.engine.seedManager.currentSeedHash, at: now() };
   }
 
+  /**
+   * Writer side of a standby acceptance: the claim a standby wrote before broadcasting this ledger tx
+   * (seed commitment, coverage reservation, batch group). Only a claim that matches the tx is used.
+   * Returns rec fields to merge, or null.
+   */
+  async _acceptedClaim(t, memo) {
+    if (typeof this.store.peek !== 'function') return null;
+    const a = await this.store.peek(`accepted:${t.id}`);
+    if (!a || a.txid !== t.id || a.from !== t.from || String(a.memo) !== String(memo) || toMicros(a.amountPoa) !== toMicros(t.amount)) return null;
+    const fields = { acceptedBy: 'standby', submittedAt: Number(a.submittedAt) || now() };
+    if (a.action === 'BET' && a.seedCommit && a.seedCommit.hash) fields.seedCommit = { epoch: a.seedCommit.epoch, hash: a.seedCommit.hash, at: a.seedCommit.at };
+    if (a.coverage && a.coverage.key && a.coverage.micros) fields.coverage = { key: String(a.coverage.key), micros: String(a.coverage.micros) };
+    if (a.groupId) {
+      if (!this.state.groups[a.groupId]) {
+        const g = await this.store.peek(`group:${a.groupId}`);
+        if (g) this.state.groups[a.groupId] = { count: g.count, address: g.address, resolved: 0, done: 0, wins: 0, losses: 0, netMicros: '0', completed: false, createdAt: g.createdAt || now() };
+      }
+      if (this.state.groups[a.groupId]) fields.groupId = a.groupId;
+    }
+    return fields;
+  }
+
+  // ─── Shared writer status (serverless: many instances, one bank writer) ──
+
+  /** Is the published writer status fresh (written within leaderStatusMaxAgeMs, lease not expired)? */
+  _sharedFresh(s = this.shared) {
+    if (!s || !Number.isFinite(Number(s.at))) return false;
+    const t = now();
+    return t - Number(s.at) <= this.leaderStatusMaxAgeMs && Number(s.leaseExpiresAt || 0) > t;
+  }
+
+  async _readShared() {
+    if (typeof this.store.getStatus !== 'function') return null;
+    try {
+      this.shared = await this.store.getStatus(LEADER_STATUS_KEY);
+      this._sharedReadAt = now();
+    } catch (err) {
+      this._tickErrors.push(`writer status: ${err.message}`);
+    }
+    return this.shared;
+  }
+
+  _statusDoc() {
+    const hold = this._leaderHold();
+    const lim = this.coverageLimit();
+    const r = this.reconcile || {};
+    return {
+      v: 1,
+      holder: this.writer.holderId,
+      token: this.writer.lease?.token ?? null,
+      leaseExpiresAt: Number(this.writer.lease?.expiresAt || 0),
+      at: now(),
+      trading: tradingLabel(hold),
+      hold: hold ? { status: hold.status, reason: hold.reason } : null,
+      reconcile: { status: r.status || null, reason: r.reason || null, at: r.at || null, inReview: r.inReview || [], audit: r.audit || null },
+      foreignOutflows: this.foreign,
+      onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
+      coverage: lim.known ? { known: true, limitMicros: lim.limitMicros.toString() } : { known: false, code: lim.code, reason: lim.reason },
+      seed: { epoch: this.engine.seedManager.epochId, hash: this.engine.seedManager.currentSeedHash },
+      docSavedAt: this.state.savedAt ?? null,
+      lastGoodTick: this.lastGoodTick || null,
+      lastError: this.lastError || null
+    };
+  }
+
+  /** Writer only: publish this tick's status for every other instance (fenced by the lease in Postgres). */
+  async _publishStatus() {
+    if (typeof this.store.putStatus !== 'function' || !this.writer.canWrite()) return;
+    try {
+      const doc = this._statusDoc();
+      await this.store.putStatus(LEADER_STATUS_KEY, doc);
+      this.shared = doc;
+      this._sharedReadAt = now();
+    } catch (err) {
+      this._tickErrors.push(`writer status publish: ${err.message}`);
+    }
+  }
+
+  /** Standby: follow the shared vault document (read-only) and the writer's status. Never writes. */
+  async _standbyTick() {
+    const s = await this._readShared();
+    const due = !this._replicaAt || now() - this._replicaAt > this.leaderStatusMaxAgeMs;
+    if (due || (s && s.docSavedAt !== this._replicaSavedAt)) {
+      try {
+        const doc = await this._reloadFromStore();
+        this._replicaSavedAt = doc?.savedAt ?? null;
+        this._replicaAt = now();
+        for (const [id, rec] of this._standbyLocal) {
+          if (this.state.inbound[id] || this.engine.processedTxids.has(id) || now() - rec.submittedAt > this.inboundExpireMs) this._standbyLocal.delete(id);
+          else this.state.inbound[id] = rec;
+        }
+      } catch (err) {
+        this._tickErrors.push(`standby reload: ${err.message}`);
+      }
+    }
+    if (this._sharedFresh()) this.foreign = this.shared.foreignOutflows || [];
+    this.lastTick = now();
+    this.lastError = this._tickErrors.length ? this._tickErrors.join('; ') : null;
+    if (this.lastError) this.lastErrorAt = now();
+  }
+
+  /** Writer status as this instance sees it (health / settlement). */
+  leaderView() {
+    const s = this.shared;
+    const self = this.writer.canWrite();
+    return {
+      active: self || this._sharedFresh(),
+      thisInstance: self ? 'WRITER' : this.writer.status,
+      statusAt: s?.at ? new Date(Number(s.at)).toISOString() : null,
+      statusAgeMs: s?.at ? Math.max(0, now() - Number(s.at)) : null,
+      maxAgeMs: this.leaderStatusMaxAgeMs,
+      token: s?.token ?? null,
+      leaseExpiresAt: s?.leaseExpiresAt ? new Date(Number(s.leaseExpiresAt)).toISOString() : null,
+      trading: s?.trading ?? null,
+      hold: s?.hold ?? null,
+      lastGoodTick: s?.lastGoodTick ? new Date(Number(s.lastGoodTick)).toISOString() : null
+    };
+  }
+
+  /** Writer only: apply foreign-outflow acknowledgements recorded by any instance (claims `foreign-ack:<txid>`). */
+  async _applyForeignAcks() {
+    if (!this.writer.canWrite() || typeof this.store.peek !== 'function') return 0;
+    this.state.foreignAck = this.state.foreignAck || {};
+    let applied = 0;
+    for (const f of this._foreignOutflows()) {
+      if (f.acknowledged) continue;
+      const a = await this.store.peek(`foreign-ack:${f.txid}`);
+      if (!a || !['book_loss', 'reimbursed'].includes(a.mode)) continue;
+      if (a.mode === 'book_loss') {
+        const o = this.state.ledgerOut[f.txid];
+        const d = await this._claimDecision(f.txid, { v: 1, kind: 'UNMATCHED_OUTFLOW', txid: f.txid, to: o.to, amountMicros: toMicros(o.amountPoa).toString(), memo: String(o.memo || '').slice(0, 200), ts: Math.floor(now() / 1000), foreign: true });
+        this._applyDecision(d);
+      }
+      this.state.foreignAck[f.txid] = { mode: a.mode, at: a.at || new Date(now()).toISOString(), ...(a.note ? { note: a.note } : {}) };
+      applied += 1;
+    }
+    if (applied) this._save();
+    return applied;
+  }
+
   async _reloadFromStore() {
     const doc = await this.store.load();
     if (doc && doc.version === 1) {
@@ -1318,6 +1606,7 @@ export class ChainSettlement {
 
   /** Read-only instance: refresh the ledger view for status/audit; never book, roll, claim or sign. */
   async _readOnlyTick() {
+    await this._readShared();
     const row = await this._scanBank();
     this.foreign = this._foreignOutflows();
     this.lastTick = now();
@@ -1413,26 +1702,31 @@ export class ChainSettlement {
     return out;
   }
 
-  /** Operator decision for foreign outflows: 'book_loss' (charge to the bankroll) or 'reimbursed' (funds returned to the bank). */
-  async ackForeignOutflows({ txids = [], mode }) {
+  /**
+   * Operator decision for foreign outflows: 'book_loss' (charge to the bankroll) or 'reimbursed' (funds
+   * returned to the bank). Works on any instance: the decision is recorded in the shared store (claim
+   * `foreign-ack:<txid>`) and the bank writer applies it on its next pass (immediately when this is the writer).
+   */
+  async ackForeignOutflows({ txids = [], mode, note = null }) {
     if (!['book_loss', 'reimbursed'].includes(mode)) throw new Error("mode must be 'book_loss' or 'reimbursed'");
+    if (!Array.isArray(txids) || !txids.length) throw new Error('txids: list the foreign outflow txids to acknowledge');
     await this.tick();
-    if (!this.writer.canWrite()) throw new Error(this.writer.hold()?.reason || 'read-only');
-    const foreign = new Map(this._foreignOutflows().map((f) => [f.txid, f]));
-    this.state.foreignAck = this.state.foreignAck || {};
+    const writer = this.writer.canWrite();
+    if (!writer) {
+      if (this.writer.status !== 'STANDBY') throw new Error(this.writer.hold()?.reason || 'read-only');
+      await this._readShared();
+      if (!this._sharedFresh()) throw new Error(this._standbyHold().reason);
+    }
+    const list = writer ? this._foreignOutflows() : this.shared.foreignOutflows || [];
+    const foreign = new Map(list.map((f) => [f.txid, f]));
+    for (const id of txids) if (!foreign.has(id)) throw new Error(`${String(id).slice(0, 16)} is not a listed foreign outflow`);
     const done = [];
     for (const id of txids) {
-      const f = foreign.get(id);
-      if (!f) throw new Error(`${String(id).slice(0, 16)} is not a listed foreign outflow`);
-      if (mode === 'book_loss') {
-        const o = this.state.ledgerOut[id];
-        const d = await this._claimDecision(id, { v: 1, kind: 'UNMATCHED_OUTFLOW', txid: id, to: o.to, amountMicros: toMicros(o.amountPoa).toString(), memo: String(o.memo || '').slice(0, 200), ts: Math.floor(now() / 1000), foreign: true });
-        this._applyDecision(d);
-      }
-      this.state.foreignAck[id] = { mode, at: new Date(now()).toISOString() };
-      done.push({ txid: id, mode });
+      const res = await this.store.claim(`foreign-ack:${id}`, { txid: id, mode, at: new Date(now()).toISOString(), ...(note ? { note: String(note).slice(0, 200) } : {}) });
+      done.push({ txid: id, mode: res.value.mode, ...(res.claimed ? {} : { alreadyAcknowledged: true }) });
     }
-    this._save();
+    if (!writer) return { acknowledged: done, appliedBy: 'the bank writer on its next pass', foreign: list };
+    await this._applyForeignAcks();
     await this.flush();
     await this.tick();
     return { acknowledged: done, foreign: this._foreignOutflows() };
@@ -1790,7 +2084,8 @@ export class ChainSettlement {
         }
         if (!leader) {
           this._leaderToken = null;
-          await this._readOnlyTick();
+          if (this.writer.status === 'STANDBY') await this._standbyTick();
+          else await this._readOnlyTick();
           return;
         }
         if (this._leaderToken !== this.writer.lease.token) {
@@ -1819,11 +2114,13 @@ export class ChainSettlement {
             this._save();
           }
           this._leaderToken = this.writer.lease.token;
+          this._standbyLocal.clear();
         }
         this.writer.tokenAtTickStart = this.writer.lease.token;
         await this._syncSeed();
         const row = await this._scanBank();
         await this._confirmInbound();
+        await this._applyForeignAcks().catch((err) => this._tickErrors.push(`foreign acks: ${err.message}`));
         await this._reconcile(row);
         this._adoptOutbound();
         await this._processOutbound(row);
@@ -1836,6 +2133,7 @@ export class ChainSettlement {
           this.lastError = null; // only report errors that are still happening
         }
         this.lastGoodTick = this._tickErrors.length ? this.lastGoodTick : now();
+        await this._publishStatus();
         this.writer.tokenAtTickStart = null;
       } catch (err) {
         this.lastError = String(err.message || err);
@@ -1899,6 +2197,13 @@ export class ChainSettlement {
   coverageLimit() {
     const hold = this.tradingHold();
     if (hold) return { known: false, code: hold.status, reason: hold.reason };
+    if (!this.writer.canWrite() && this.writer.status === 'STANDBY') {
+      // Standby: the writer's published limit; reservations against it are shared (reserveCapacity).
+      const c = this.shared?.coverage;
+      if (!c || !c.known) return { known: false, code: c?.code || 'BANK_BALANCE_UNKNOWN', reason: c?.reason || 'The bank writer has not published the bank\'s free funds yet; bets are paused.' };
+      const limit = BigInt(c.limitMicros);
+      return { known: true, limitMicros: limit, baseMicros: limit, source: 'writer-status' };
+    }
     const row = this._lastRow;
     if (!row || typeof row.effectiveMicros !== 'bigint') return { known: false, code: 'BANK_BALANCE_UNKNOWN', reason: 'The bank balance on minepoa is unknown right now; bets are paused until it can be read.' };
     if (now() - this._lastRowAt > this.balanceStaleMs) return { known: false, code: 'BANK_BALANCE_STALE', reason: `The bank balance was last read ${Math.round((now() - this._lastRowAt) / 1000)}s ago; bets are paused until it is refreshed.` };
@@ -1927,6 +2232,10 @@ export class ChainSettlement {
 
   /** Refresh the bank balance (one tick) if it is missing or stale. */
   async ensureFreshBalance() {
+    if (this.writer.status === 'STANDBY') {
+      if (now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS) await this.tick().catch(() => {});
+      return;
+    }
     if (!this._lastRow || now() - this._lastRowAt > this.balanceStaleMs || !this.reconcile.at) await this.tick().catch(() => {});
   }
 
@@ -1992,7 +2301,8 @@ export class ChainSettlement {
 
   /** Run one tick first if no reconcile pass has finished yet (cold start), then report the hold. */
   async ensureReconciled() {
-    if (!this.reconcile.at) await this.tick().catch(() => {});
+    const standby = this.writer.status === 'STANDBY';
+    if (standby ? now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS : !this.reconcile.at) await this.tick().catch(() => {});
     if (this.ledgerProbe) await this.ledgerProbe.maybeProbe().catch(() => {});
     return this.tradingHold();
   }
@@ -2003,8 +2313,24 @@ export class ChainSettlement {
    */
   tradingHold() {
     if (!this._loaded) return { status: 'SIGNER_READ_ONLY', reason: `Vault state is not loaded yet (${this.vaultLoad.lastError || 'loading'}). Read-only until a load succeeds; retried automatically.`, writer: 'VAULT_NOT_LOADED' };
+    if (!this.writer.canWrite() && this.writer.status === 'STANDBY') return this._standbyHold();
     const wh = this.writer.hold();
     if (wh) return wh;
+    return this._leaderHold();
+  }
+
+  /** Standby: the writer's published hold, or NO_ACTIVE_LEADER when its status is missing or stale. */
+  _standbyHold() {
+    if (!this._sharedFresh()) {
+      const age = this.shared?.at ? `${Math.round((now() - Number(this.shared.at)) / 1000)} s ago` : 'never';
+      return { status: NO_ACTIVE_LEADER, reason: `No bank writer is active (last status: ${age}; limit ${Math.round(this.leaderStatusMaxAgeMs / 1000)} s). Bets and withdrawals are refused until one reports in.`, writer: NO_ACTIVE_LEADER };
+    }
+    if (this.shared.hold) return { status: this.shared.hold.status, reason: this.shared.hold.reason };
+    return this.ledgerProbe ? this.ledgerProbe.hold() : null;
+  }
+
+  /** The writer's own hold: reconciliation state, then the ledger probe. */
+  _leaderHold() {
     if (this.reconcile && this.reconcile.status !== 'OK') {
       const st = this.reconcile.status;
       return { status: st === 'SOLVENCY_HOLD' || st === 'FOREIGN_OUTFLOW_HOLD' ? st : 'RECONCILING', reason: this.reconcile.reason };
@@ -2229,6 +2555,8 @@ export class ChainSettlement {
     const count = (list, key) => list.reduce((m, r) => ((m[r[key]] = (m[r[key]] || 0) + 1), m), {});
     const outs = Object.values(this.state.outbound);
     const ins = Object.values(this.state.inbound);
+    const fromWriter = !this.writer.canWrite() && this.writer.status === 'STANDBY' && this._sharedFresh() ? this.shared : null;
+    const rec = fromWriter ? fromWriter.reconcile || {} : this.reconcile;
     return {
       mode: 'chain',
       bankAddress: this.bankAddress,
@@ -2240,13 +2568,14 @@ export class ChainSettlement {
       lastGoodTick: this.lastGoodTick ? new Date(this.lastGoodTick).toISOString() : null,
       lastError: this.lastError,
       lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
-      onChainBankBalancePoa: this.lastBankBalance?.balance ?? null,
+      onChainBankBalancePoa: fromWriter ? fromWriter.onChainBankBalancePoa : this.lastBankBalance?.balance ?? null,
       bankBalance: this.lastBankBalance,
       stuckPayouts: this.stuckPayouts(),
       writer: this.writer.view(),
-      foreignOutflows: this.foreign,
+      leader: this.leaderView(),
+      foreignOutflows: fromWriter ? fromWriter.foreignOutflows || [] : this.foreign,
       ledgerIndexComplete: this.ledgerIndexComplete,
-      reconcile: { status: this.reconcile.status, reason: this.reconcile.reason, at: this.reconcile.at ? new Date(this.reconcile.at).toISOString() : null, inReview: this.reconcile.inReview, audit: this.reconcile.audit },
+      reconcile: { status: rec.status ?? null, reason: rec.reason ?? null, at: rec.at ? new Date(rec.at).toISOString() : null, inReview: rec.inReview, audit: rec.audit, ...(fromWriter ? { source: 'writer-status' } : {}) },
       trading: tradingLabel(this.tradingHold()),
       ledger: this.ledgerProbe ? this.ledgerProbe.view() : null,
       recoveredOutflows: [...this.engine.recoveredOutflows.entries()].slice(-20).map(([txid, r]) => ({ txid, ...r })),
