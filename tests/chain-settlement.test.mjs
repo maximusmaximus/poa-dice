@@ -183,7 +183,8 @@ test('round trip: stake 10 POA (lock 0) -> confirmed -> withdraw 100% -> payout 
     let ws = (await srv.mcp('tx_status', { txid: wd.data.txid })).data;
     assert.equal(ws.status, 'CONFIRMED');
     assert.equal(ws.payouts.length, 1);
-    assert.equal(ws.payouts[0].status, 'SENT');
+    // SENT, or already CONFIRMED from minepoa's receipt (included) before it is final on the explorer
+    assert.ok(['SENT', 'CONFIRMED'].includes(ws.payouts[0].status), ws.payouts[0].status);
     const payoutTxid = ws.payouts[0].txid;
     assert.ok(mock.tx(payoutTxid), 'payout is on the ledger');
     mock.finalizeAll();

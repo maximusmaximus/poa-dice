@@ -64,7 +64,7 @@ import crypto from 'node:crypto';
 import { BankWriter, BINDING_KEY } from './bank-writer.mjs';
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
 import { PersistQueue } from './settlement-store.mjs';
-import { isLedgerOutage, LEDGER_HOLD } from './ledger-probe.mjs';
+import { isLedgerBusy, isLedgerOutage, LEDGER_HOLD } from './ledger-probe.mjs';
 
 const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED', 'REFUSED_DUPLICATE']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
@@ -132,6 +132,7 @@ export class ChainSettlement {
     passEveryMs = 15000,
     rebroadcastAfterMs = 60000,
     payoutRetryMaxMs = 30000,
+    trustedBalanceMaxAgeMs = 10 * 60 * 1000,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -167,6 +168,8 @@ export class ChainSettlement {
     this.passEveryMs = passEveryMs;
     this.rebroadcastAfterMs = rebroadcastAfterMs;
     this.payoutRetryMaxMs = payoutRetryMaxMs;
+    // While the explorer is busy, the last complete bank read (plus our own in-flight txs) stands in for it.
+    this.trustedBalanceMaxAgeMs = trustedBalanceMaxAgeMs;
     this._lastPass = null; // {holder, token, savedAt, at}: the last pass THIS instance completed as writer
     this._observePromise = null;
     this.passes = { started: 0, completed: 0, lastStartedAt: null, lastCompletedAt: null, lastMs: null };
@@ -318,22 +321,45 @@ export class ChainSettlement {
     // A crash mid-broadcast leaves SUBMITTING: treat as broadcast; it is booked if the ledger has it,
     // and expires (releasing its reservation) if it never shows up.
     for (const rec of Object.values(this.state.inbound)) if (rec.status === 'SUBMITTING') rec.status = 'BROADCAST';
-    // Restore pending-bet reservations after a restart, so the bank cannot be oversubscribed.
-    const held = new Map();
-    for (const rec of Object.values(this.state.inbound)) {
-      if (OPEN_IN.has(rec.status) && rec.reserve) held.set(rec.reserve.key, (held.get(rec.reserve.key) || 0n) + BigInt(rec.reserve.micros));
-    }
-    for (const [key, micros] of held) {
-      try {
-        this.engine.batchReservations.set(key, micros);
-        this.engine.lockedCollateralMicros += micros;
-      } catch {
-        // ignore
-      }
+    // Rebuild the pending-bet reservations from the stored open bets (never added on top of what this
+    // process already held: that double count drove the stored lock to -4.55 POA on 2026-10-26).
+    this._rebuildReservations();
+    if (this.engine.lockHeal && this.engine.lockHeal !== this._lastLockHeal) {
+      this._lastLockHeal = this.engine.lockHeal;
+      if (this.logger) this.logger(`vault load: locked collateral corrected (stored ${this.engine.lockHeal.storedMicros} micros, now ${this.engine.lockHeal.correctedMicros})`);
     }
     this._loaded = true;
     this.engine.onStateSaved = () => this._save();
     this._save();
+  }
+
+  /**
+   * Exposure reservations held in this process = the open bets in the vault document that carry one,
+   * plus reservations for submissions still in progress here (not in the document yet). Reservations
+   * of bets that are settled, refunded or expired are dropped. Locked collateral is then re-derived.
+   */
+  _rebuildReservations() {
+    const next = new Map();
+    for (const rec of Object.values(this.state.inbound)) {
+      if (OPEN_IN.has(rec.status) && rec.reserve) {
+        try {
+          next.set(rec.reserve.key, (next.get(rec.reserve.key) || 0n) + BigInt(rec.reserve.micros));
+        } catch {
+          // malformed reservation: ignore
+        }
+      }
+    }
+    for (const [key, micros] of this.engine.batchReservations) {
+      if (next.has(key)) continue;
+      const m = /^pending_([0-9a-f]{64})$/.exec(key);
+      if (m) {
+        const r = this.state.inbound[m[1]];
+        if (this.engine.processedTxids.has(m[1]) || (r && !OPEN_IN.has(r.status))) continue; // settled, refunded or expired
+      }
+      next.set(key, micros); // a submission in progress here, or a local batch
+    }
+    this.engine.batchReservations = next;
+    this.engine._syncLocked();
   }
 
   _save() {
@@ -930,6 +956,15 @@ export class ChainSettlement {
       row = await this.client.getAddress(this.bankAddress);
     } catch (err) {
       this._tickErrors.push(err.message);
+      const trusted = isLedgerBusy(err) ? this._trustedRow() : null;
+      if (trusted) {
+        // Explorer busy / slow: the last complete read stands in (bounded age); our own payouts since then
+        // are subtracted as in flight (_inFlightOutMicros), deposits since then are simply not counted yet.
+        this._lastRow = trusted;
+        this._lastRowAt = now();
+        this.ledgerIndexComplete = true; // the trusted read was complete when it was taken
+        return trusted;
+      }
       this._lastRow = null; // unknown balance: bets fail closed until the next good read
       return null;
     }
@@ -1067,6 +1102,50 @@ export class ChainSettlement {
     };
     this._lastRow = outIndexComplete ? row : null;
     this._lastRowAt = now();
+    if (outIndexComplete) this._noteTrustedRow(row, txs);
+    return row;
+  }
+
+  /** The document is the one the last writer published (same savedAt) and that status is recent. */
+  async _handoverFromFreshStatus(doc) {
+    if (!doc) return false;
+    const st = await this._readShared();
+    if (!st || st.docSavedAt === undefined || st.docSavedAt === null) return false;
+    return st.docSavedAt === this._loadedSavedAt && now() - Number(st.at || 0) <= this.trustedBalanceMaxAgeMs;
+  }
+
+  /** Remember the last complete bank read (in the vault document, so every instance has it). */
+  _noteTrustedRow(row, txs) {
+    const outIds = txs.filter((t) => t.from === this.bankAddress && t.to !== this.bankAddress).map((t) => t.id);
+    const prev = this.state.trustedBank;
+    const eff = String(row.effectiveMicros);
+    const changed = !prev || prev.effectiveMicros !== eff || (prev.listedOutIds || []).length !== outIds.length;
+    if (!changed && now() - Number(prev.at || 0) < 60000) return;
+    this.state.trustedBank = { effectiveMicros: eff, listedOutIds: outIds, checkpointBalance: row.balance ?? null, checkpoint: row.checkpoint ?? null, at: now() };
+    this._save();
+  }
+
+  /** The last complete bank read as a row, if it is recent enough to stand in for a busy explorer. */
+  _trustedRow() {
+    const tb = this.state.trustedBank;
+    if (!tb || !tb.effectiveMicros) return null;
+    const age = now() - Number(tb.at || 0);
+    if (!(age >= 0 && age <= this.trustedBalanceMaxAgeMs)) return null;
+    let eff;
+    try {
+      eff = BigInt(tb.effectiveMicros);
+    } catch {
+      return null;
+    }
+    const row = { address: this.bankAddress, balance: tb.checkpointBalance, checkpoint: tb.checkpoint, txs: [], effectiveMicros: eff, listedIds: new Set(tb.listedOutIds || []), fromTrusted: true, trustedAt: Number(tb.at) };
+    this.lastBankBalance = {
+      ...(this.lastBankBalance || {}),
+      balance: fromMicros(eff < 0n ? 0n : eff),
+      source: 'last-trusted-read',
+      trustedAt: new Date(Number(tb.at)).toISOString(),
+      trustedAgeMs: age,
+      at: now()
+    };
     return row;
   }
 
@@ -1263,9 +1342,23 @@ export class ChainSettlement {
       if (tx && this._confirmed(tx)) {
         rec.status = 'CONFIRMED';
         rec.confirmedAt = now();
+        rec.confirmedVia = 'explorer';
         this._save();
         this.engine.markOutboundSent(rec.orderId, rec.txid, 'CONFIRMED');
         this._emit('settlement.updated', this._outboundView(rec));
+      } else if (!(tx && tx.invalid)) {
+        // Explorer busy, behind, or not final yet: minepoa's receipt for this exact signed tx is enough.
+        const receipt = await this._receiptConfirms(rec);
+        if (receipt) {
+          rec.status = 'CONFIRMED';
+          rec.confirmedAt = now();
+          rec.confirmedVia = 'receipt';
+          rec.receipt = { status: receipt.status, height: receipt.height ?? null, ts: receipt.ts ?? null };
+          this._save();
+          this.engine.markOutboundSent(rec.orderId, rec.txid, 'CONFIRMED');
+          this._emit('settlement.updated', this._outboundView(rec));
+          if (this.logger) this.logger(`payout ${rec.orderId} confirmed from its receipt (${receipt.status}, height ${receipt.height ?? '?'})`);
+        }
       } else if (tx && tx.invalid) {
         rec.status = 'FAILED';
         rec.lastError = 'minepoa marked the payout tx invalid; operator must review';
@@ -1505,6 +1598,8 @@ export class ChainSettlement {
     try {
       this.shared = await this.store.getStatus(LEADER_STATUS_KEY);
       this._sharedReadAt = now();
+      // A sustained ledger outage is measured from when ANY instance last saw minepoa healthy.
+      if (this.ledgerProbe?.noteRemoteOk && this.shared?.ledger?.lastOkAt) this.ledgerProbe.noteRemoteOk(this.shared.ledger.lastOkAt);
     } catch (err) {
       this._tickErrors.push(`writer status: ${err.message}`);
     }
@@ -1533,7 +1628,7 @@ export class ChainSettlement {
       goodAt: this.lastGoodTick || null,
       passMs: this.passes.lastStartedAt ? now() - this.passes.lastStartedAt : null,
       passMode: this.passMode,
-      ledger: this.ledgerProbe ? { status: this.ledgerProbe.status, lastError: this.ledgerProbe.lastError || null } : null,
+      ledger: this.ledgerProbe ? { status: this.ledgerProbe.status, lastError: this.ledgerProbe.lastError || null, lastOkAt: this.ledgerProbe.lastOkAt ?? null } : null,
       lastError: this.lastError || null
     };
   }
@@ -1564,6 +1659,7 @@ export class ChainSettlement {
           if (this.state.inbound[id] || this.engine.processedTxids.has(id) || now() - rec.submittedAt > this.inboundExpireMs) this._standbyLocal.delete(id);
           else this.state.inbound[id] = rec;
         }
+        this._rebuildReservations();
       } catch (err) {
         this._tickErrors.push(`standby reload: ${err.message}`);
       }
@@ -1620,6 +1716,7 @@ export class ChainSettlement {
 
   async _reloadFromStore() {
     const doc = await this.store.load();
+    this._loadedSavedAt = doc?.savedAt ?? null; // as stored (applying the document may re-save it)
     if (doc && doc.version === 1) {
       this.state = { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, ledgerOut: {}, seq: 0, createdAt: Math.floor(now() / 1000) };
       this._applyDoc(doc);
@@ -1850,6 +1947,70 @@ export class ChainSettlement {
     return r;
   }
 
+  /**
+   * The signed body this order sent: rec.body, else the store's payout claim for it. Only a body whose
+   * txid, sender, recipient and amount match the order is returned.
+   */
+  async _sentBody(rec) {
+    const ok = (b) => b && txidOf(b) === rec.txid && b.from === this.bankAddress && b.to === rec.to && toMicros(String(b.amount)) === toMicros(rec.amountPoa) && (!Number.isInteger(rec.nonce) || Number(b.nonce) === rec.nonce);
+    if (ok(rec.body)) return rec.body;
+    if (typeof this.store.peek !== 'function') return null;
+    try {
+      const v = await this.store.peek(`payout:${rec.orderId}:${rec.resigns || 0}`);
+      if (v && v.txid === rec.txid && ok(v.body)) return v.body;
+    } catch {
+      // store unavailable: no proof this tick
+    }
+    return null;
+  }
+
+  /**
+   * minepoa's receipt proves this payout landed: status included / final, for this txid, and the signed
+   * body behind the txid pays exactly this order (recipient, amount, nonce). Fields the receipt itself
+   * carries (to / amount / nonce / from) must match too. Returns the receipt or null.
+   */
+  async _receiptConfirms(rec) {
+    if (!rec.txid) return null;
+    const r = await this._receipt(rec.txid);
+    if (!r || !['included', 'final', 'confirmed'].includes(String(r.status).toLowerCase())) return null;
+    if (r.txid !== rec.txid) return null;
+    const body = await this._sentBody(rec);
+    if (!body) return null;
+    if (r.to !== undefined && r.to !== rec.to) return null;
+    if (r.from !== undefined && r.from !== this.bankAddress) return null;
+    if (r.amount !== undefined && toMicros(String(r.amount)) !== toMicros(rec.amountPoa)) return null;
+    if (r.nonce !== undefined && Number(r.nonce) !== Number(body.nonce)) return null;
+    return r;
+  }
+
+  /**
+   * Next bank nonce without the explorer: the highest nonce among the bank's own transactions that minepoa
+   * confirmed (CONFIRMED orders, SENT ones with an included / final receipt, bank txs already read from the
+   * ledger), and minepoa's own next_nonce answers, +1. null when nothing is known. Two instances can still
+   * never sign the same nonce (bank-nonce claims), our own live bodies floor it (_localNonceFloor), and a
+   * nonce minepoa says is used is only re-signed with proof (rejected-payout reconciler).
+   */
+  async _nonceFromReceipts() {
+    let best = null;
+    const bump = (n) => {
+      if (Number.isInteger(n) && n > 0 && (best === null || n > best)) best = n;
+    };
+    for (const o of Object.values(this.state.outbound)) {
+      if (o.recoveredFromLedger || !Number.isInteger(o.nonce) || !o.txid) continue;
+      if (o.status === 'CONFIRMED') bump(o.nonce + 1);
+      else if (o.status === 'SENT') {
+        const r = await this._receipt(o.txid);
+        if (r && r.txid === o.txid && ['included', 'final', 'confirmed'].includes(String(r.status).toLowerCase())) {
+          bump(o.nonce + 1);
+          bump(Number(r.next_nonce));
+        }
+      }
+    }
+    for (const n of this._txNonce.values()) bump(n + 1);
+    bump(Number(this.state.bankNonce));
+    return best;
+  }
+
   /** body.nonce of a bank tx on the ledger (cached; nonces are immutable). undefined = could not ask. */
   async _nonceOfTx(txid) {
     if (this._txNonce.has(txid)) return this._txNonce.get(txid);
@@ -1899,7 +2060,16 @@ export class ChainSettlement {
       if (!res.claimed && res.value?.orderId !== rec.orderId) throw new Error(`nonce ${rule.fixed} is reserved by order ${res.value?.orderId}`);
       return rule.fixed;
     }
-    const chainNext = await this._chainNextNonce();
+    let chainNext;
+    try {
+      chainNext = await this._chainNextNonce();
+    } catch (err) {
+      if (!isLedgerBusy(err)) throw err;
+      const fromReceipts = await this._nonceFromReceipts();
+      if (fromReceipts === null) throw err;
+      chainNext = fromReceipts;
+      if (this.logger) this.logger(`bank nonce from receipts (explorer busy): ${fromReceipts}`);
+    }
     let n = Math.max(chainNext, this._localNonceFloor(), Number.isInteger(rule.floor) ? rule.floor : 0);
     for (let i = 0; i < 64; i++, n++) {
       const res = await this._persist.claim(`bank-nonce:${n}`, { orderId: rec.orderId, gen: rec.resigns || 0, at: now() });
@@ -2219,8 +2389,14 @@ export class ChainSettlement {
           const doc = await this._reloadFromStore();
           // Pass mode: re-taking the lease right after our own pass (nobody held it in between, the
           // document is exactly what we left) is the same writer continuing; the check already passed.
-          const continuing = Boolean(this._lastPass && doc && this._lastPass.holder === this.writer.holderId && this.writer.lease.token === this._lastPass.token + 1 && doc.savedAt === this._lastPass.savedAt);
-          const missing = continuing ? [] : await this._unaccountedOutflows(doc);
+          const continuing = Boolean(this._lastPass && doc && this._lastPass.holder === this.writer.holderId && this.writer.lease.token === this._lastPass.token + 1 && this._loadedSavedAt === this._lastPass.savedAt);
+          let missing = continuing ? [] : await this._unaccountedOutflows(doc);
+          if (missing === undefined && (await this._handoverFromFreshStatus(doc))) {
+            // minepoa's explorer is busy: the document is exactly the one the last writer published, and
+            // that was recent, so it is not an old copy. The full ledger check runs on the next handover.
+            missing = [];
+            this._tickErrors.push('writer takeover: explorer busy; continued from the last published document');
+          }
           const attest = new Set(this._attestPending || []);
           this._attestPending = null;
           const unexplained = (missing || []).filter((id) => !attest.has(id));
@@ -2260,7 +2436,10 @@ export class ChainSettlement {
         } else {
           this.lastError = null; // only report errors that are still happening
         }
-        this.lastGoodTick = this._tickErrors.length ? this.lastGoodTick : now();
+        // A pass that only met a slow / busy minepoa (and fell back to receipts or the last trusted read)
+        // still completed: slow is not down. Any other error makes it not good.
+        const hardErrors = this._tickErrors.filter((e) => !isLedgerBusy(e));
+        this.lastGoodTick = hardErrors.length ? this.lastGoodTick : now();
         await this._publishStatus();
         this.writer.tokenAtTickStart = null;
         this.passes.completed += 1;
@@ -2674,11 +2853,15 @@ export class ChainSettlement {
       // 3. the books must be covered by the confirmed on-chain balance. A signed or sent payout that the
       //    ledger view does not show yet is subtracted from the balance (in flight) and is NOT counted as
       //    owed again, so a payout in flight never trips SOLVENCY_HOLD.
-      let pendingOut = 0n;
-      for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
-      for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
-      const required = this.engine.bankNavMicros + this.engine.devReserveMicros + this.engine.incentivePoolMicros + pendingOut;
-      const available = row.effectiveMicros - this._inFlightOutMicros(row.listedIds);
+      //    A queued refund is owed AND its deposit is in the balance, so it is covered: it counts once.
+      const solvency = () => {
+        let pendingOut = 0n;
+        for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
+        for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
+        return { required: this.engine.bankNavMicros + this.engine.devReserveMicros + this.engine.incentivePoolMicros + pendingOut, available: row.effectiveMicros - this._inFlightOutMicros(row.listedIds) };
+      };
+      let { required, available } = solvency();
+      if (available < required && this._repairHalfAppliedRefunds(required - available)) ({ required, available } = solvency());
       const inReview = Object.values(this.state.inbound).filter((r) => r.status === 'NEEDS_REVIEW').map((r) => r.txid);
       const audit = { onChainPoa: fromMicros(available < 0n ? 0n : available), requiredPoa: fromMicros(required), ok: available >= required };
       audit.foreignOutflows = this.foreign.length;
@@ -2694,6 +2877,38 @@ export class ChainSettlement {
       this._tickErrors.push(`reconcile: ${err.message}`);
       return set(prevStatus === 'OK' ? 'OK' : 'PENDING', prevStatus === 'OK' ? null : `Reconciliation could not finish (${err.message}); retrying.`);
     }
+  }
+
+  /**
+   * Bets refused by the accounting invariant and refunded, whose settlement had already booked the wager
+   * into the books (settleBet was not all-or-nothing before 2026-10-26): the wager was counted twice
+   * (in NAV and fees, and as the queued refund). Undo the half-applied loss once, only for the writer,
+   * only while the books exceed the balance by no more than those wagers, and never when a WIN payout
+   * exists for the bet. Returns how many were repaired.
+   */
+  _repairHalfAppliedRefunds(shortfallMicros) {
+    if (!this.writer.canWrite()) return 0;
+    const cands = Object.values(this.state.inbound).filter(
+      (r) => r.action === 'BET' && r.status === 'BOOKED' && !r.halfApplyRepaired && r.result?.action === 'REFUND_QUEUED' && /^Accounting invariant failed/.test(String(r.result?.reason || ''))
+    );
+    if (!cands.length) return 0;
+    let total = 0n;
+    const ok = [];
+    for (const r of cands) {
+      const win = Object.values(this.state.outbound).some((o) => o.sourceTxid === r.txid && o.kind === 'BET_WIN_PAYOUT') || this.engine.outboundQueue.some((o) => o.sourceTxid === r.txid && o.kind === 'BET_WIN_PAYOUT');
+      const receipt = this.engine.processedTxids.get(r.txid);
+      if (win || !receipt || receipt.action !== 'REFUND_QUEUED') continue;
+      ok.push(r);
+      total += toMicros(r.amountPoa);
+    }
+    if (!ok.length || shortfallMicros > total) return 0; // the gap is not (only) these wagers: leave it to the hold
+    for (const r of ok) {
+      const done = this.engine.revertHalfAppliedLoss({ betTxid: r.txid, wagerMicros: toMicros(r.amountPoa) });
+      r.halfApplyRepaired = { at: now(), ...done };
+      if (this.logger) this.logger(`reconcile: bet ${r.txid.slice(0, 16)} was refunded but its wager was also booked; booking undone (${done.wagerPoa} POA)`);
+    }
+    this._save();
+    return ok.length;
   }
 
   summary() {
@@ -2742,23 +2957,28 @@ export class ChainSettlement {
     const row = await this._scanBankReadOnly();
     this._tickErrors = prevErrors;
     if (!row || row.effectiveMicros === null) throw new Error('Could not read a trustworthy bank balance from minepoa right now');
-    const onChain = row.effectiveMicros;
+    // Bank payouts this vault made that the bank read does not show yet (signed, sent, or confirmed after
+    // the read) are subtracted from the balance and not counted as owed: each payout is counted once.
+    const sentUnconfirmed = this._inFlightOutMicros(row.listedIds);
+    const onChain = row.effectiveMicros - sentUnconfirmed;
     const unconfirmedIn = 0n; // the effective balance only counts FINAL inbound
     let pendingOut = 0n;
-    for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT') pendingOut += toMicros(o.amountPoa);
+    for (const o of Object.values(this.state.outbound)) if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
     for (const item of this.engine.outboundQueue) if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
     const booked = this.engine.bankNavMicros + this.engine.devReserveMicros + this.engine.incentivePoolMicros;
     const required = booked + pendingOut;
     const confirmedOnChain = onChain - unconfirmedIn;
     const delta = confirmedOnChain - required;
-    const sentUnconfirmed = this._inFlightOutMicros(row.listedIds);
     const stuck = this.stuckPayouts();
     let rejectedMicros = 0n;
     for (const o of Object.values(this.state.outbound)) if (o.status === 'REJECTED') rejectedMicros += toMicros(o.amountPoa);
     return {
       ok: delta >= 0n,
       bankAddress: this.bankAddress,
-      onChainBalancePoa: fromMicros(onChain),
+      onChainBalancePoa: fromMicros(onChain < 0n ? 0n : onChain),
+      balanceFrom: row.fromTrusted ? 'last-trusted-read' : 'ledger',
+      trustedBalanceAt: row.fromTrusted ? new Date(row.trustedAt).toISOString() : null,
+      trustedBalanceAgeMs: row.fromTrusted ? Math.max(0, now() - row.trustedAt) : null,
       unconfirmedInboundPoa: fromMicros(unconfirmedIn),
       confirmedOnChainPoa: fromMicros(confirmedOnChain < 0n ? 0n : confirmedOnChain),
       internal: {
@@ -2768,7 +2988,9 @@ export class ChainSettlement {
         // owed and NOT on its way (includes rejected payouts, listed separately below)
         outboundNotYetSentPoa: fromMicros(pendingOut),
         outboundRejectedPoa: fromMicros(rejectedMicros),
-        outboundSentUnconfirmedPoa: fromMicros(sentUnconfirmed)
+        outboundSentUnconfirmedPoa: fromMicros(sentUnconfirmed),
+        lockedCollateralPoa: fromMicros(this.engine.lockedCollateralMicros),
+        lockedCollateralHeal: this.engine.lockHeal || null
       },
       payoutsOk: stuck.length === 0,
       stuckPayouts: stuck,

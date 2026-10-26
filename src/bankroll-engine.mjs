@@ -154,6 +154,22 @@ export class BankrollEngine {
   // -------------------------------------------------------------------------
   // Accounting Invariants & Share Math
   // -------------------------------------------------------------------------
+  /**
+   * Locked collateral is DERIVED, never accumulated: the lock of every bet being settled in this
+   * process (inFlightBets) plus every exposure reservation held here (batchReservations). Nothing else
+   * can be locked, so it can never drift (e.g. across a reload of the shared vault) or go negative.
+   */
+  derivedLockedMicros() {
+    let sum = 0n;
+    for (const b of this.inFlightBets.values()) sum += BigInt(b.lockAmountMicros || 0n);
+    return sum + this.reservedExposureMicros;
+  }
+
+  _syncLocked() {
+    this.lockedCollateralMicros = this.derivedLockedMicros();
+    return this.lockedCollateralMicros;
+  }
+
   get availableBankrollMicros() {
     const avail = this.bankNavMicros - this.lockedCollateralMicros;
     return avail > 0n ? avail : 0n;
@@ -823,8 +839,6 @@ export class BankrollEngine {
     const incentiveFeeMicros = toMicros(quote.incentivePoolFeePoa);
     const lockAmountMicros = profitMicros + devFeeMicros + incentiveFeeMicros;
 
-    this.lockedCollateralMicros += lockAmountMicros;
-
     const cleanSeed = sanitizeUntrustedText(
       clientSeed || this.playerClientSeeds.get(address) || 'default',
       64
@@ -854,6 +868,7 @@ export class BankrollEngine {
     };
 
     this.inFlightBets.set(betTxid, lockedBet);
+    this._syncLocked();
     this._emit('bet.locked', {
       betTxid,
       address,
@@ -924,17 +939,29 @@ export class BankrollEngine {
     if (!locked) {
       throw new Error(`No locked in-flight bet found for txid: ${betTxid}`);
     }
+    // All-or-nothing up to the invariant check: if anything below throws, every change made here is
+    // undone, so a bet that is refused (and refunded by the caller) never also moves the books.
+    const snap = this._betSnapshot(betTxid, locked.address);
+    let outcome;
+    let roll;
+    let ticket;
+    let nextNonce;
+    let serverSeedHash;
+    let actualDevFeeMicros;
+    let payoutOrderId = null;
+    let netPlayerDeltaMicros = -locked.wagerMicros;
+    try {
 
     // 1. Release locked collateral
-    this.lockedCollateralMicros -= locked.lockAmountMicros;
     this.inFlightBets.delete(betTxid);
+    this._syncLocked();
 
     // 2. Fix the provably-fair inputs. If a settlement ticket was claimed for this bet in the shared
     //    store (chain mode), it is authoritative: its nonce, seed epoch and roll were fixed when the bet
     //    was first booked, by whichever instance got there first. Otherwise compute the ticket here.
     const claimed = this.settlementTickets.get(betTxid) || null;
     this.settlementTickets.delete(betTxid);
-    let ticket = claimed;
+    ticket = claimed;
     if (ticket && (ticket.address !== locked.address || Number(ticket.targetBps) !== Number(locked.targetBps) || ticket.direction !== locked.direction)) {
       throw new Error(`Settlement ticket for ${betTxid} does not match the locked bet; refusing to settle`);
     }
@@ -947,25 +974,25 @@ export class BankrollEngine {
         direction: locked.direction
       });
     }
-    const nextNonce = Number(ticket.nonce);
+    nextNonce = Number(ticket.nonce);
     this.playerNonces.set(locked.address, Math.max(this.playerNonces.get(locked.address) || 0, nextNonce));
     this.seedManager.betsCount += 1;
 
-    const serverSeedHash = ticket.serverSeedHash;
-    const roll = {
+    serverSeedHash = ticket.serverSeedHash;
+    roll = {
       rollBps: Number(ticket.rollBps),
       rollDisplay: ticket.rollDisplay,
       message: ticket.message,
       hmacHex: ticket.hmacHex
     };
-    const outcome = evaluateRoll({
+    outcome = evaluateRoll({
       rollBps: roll.rollBps,
       targetBps: locked.targetBps,
       direction: locked.direction
     });
 
     // 3. Allocate 0.1% Dev Reserve to poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U
-    let actualDevFeeMicros = locked.devFeeMicros;
+    actualDevFeeMicros = locked.devFeeMicros;
     if (this.devFeeMode === 'net_profit_only' && outcome.won) {
       actualDevFeeMicros = 0n;
     }
@@ -976,8 +1003,6 @@ export class BankrollEngine {
     this.incentivePoolMicros += locked.incentiveFeeMicros;
 
     // 5. Update LP Bankroll Equity (bankNavMicros) and enqueue player payout if won
-    let payoutOrderId = null;
-    let netPlayerDeltaMicros = -locked.wagerMicros;
 
     if (outcome.won) {
       this.totalPlayerWinsCount += 1;
@@ -1006,6 +1031,10 @@ export class BankrollEngine {
     this.totalVolumeMicros += locked.wagerMicros;
 
     this.assertAccountingInvariant();
+    } catch (err) {
+      this._restoreBetSnapshot(snap);
+      throw err;
+    }
     this._processWithdrawalQueue();
 
     const receipt = {
@@ -1052,6 +1081,32 @@ export class BankrollEngine {
     this._saveToDisk();
     this._emit('bet.settled', receipt);
     return receipt;
+  }
+
+  /**
+   * Undo the books effects of a LOST bet whose settlement threw at the invariant check AFTER changing the
+   * books (before 2026-10-26 settleBet was not all-or-nothing) and which was then refunded: the wager
+   * was booked into NAV and fees AND is owed back as a refund. Only the loss branch is undone here
+   * (a half-applied WIN would have queued a payout; the caller refuses to repair that case).
+   */
+  revertHalfAppliedLoss({ betTxid, wagerMicros }) {
+    const w = BigInt(wagerMicros);
+    const { devFeeMicros, incentiveFeeMicros } = this.feesForWager(w, false);
+    const net = w - devFeeMicros - incentiveFeeMicros;
+    this.bankNavMicros -= net;
+    this.netHouseProfitMicros -= net;
+    this.devReserveMicros -= devFeeMicros;
+    this.totalDevEarnedMicros -= devFeeMicros;
+    this.incentivePoolMicros -= incentiveFeeMicros;
+    if (this.totalPlayerLossesCount > 0) this.totalPlayerLossesCount -= 1;
+    if (this.totalBetsCount > 0) this.totalBetsCount -= 1;
+    this.totalVolumeMicros -= w;
+    this._syncLocked();
+    this.assertAccountingInvariant();
+    this._saveToDisk();
+    const rec = { betTxid, wagerPoa: fromMicros(w), navPoa: fromMicros(net), devFeePoa: fromMicros(devFeeMicros), incentiveFeePoa: fromMicros(incentiveFeeMicros) };
+    this._emit('bank.half_applied_bet_reverted', rec);
+    return rec;
   }
 
   /** Fees the normal settle path charges on a wager (same formulas as quoteBet / settleBet). */
@@ -1175,7 +1230,50 @@ export class BankrollEngine {
     if (lockRes.idempotent || lockRes.action === 'REFUND_QUEUED') {
       return lockRes;
     }
-    return this.settleBet(params.betTxid, params.ts);
+    try {
+      return this.settleBet(params.betTxid, params.ts);
+    } catch (err) {
+      // Refused at settlement (the caller refunds it): the books are exactly as before the bet.
+      this.inFlightBets.delete(params.betTxid);
+      this._syncLocked();
+      throw err;
+    }
+  }
+
+  /** Everything settleBet changes before its invariant check (restored if that check fails). */
+  _betSnapshot(betTxid, address) {
+    return {
+      betTxid,
+      address,
+      locked: this.inFlightBets.get(betTxid),
+      ticket: this.settlementTickets.get(betTxid),
+      hadNonce: this.playerNonces.has(address),
+      nonce: this.playerNonces.get(address),
+      betsCount: this.seedManager.betsCount,
+      outboundLen: this.outboundQueue.length,
+      n: {
+        bankNavMicros: this.bankNavMicros,
+        devReserveMicros: this.devReserveMicros,
+        totalDevEarnedMicros: this.totalDevEarnedMicros,
+        incentivePoolMicros: this.incentivePoolMicros,
+        netHouseProfitMicros: this.netHouseProfitMicros,
+        totalPlayerWinsCount: this.totalPlayerWinsCount,
+        totalPlayerLossesCount: this.totalPlayerLossesCount,
+        totalBetsCount: this.totalBetsCount,
+        totalVolumeMicros: this.totalVolumeMicros
+      }
+    };
+  }
+
+  _restoreBetSnapshot(snap) {
+    Object.assign(this, snap.n);
+    if (snap.locked) this.inFlightBets.set(snap.betTxid, snap.locked);
+    if (snap.ticket) this.settlementTickets.set(snap.betTxid, snap.ticket);
+    if (snap.hadNonce) this.playerNonces.set(snap.address, snap.nonce);
+    else this.playerNonces.delete(snap.address);
+    this.seedManager.betsCount = snap.betsCount;
+    this.outboundQueue.length = snap.outboundLen;
+    this._syncLocked();
   }
 
   queueRefund({ sourceTxid, to, amountPoa, reason, full = false, ts = Math.floor(Date.now() / 1000) }) {
@@ -1639,7 +1737,7 @@ export class BankrollEngine {
       throw error;
     }
     this.batchReservations.set(batchId, amount);
-    this.lockedCollateralMicros += amount;
+    this._syncLocked();
     return amount;
   }
 
@@ -1652,8 +1750,7 @@ export class BankrollEngine {
     const left = held - amount;
     if (left > 0n) this.batchReservations.set(batchId, left);
     else this.batchReservations.delete(batchId);
-    this.lockedCollateralMicros -= amount;
-    if (this.lockedCollateralMicros < 0n) this.lockedCollateralMicros = 0n;
+    this._syncLocked();
     return amount;
   }
 
@@ -1671,7 +1768,8 @@ export class BankrollEngine {
       epochStartedAt: this.epochStartedAt,
       devFeeMode: this.devFeeMode,
       bankNavMicros: this.bankNavMicros.toString(),
-      lockedCollateralMicros: (this.lockedCollateralMicros - this.reservedExposureMicros).toString(),
+      // Locks of bets being settled right now; reservations are rebuilt from the open bets on load.
+      lockedCollateralMicros: (this.derivedLockedMicros() - this.reservedExposureMicros).toString(),
       totalShares: this.totalShares.toString(),
       devReserveMicros: this.devReserveMicros.toString(),
       totalDevEarnedMicros: this.totalDevEarnedMicros.toString(),
@@ -1756,7 +1854,22 @@ export class BankrollEngine {
     this.epochStartedAt = raw.epochStartedAt === undefined || raw.epochStartedAt === null ? null : Number(raw.epochStartedAt);
     this.devFeeMode = raw.devFeeMode || this.devFeeMode;
     this.bankNavMicros = BigInt(raw.bankNavMicros || 0);
-    this.lockedCollateralMicros = BigInt(raw.lockedCollateralMicros || 0);
+    // Self-heal: the stored value is only checked, never trusted. Locked collateral is derived from what
+    // is actually open here (see derivedLockedMicros); a disagreeing stored value (e.g. the negative
+    // value left by the reload double-subtraction fixed on 2026-10-26) is corrected and recorded.
+    let storedLocked = 0n;
+    try {
+      storedLocked = BigInt(raw.lockedCollateralMicros || 0);
+    } catch {
+      storedLocked = null;
+    }
+    this._syncLocked();
+    const storedExpected = this.derivedLockedMicros() - this.reservedExposureMicros;
+    if (storedLocked !== storedExpected) {
+      this.lockHeal = { at: Date.now(), storedMicros: storedLocked === null ? null : storedLocked.toString(), correctedMicros: storedExpected.toString() };
+      this._emit('bank.locked_collateral_healed', this.lockHeal);
+      if (typeof this.logger === 'function') this.logger(`locked collateral corrected on load: stored ${this.lockHeal.storedMicros} -> ${this.lockHeal.correctedMicros} micros`);
+    }
     this.totalShares = BigInt(raw.totalShares || 0);
     this.devReserveMicros = BigInt(raw.devReserveMicros || 0);
     this.totalDevEarnedMicros = BigInt(raw.totalDevEarnedMicros || 0);

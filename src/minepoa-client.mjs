@@ -75,7 +75,9 @@ export class MinepoaClient {
     this._memoCache = new Map(); // txid -> memo (memos are immutable once on the ledger)
     this.stats = { calls: 0, retries: 0, timeouts: 0, lastLatencyMs: null, busy: 0, busyFastFails: 0 };
     this.busyMaxMs = busyMaxMs;
-    this._busyUntil = { read: 0, submit: 0 };
+    // Busy windows per minepoa surface: the explorer ('read'), receipts, /api/txs, and submits. The
+    // explorer can be "origin busy" while receipts still answer (seen live 2026-10-26).
+    this._busyUntil = { read: 0, receipt: 0, txs: 0, submit: 0 };
   }
 
   /** {until, scope} while minepoa's retry_after window for this scope is open; else null. */
@@ -86,7 +88,7 @@ export class MinepoaClient {
 
   busyView() {
     const iso = (t) => (t > Date.now() ? new Date(t).toISOString() : null);
-    return { readBusyUntil: iso(this._busyUntil.read), submitBusyUntil: iso(this._busyUntil.submit) };
+    return { readBusyUntil: iso(this._busyUntil.read), receiptBusyUntil: iso(this._busyUntil.receipt), txsBusyUntil: iso(this._busyUntil.txs), submitBusyUntil: iso(this._busyUntil.submit) };
   }
 
   _noteBusy(scope, retryAfterMs) {
@@ -112,9 +114,16 @@ export class MinepoaClient {
    * Each attempt gets a FRESH timeout signal, so a process that was frozen between requests
    * (serverless) does not fail on a signal whose clock ran while it was asleep.
    */
+  static busyScope(path) {
+    if (path.startsWith('/api/receipt/')) return 'receipt';
+    if (path.startsWith('/api/txs')) return 'txs';
+    return 'read';
+  }
+
   async _get(path) {
     let lastErr = null;
-    this._failFast('read', path.split('?')[0]);
+    const scope = MinepoaClient.busyScope(path);
+    this._failFast(scope, path.split('?')[0]);
     for (let attempt = 1; attempt <= this.retries; attempt++) {
       const t0 = Date.now();
       this.stats.calls += 1;
@@ -139,8 +148,8 @@ export class MinepoaClient {
         const body = await resp.json();
         const ra = Number(body?.retry_after_seconds || 0) * 1000;
         if (body && !body.id && body.error && ra > IN_CALL_RETRY_AFTER_MS) {
-          const ms = this._noteBusy('read', ra);
-          throw new BusyError(`minepoa ${path.split('?')[0]} -> busy: ${String(body.error).slice(0, 80)}`, { retryAfterMs: ms, scope: 'read' });
+          const ms = this._noteBusy(scope, ra);
+          throw new BusyError(`minepoa ${path.split('?')[0]} -> busy: ${String(body.error).slice(0, 80)}`, { retryAfterMs: ms, scope });
         }
         return body;
       }
@@ -149,8 +158,8 @@ export class MinepoaClient {
         const j = await resp.json().catch(() => null);
         const ra = Number(j?.retry_after_seconds || resp.headers?.get?.('retry-after') || 0) * 1000 || 0;
         if (ra > IN_CALL_RETRY_AFTER_MS) {
-          const ms = this._noteBusy('read', ra);
-          throw new BusyError(`minepoa ${path.split('?')[0]} -> HTTP ${resp.status} busy${j?.error ? `: ${String(j.error).slice(0, 80)}` : ''}`, { retryAfterMs: ms, scope: 'read' });
+          const ms = this._noteBusy(scope, ra);
+          throw new BusyError(`minepoa ${path.split('?')[0]} -> HTTP ${resp.status} busy${j?.error ? `: ${String(j.error).slice(0, 80)}` : ''}`, { retryAfterMs: ms, scope });
         }
         retryAfterMs = Math.min(IN_CALL_RETRY_AFTER_MS, ra);
         lastErr = new Error(`minepoa ${path.split('?')[0]} -> HTTP ${resp.status}`);

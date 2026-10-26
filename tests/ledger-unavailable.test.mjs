@@ -215,8 +215,13 @@ test('payout during an outage stays queued, retries after recovery with the same
       assert.equal(mock.transfersFrom(bank.address).length, 0);
       const hh = (await srv.get('/api/health')).settlement;
       // (the books may also be in SOLVENCY_HOLD here: the whole bank is being withdrawn; that hold takes precedence)
-      assert.equal(hh.ledger.status, 'UNAVAILABLE', `${status}: a failed payout broadcast pauses trading`);
-      assert.notEqual(hh.trading, 'OPEN');
+      if (status === 401) {
+        assert.equal(hh.ledger.status, 'UNAVAILABLE', `${status}: a refused payout broadcast pauses trading`);
+        assert.notEqual(hh.trading, 'OPEN');
+      } else {
+        // 503 is slow / busy: degraded, not a pause, until it lasts longer than the outage window
+        assert.equal(hh.ledger.status, 'DEGRADED', `${status}: a busy minepoa only degrades`);
+      }
       mock.setOutage(0);
       for (let i = 0; i < 10; i++) await srv.settle(1);
       out = srv.app.settlement.getTxStatus(wd.data.txid).payouts[0];
