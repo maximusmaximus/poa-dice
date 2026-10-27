@@ -13,8 +13,15 @@
  *   - bets booked by recovery from an on-chain payout (`recovered`), and wins whose payout was
  *     matched or recovered from the ledger after the fact, or re-paid: their confirmation time is
  *     when the books were repaired, not when the payout landed.
+ *
+ * The headline figures (avgPlaySeconds, plays, avgWinSeconds, avgLossSeconds) cover the `windowSize`
+ * (default 20) most recently completed plays, ordered by completion time (loss: bookedAt; win: payout
+ * confirmedAt), so a few old slow plays (e.g. payouts held during a ledger outage) stop skewing it.
+ * The same figures over every eligible play are under `allTime`.
  */
-export function computePlayTimes(inbound = {}, outbound = {}) {
+export const PLAY_TIME_WINDOW = 20;
+
+export function computePlayTimes(inbound = {}, outbound = {}, { windowSize = PLAY_TIME_WINDOW } = {}) {
   const payoutBySource = new Map();
   for (const o of Object.values(outbound || {})) {
     if (!o || o.kind !== 'BET_WIN_PAYOUT' || !o.sourceTxid) continue;
@@ -22,8 +29,7 @@ export function computePlayTimes(inbound = {}, outbound = {}) {
     const prev = payoutBySource.get(o.sourceTxid);
     if (!prev || (o.status === 'CONFIRMED' && prev.status !== 'CONFIRMED')) payoutBySource.set(o.sourceTxid, o);
   }
-  const loss = [];
-  const win = [];
+  const done = []; // { ms, end, won }
   let pendingWins = 0;
   let excluded = 0;
   let lastAt = 0;
@@ -61,23 +67,34 @@ export function computePlayTimes(inbound = {}, outbound = {}) {
       continue;
     }
     const ms = end - start;
-    (res.won ? win : loss).push(ms);
+    done.push({ ms, end, won: Boolean(res.won), seq: Number(r.seq) || 0 });
     if (end > lastAt) {
       lastAt = end;
       lastMs = ms;
     }
   }
+  // Most recently completed first (ties: later bet first).
+  done.sort((a, b) => b.end - a.end || b.seq - a.seq);
   const avg = (xs) => (xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : null);
   const secs = (ms) => (ms === null ? null : Math.round(ms / 100) / 10);
-  const all = loss.concat(win);
+  const figures = (list) => {
+    const win = list.filter((p) => p.won).map((p) => p.ms);
+    const loss = list.filter((p) => !p.won).map((p) => p.ms);
+    return {
+      avgPlaySeconds: secs(avg(list.map((p) => p.ms))),
+      plays: list.length,
+      wins: win.length,
+      losses: loss.length,
+      avgWinSeconds: secs(avg(win)),
+      avgLossSeconds: secs(avg(loss))
+    };
+  };
+  const size = Number.isInteger(windowSize) && windowSize > 0 ? windowSize : PLAY_TIME_WINDOW;
   return {
-    window: 'all-time',
-    avgPlaySeconds: secs(avg(all)),
-    plays: all.length,
-    wins: win.length,
-    losses: loss.length,
-    avgWinSeconds: secs(avg(win)),
-    avgLossSeconds: secs(avg(loss)),
+    window: `last-${size}`,
+    windowSize: size,
+    ...figures(done.slice(0, size)),
+    allTime: { window: 'all-time', ...figures(done) },
     lastPlaySeconds: secs(lastMs),
     lastPlayAt: lastAt ? new Date(lastAt).toISOString() : null,
     winsAwaitingPayout: pendingWins,
