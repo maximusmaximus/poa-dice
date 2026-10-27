@@ -530,11 +530,11 @@ function setStatus(text, st) {
   $('sseStatusBadge').dataset.state = st;
 }
 
-/** "Average play: 52 s (over 18 plays)" from /api/state playTime (server-side timings, all settled plays). */
+/** "Average play: 52 s (last 20 plays)" from /api/state playTime (server-side timings, most recent completed plays). */
 export function avgPlayText(pt) {
   if (!pt || typeof pt.avgPlaySeconds !== 'number' || !Number.isFinite(pt.avgPlaySeconds) || !(pt.plays > 0)) return 'Average play: — (no timed plays yet)';
   const secs = pt.avgPlaySeconds >= 10 ? Math.round(pt.avgPlaySeconds) : Math.round(pt.avgPlaySeconds * 10) / 10;
-  return `Average play: ${secs} s (over ${pt.plays} ${pt.plays === 1 ? 'play' : 'plays'})`;
+  return `Average play: ${secs} s (last ${pt.plays === 1 ? 'play' : `${pt.plays} plays`})`;
 }
 
 function renderAvgPlayTime(pt) {

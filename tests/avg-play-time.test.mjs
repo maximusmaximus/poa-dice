@@ -27,8 +27,10 @@ test('computePlayTimes: loss = submitted -> booked, win = submitted -> payout co
     pc: payout('c', null, { status: 'SENT' })
   };
   const r = computePlayTimes(inbound, outbound);
-  assert.equal(r.window, 'all-time');
+  assert.equal(r.window, 'last-20');
   assert.equal(r.plays, 2);
+  assert.equal(r.allTime.plays, 2);
+  assert.equal(r.allTime.avgPlaySeconds, 60);
   assert.equal(r.losses, 1);
   assert.equal(r.wins, 1);
   assert.equal(r.avgPlaySeconds, 60);
@@ -58,17 +60,70 @@ test('computePlayTimes: leaves out non-plays and repaired timestamps', () => {
   assert.equal(r.excluded, 4); // scan, recovered, matched, skew
 });
 
+test('computePlayTimes: last 20 by completion time; old slow plays fall out of the window', () => {
+  const inbound = {};
+  const outbound = {};
+  // 5 old slow wins whose payouts were held for ~10 min (completed first).
+  for (let i = 0; i < 5; i++) {
+    const t = `slow${i}`;
+    inbound[t] = bet(t, 1_000 + i, 2_000 + i, true, { seq: i + 1 });
+    outbound[`p${t}`] = payout(t, 601_000 + i); // 600 s
+  }
+  // 20 newer plays: 10 losses of 30 s and 10 wins of 60 s, all completed after the slow ones.
+  for (let i = 0; i < 20; i++) {
+    const t = `new${i}`;
+    const start = 1_000_000 + i * 100_000;
+    if (i % 2) {
+      inbound[t] = bet(t, start, start + 5_000, true, { seq: 10 + i });
+      outbound[`p${t}`] = payout(t, start + 60_000);
+    } else {
+      inbound[t] = bet(t, start, start + 30_000, false, { seq: 10 + i });
+    }
+  }
+  // A bet submitted early but whose payout confirmed last is the most recent completion.
+  inbound.late = bet('late', 500, 900, true, { seq: 99 });
+  outbound.plate = payout('late', 5_000_000); // ~5000 s
+  const r = computePlayTimes(inbound, outbound);
+  assert.equal(r.window, 'last-20');
+  assert.equal(r.windowSize, 20);
+  assert.equal(r.plays, 20);
+  // window = 'late' + the 19 newest of the 20 new plays (oldest new loss "new0" drops out); no slow wins.
+  const lateMs = 5_000_000 - 500;
+  const expected = (lateMs + 9 * 30_000 + 10 * 60_000) / 20;
+  assert.equal(r.avgPlaySeconds, Math.round(expected / 100) / 10);
+  assert.equal(r.wins, 11);
+  assert.equal(r.losses, 9);
+  assert.equal(r.avgLossSeconds, 30);
+  assert.equal(r.avgWinSeconds, Math.round(((lateMs + 10 * 60_000) / 11) / 100) / 10);
+  assert.equal(r.allTime.plays, 26);
+  assert.equal(r.allTime.wins, 16);
+  // Without the late outlier, the slow wins still sit outside the window.
+  delete inbound.late;
+  const r2 = computePlayTimes(inbound, outbound);
+  assert.equal(r2.plays, 20);
+  assert.equal(r2.avgPlaySeconds, 45);
+  assert.equal(r2.avgWinSeconds, 60);
+  assert.ok(r2.allTime.avgPlaySeconds > 100, 'all-time still includes the slow wins');
+  // Fewer than 20: every play is used.
+  const r3 = computePlayTimes({ a: bet('a', 1_000, 11_000, false) }, {});
+  assert.equal(r3.plays, 1);
+  assert.equal(r3.window, 'last-20');
+  // Custom window size.
+  assert.equal(computePlayTimes(inbound, outbound, { windowSize: 5 }).plays, 5);
+});
+
 test('computePlayTimes: empty state => null average, zero plays', () => {
   const r = computePlayTimes({}, {});
   assert.equal(r.avgPlaySeconds, null);
   assert.equal(r.plays, 0);
 });
 
-test('header text: "Average play: N s (over M plays)"', async () => {
+test('header text: "Average play: N s (last M plays)"', async () => {
   globalThis.document ??= undefined;
   const { avgPlayText } = await import('../public/app.js');
-  assert.equal(avgPlayText({ avgPlaySeconds: 52.4, plays: 18 }), 'Average play: 52 s (over 18 plays)');
-  assert.equal(avgPlayText({ avgPlaySeconds: 4.26, plays: 1 }), 'Average play: 4.3 s (over 1 play)');
+  assert.equal(avgPlayText({ avgPlaySeconds: 52.4, plays: 20 }), 'Average play: 52 s (last 20 plays)');
+  assert.equal(avgPlayText({ avgPlaySeconds: 52.4, plays: 7 }), 'Average play: 52 s (last 7 plays)');
+  assert.equal(avgPlayText({ avgPlaySeconds: 4.26, plays: 1 }), 'Average play: 4.3 s (last play)');
   assert.equal(avgPlayText({ avgPlaySeconds: null, plays: 0 }), 'Average play: — (no timed plays yet)');
   assert.equal(avgPlayText(null), 'Average play: — (no timed plays yet)');
   const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
@@ -130,8 +185,9 @@ test('chain e2e: /api/health and /api/state report avgPlaySeconds after each set
     mock.finalizeAll(); // payouts final on the ledger
     await settle();
     h = await fetch(`${info.url}/api/health`).then((r) => r.json());
-    assert.equal(h.playTime.window, 'all-time');
+    assert.equal(h.playTime.window, 'last-20');
     assert.equal(h.playTime.plays, 5);
+    assert.equal(h.playTime.allTime.plays, 5);
     assert.equal(h.playTime.wins, wins);
     assert.equal(h.playTime.winsAwaitingPayout, 0);
     assert.ok(h.playTime.avgPlaySeconds >= 0.05, `avg ${h.playTime.avgPlaySeconds}`);

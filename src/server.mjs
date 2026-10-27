@@ -499,13 +499,13 @@ export function createDiceServer(options = {}) {
     };
   }
 
-  // Average play time (seconds) over all settled plays; null with no chain settlement (local demo ledger).
+  // Average play time (seconds) over the last 20 settled plays (all-time under allTime); null with no chain settlement (local demo ledger).
   function playTimeBrief() {
-    if (!settlement) return { window: 'all-time', avgPlaySeconds: null, plays: 0, note: 'Plays are timed only with chain settlement' };
+    if (!settlement) return { window: 'last-20', avgPlaySeconds: null, plays: 0, note: 'Plays are timed only with chain settlement' };
     try {
       return settlement.playTimeStats();
     } catch {
-      return { window: 'all-time', avgPlaySeconds: null, plays: 0 };
+      return { window: 'last-20', avgPlaySeconds: null, plays: 0 };
     }
   }
 
