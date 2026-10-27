@@ -1533,6 +1533,7 @@ html[data-legal-dismissed] .legal-strip {
 .brand-title { margin: 0; font-size: 22px; letter-spacing: 0.14em; font-weight: 800; color: var(--text-primary); }
 .brand-tagline { margin: 4px 0 0; color: var(--text-secondary); font-size: 13.5px; max-width: 620px; }
 .header-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+.avg-play { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .status-chip {
   display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 999px;
   font: 600 11px var(--font-mono); letter-spacing: 0.08em; border: 1px solid var(--border-subtle); color: var(--text-secondary);

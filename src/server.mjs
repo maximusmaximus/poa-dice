@@ -499,6 +499,16 @@ export function createDiceServer(options = {}) {
     };
   }
 
+  // Average play time (seconds) over all settled plays; null with no chain settlement (local demo ledger).
+  function playTimeBrief() {
+    if (!settlement) return { window: 'all-time', avgPlaySeconds: null, plays: 0, note: 'Plays are timed only with chain settlement' };
+    try {
+      return settlement.playTimeStats();
+    } catch {
+      return { window: 'all-time', avgPlaySeconds: null, plays: 0 };
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'OPTIONS') {
@@ -606,6 +616,7 @@ export function createDiceServer(options = {}) {
           devReserveAddress: DEV_RESERVE_ADDRESS,
           devFeeBps: 10,
           settlement: settlementBrief(),
+          playTime: playTimeBrief(),
           stateRootSha256: engine.computeStateRoot(),
           connectedSseClients: sseClients.size,
           mcpEndpoint: '/mcp',
@@ -647,6 +658,7 @@ export function createDiceServer(options = {}) {
         summary.bankAddress = publicBankAddress();
         summary.chainId = chainIdValue();
         summary.settlement = settlementBrief();
+        summary.playTime = playTimeBrief();
         if (requireChain) {
           try {
             const bank = await cachedExplorer(engine.bankAddress);

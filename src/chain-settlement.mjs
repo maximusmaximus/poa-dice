@@ -65,6 +65,7 @@ import { BankWriter, BINDING_KEY } from './bank-writer.mjs';
 import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMicros, txidOf, verifyBody } from './crypto-poa.mjs';
 import { PersistQueue } from './settlement-store.mjs';
 import { isLedgerBusy, isLedgerOutage, LEDGER_HOLD } from './ledger-probe.mjs';
+import { computePlayTimes } from './play-time.mjs';
 
 const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED', 'REFUSED_DUPLICATE']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
@@ -3486,6 +3487,11 @@ export class ChainSettlement {
     }
     this._save();
     return ok.length;
+  }
+
+  /** Average time a dice play takes, over every settled play in this vault's state (see play-time.mjs). */
+  playTimeStats() {
+    return computePlayTimes(this.state.inbound, this.state.outbound);
   }
 
   summary() {
