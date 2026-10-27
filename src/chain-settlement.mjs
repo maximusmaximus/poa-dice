@@ -66,6 +66,7 @@ import { buildSignedTransfer, fromMicros, isValidPoaAddress, parseDiceMemo, toMi
 import { PersistQueue } from './settlement-store.mjs';
 import { isLedgerBusy, isLedgerOutage, LEDGER_HOLD } from './ledger-probe.mjs';
 import { computePlayTimes } from './play-time.mjs';
+import { bankHistoryOf, bankHistoryTotals, MINEPOA_ADDRESS_CAP, mergeBankTxs, poascanHistoryProblem } from './bank-history.mjs';
 
 const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED', 'REFUSED_DUPLICATE']);
 const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
@@ -135,6 +136,8 @@ export class ChainSettlement {
     payoutRetryMaxMs = 30000,
     trustedBalanceMaxAgeMs = 10 * 60 * 1000,
     indexer = null,
+    addressListCap = MINEPOA_ADDRESS_CAP,
+    historyBackfillEveryMs = 2 * 60 * 1000,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -143,6 +146,12 @@ export class ChainSettlement {
     this.client = client;
     // Independent index of the ledger (POAScan, see poascan-client.mjs); the re-pay check needs its answer.
     this.indexer = indexer;
+    // Full bank history (bank-history.mjs): minepoa's address page lists only the newest `addressListCap`
+    // transfers, so every bank transfer seen is kept in the vault document and older ones come from POAScan.
+    this.addressListCap = addressListCap;
+    this.historyBackfillEveryMs = historyBackfillEveryMs;
+    this._historyBackfill = { at: 0, okAt: null, reason: null, added: 0 };
+    this._historyStatus = null;
     Object.defineProperty(this, 'bankWallet', { value: bankWallet, enumerable: false });
     this.bankAddress = bankWallet.address;
     this.store = store;
@@ -1079,6 +1088,11 @@ export class ChainSettlement {
         this._save();
       }
     }
+    // The bank's FULL history: minepoa lists only its newest transfers, so the balance is summed over every
+    // bank transfer the vault has recorded (plus POAScan's older ones when needed). If that history cannot be
+    // shown to be complete, nothing below is trusted: bets stay refused and the hold stays (never fails open).
+    const history = await this._syncBankHistory(row.txs || [], txs);
+    if (!history.complete) outIndexComplete = false;
     // Our own SIGNED/SENT txs may not be listed yet; they are covered by _inFlightOutMicros.
     this.ledgerIndexComplete = outIndexComplete;
 
@@ -1094,24 +1108,19 @@ export class ChainSettlement {
     } catch {
       checkpointMicros = null;
     }
-    const listed = new Set();
-    let finalIn = 0n;
-    let outAll = 0n;
-    for (const t of txs) {
-      if (t.to === this.bankAddress && t.from === this.bankAddress) continue;
-      if (t.to === this.bankAddress) {
-        listed.add(t.id);
-        if (t.final) finalIn += toMicros(t.amount || '0');
-      } else if (t.from === this.bankAddress) {
-        listed.add(t.id);
-        outAll += toMicros(t.amount || '0');
-      }
-    }
+    // Summed over the recorded history (every listed transfer is in it, deduplicated by txid), not over
+    // minepoa's capped list: a transfer that falls off the list still counts.
+    const totals = bankHistoryTotals(bankHistoryOf(this.state));
+    const listed = totals.ids;
+    const finalIn = totals.finalIn;
+    const outAll = totals.outAll;
     const est1 = finalIn - outAll;
     const est2 = checkpointMicros === null ? null : checkpointMicros - outAll;
     const effective = est2 === null ? est1 : est1 > est2 ? est1 : est2;
     row.effectiveMicros = effective;
     row.listedIds = listed;
+    row.historyComplete = history.complete;
+    row.historyReason = history.reason;
     this.lastBankBalance = {
       balance: fromMicros(effective < 0n ? 0n : effective),
       checkpointBalance: row.balance,
@@ -1119,6 +1128,10 @@ export class ChainSettlement {
       ledgerFinalInPoa: fromMicros(finalIn),
       ledgerOutPoa: fromMicros(outAll),
       source: est2 !== null && est2 >= est1 ? 'checkpoint-minus-outbound' : 'ledger-history-final',
+      historyTxs: totals.count,
+      minepoaListed: (row.txs || []).length,
+      historyComplete: history.complete,
+      ...(history.complete ? {} : { historyProblem: history.reason }),
       at: now()
     };
     this._lastRow = outIndexComplete ? row : null;
@@ -1126,6 +1139,145 @@ export class ChainSettlement {
     this._balanceRow = row;
     if (outIndexComplete) this._noteTrustedRow(row, txs);
     return row;
+  }
+
+  /**
+   * Record this read's bank transfers in the vault's full history and decide whether that history is
+   * complete (see bank-history.mjs). `listing` is minepoa's address page (capped), `txs` the union of it
+   * and the recent-transfer feed. Returns { complete, reason }.
+   */
+  async _syncBankHistory(listing, txs) {
+    const hist = bankHistoryOf(this.state);
+    const before = new Set(Object.keys(hist.txs));
+    const capped = listing.length >= this.addressListCap;
+    const overlap = listing.some((t) => t && t.id && before.has(String(t.id).toLowerCase()));
+    const wasComplete = hist.complete;
+    const merged = mergeBankTxs(hist, txs, this.bankAddress, 'minepoa');
+    let complete = false;
+    let reason = null;
+    let via = null;
+    if (merged.conflicts.length) {
+      reason = `minepoa lists transfer(s) ${merged.conflicts.map((id) => id.slice(0, 16)).join(', ')} with a different amount or direction than the recorded bank history`;
+    } else if (!capped) {
+      complete = true; // fewer than the cap: minepoa's list is the bank's whole history
+      via = 'minepoa-full-list';
+    } else if (hist.complete && overlap) {
+      complete = true; // the newest transfers continue the recorded history with no gap
+      via = hist.completeVia;
+    } else {
+      const r = await this._backfillBankHistory(hist, listing);
+      complete = r.ok;
+      reason = r.reason;
+      via = 'poascan';
+    }
+    let dirty = merged.added > 0 || merged.changed > 0;
+    if (complete && (!hist.complete || hist.completeVia !== via)) {
+      hist.complete = true;
+      hist.completeAt = now();
+      hist.completeVia = via;
+      dirty = true;
+    } else if (!complete && hist.complete) {
+      hist.complete = false;
+      dirty = true;
+    }
+    if (dirty) this._save();
+    if (wasComplete !== complete && this.logger) this.logger(`bank history: ${complete ? `complete (${via}, ${Object.keys(hist.txs).length} txs)` : `NOT complete: ${reason}`}`);
+    this._historyStatus = { complete, reason, via: complete ? via : null, minepoaListed: listing.length, capped, at: now() };
+    return { complete, reason };
+  }
+
+  /**
+   * minepoa's list is at its cap and the recorded history cannot be shown to reach back to the start (e.g. a
+   * fresh vault document): read the bank's full history from POAScan. Only FINAL transfers are taken, by txid
+   * (never counted twice). Any POAScan error (429, 5xx, timeout), a gap or a conflict leaves it incomplete.
+   */
+  async _backfillBankHistory(hist, listing) {
+    const ix = this.indexer;
+    const st = this._historyBackfill;
+    if (!ix || typeof ix.addressTxs !== 'function') {
+      st.reason = `minepoa lists only the bank's newest ${this.addressListCap} transfers and no independent index (POAScan) is configured to read the older ones`;
+      return { ok: false, reason: st.reason };
+    }
+    if (st.at && now() - st.at < this.historyBackfillEveryMs) return { ok: false, reason: st.reason || 'waiting to read the bank history from POAScan again' };
+    st.at = now();
+    const src = ix.name || 'POAScan';
+    let rows;
+    try {
+      rows = await ix.addressTxs(this.bankAddress);
+    } catch (err) {
+      st.reason = `${src} could not supply the bank's full history (${String(err?.message || err).slice(0, 120)}); transfers older than minepoa's newest ${this.addressListCap} cannot be verified`;
+      this._tickErrors.push(`bank history: ${st.reason}`);
+      return { ok: false, reason: st.reason };
+    }
+    const problem = poascanHistoryProblem(rows, listing, this.bankAddress);
+    if (problem) {
+      st.reason = `${src} bank history not usable: ${problem}`;
+      this._tickErrors.push(`bank history: ${st.reason}`);
+      return { ok: false, reason: st.reason };
+    }
+    const finalRows = rows.filter((t) => t && t.final);
+    // Cross-check against the vault's own records of the same txids (its payouts, the bets and deposits it
+    // booked, the outflows it indexed): POAScan must agree on amount and direction, or nothing is taken.
+    const ownMismatch = [];
+    const ownOut = new Map();
+    for (const o of Object.values(this.state.outbound)) {
+      if (o.txid) ownOut.set(o.txid, o.amountPoa);
+      for (const x of o.superseded || []) if (x.txid && x.amountPoa) ownOut.set(x.txid, x.amountPoa);
+    }
+    for (const [id, o] of Object.entries(this.state.ledgerOut || {})) if (!ownOut.has(id)) ownOut.set(id, o.amountPoa);
+    for (const t of finalRows) {
+      let mine = null;
+      let dir = null;
+      if (ownOut.has(t.id)) [mine, dir] = [ownOut.get(t.id), 'out'];
+      else if (this.state.inbound[t.id]) [mine, dir] = [this.state.inbound[t.id].amountPoa, 'in'];
+      if (mine === null || mine === undefined) continue;
+      const theirs = t.to === this.bankAddress ? 'in' : t.from === this.bankAddress ? 'out' : null;
+      let same = theirs === dir;
+      try {
+        same = same && toMicros(mine) === toMicros(t.amount || '0');
+      } catch {
+        same = false;
+      }
+      if (!same) ownMismatch.push(t.id);
+    }
+    if (ownMismatch.length) {
+      st.reason = `${src} and this vault's own records disagree on transfer(s) ${ownMismatch.map((id) => id.slice(0, 16)).join(', ')} (amount or direction)`;
+      this._tickErrors.push(`bank history: ${st.reason}`);
+      return { ok: false, reason: st.reason };
+    }
+    const merged = mergeBankTxs(hist, finalRows, this.bankAddress, 'poascan');
+    if (merged.conflicts.length) {
+      st.reason = `${src} and minepoa disagree on transfer(s) ${merged.conflicts.map((id) => id.slice(0, 16)).join(', ')} (amount or direction)`;
+      this._tickErrors.push(`bank history: ${st.reason}`);
+      return { ok: false, reason: st.reason };
+    }
+    // Index the bank's sent transfers minepoa no longer lists, with POAScan's memo (as the address-page scan does).
+    for (const t of finalRows) {
+      if (t.from !== this.bankAddress || t.to === this.bankAddress || this.state.ledgerOut[t.id] || t.memo === null || t.memo === undefined) continue;
+      const m = /:ord=([0-9a-f]{12})/.exec(String(t.memo));
+      this.state.ledgerOut[t.id] = { ord: m ? m[1] : null, to: t.to, amountPoa: t.amount, memo: String(t.memo).slice(0, 200), final: true, ts: t.ts || null, via: 'poascan' };
+    }
+    st.reason = null;
+    st.okAt = now();
+    st.added = merged.added;
+    if (this.logger) this.logger(`bank history: backfilled ${merged.added} older transfer(s) from ${src} (${rows.length} listed there)`);
+    return { ok: true, reason: null };
+  }
+
+  /** The bank-history record, for /api/health and the chain audit. */
+  bankHistoryView() {
+    const hist = bankHistoryOf(this.state);
+    const st = this._historyStatus;
+    return {
+      complete: Boolean(st ? st.complete : hist.complete),
+      txs: Object.keys(hist.txs).length,
+      via: hist.completeVia || null,
+      completeAt: hist.completeAt ? new Date(hist.completeAt).toISOString() : null,
+      minepoaListed: st?.minepoaListed ?? null,
+      minepoaCap: this.addressListCap,
+      problem: st && !st.complete ? st.reason : null,
+      lastPoascanBackfillAt: this._historyBackfill.okAt ? new Date(this._historyBackfill.okAt).toISOString() : null
+    };
   }
 
   /** The document is the one the last writer published (same savedAt) and that status is recent. */
@@ -1159,7 +1311,9 @@ export class ChainSettlement {
     } catch {
       return null;
     }
-    const row = { address: this.bankAddress, balance: tb.checkpointBalance, checkpoint: tb.checkpoint, txs: [], effectiveMicros: eff, listedIds: new Set(tb.listedOutIds || []), fromTrusted: true, trustedAt: Number(tb.at) };
+    const listedIds = new Set(tb.listedOutIds || []);
+    for (const id of Object.keys(bankHistoryOf(this.state).txs)) listedIds.add(id);
+    const row = { address: this.bankAddress, balance: tb.checkpointBalance, checkpoint: tb.checkpoint, txs: [], effectiveMicros: eff, listedIds, fromTrusted: true, trustedAt: Number(tb.at), historyComplete: true };
     this.lastBankBalance = {
       ...(this.lastBankBalance || {}),
       balance: fromMicros(eff < 0n ? 0n : eff),
@@ -3336,6 +3490,9 @@ export class ChainSettlement {
       if (prevStatus !== status) this._emit('settlement.reconcile', { status, reason });
     };
     if (!row || row.effectiveMicros === null || row.effectiveMicros === undefined) return set('PENDING', 'Waiting for a trustworthy bank balance from minepoa before reopening bets and withdrawals.');
+    if (row.historyComplete === false) {
+      return set('SOLVENCY_HOLD', `The bank's full ledger history could not be verified (${row.historyReason || 'unknown'}), so its balance cannot be trusted; bets and withdrawals are paused until it can.`);
+    }
     if (!this.ledgerIndexComplete) return set('PENDING', 'Still indexing the bank\'s outgoing transfers on minepoa (memos); bets and withdrawals reopen once every outflow is accounted for.');
     try {
       const known = this._knownOutTxids();
@@ -3520,6 +3677,7 @@ export class ChainSettlement {
       leader: this.leaderView(),
       foreignOutflows: fromWriter ? fromWriter.foreignOutflows || [] : this.foreign,
       ledgerIndexComplete: this.ledgerIndexComplete,
+      bankHistory: this.bankHistoryView(),
       reconcile: { status: rec.status ?? null, reason: rec.reason ?? null, at: rec.at ? new Date(rec.at).toISOString() : null, inReview: rec.inReview, audit: rec.audit, ...(fromWriter ? { source: 'writer-status' } : {}) },
       trading: tradingLabel(this.tradingHold()),
       ledger: this.ledgerProbe ? this.ledgerProbe.view() : null,
@@ -3565,9 +3723,11 @@ export class ChainSettlement {
             .map((o) => ({ orderId: o.orderId, kind: o.kind, to: o.to, amountPoa: o.amountPoa, txid: o.txid, nonce: o.nonce ?? null, confirmedVia: o.confirmedVia || null, receipt: o.receipt || null, confirmedAt: o.confirmedAt ? new Date(o.confirmedAt).toISOString() : null, repayable: o.confirmedVia === 'receipt', repayBlocked: o.repayBlocked || null }));
     let rejectedMicros = 0n;
     for (const o of Object.values(this.state.outbound)) if (o.status === 'REJECTED') rejectedMicros += toMicros(o.amountPoa);
+    const historyComplete = row.historyComplete !== false;
     return {
-      ok: delta >= 0n,
+      ok: delta >= 0n && historyComplete,
       bankAddress: this.bankAddress,
+      bankHistory: this.bankHistoryView(),
       onChainBalancePoa: fromMicros(onChain < 0n ? 0n : onChain),
       // the same figures /api/health and /api/settlement report
       ...this._bankBalanceView(row),

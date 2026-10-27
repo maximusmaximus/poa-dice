@@ -527,6 +527,8 @@ test('live case: minepoa explorer busy and its listings omit a payout that lande
     };
     const doc = c.store.load();
     delete doc.ledgerOut[rec.txid];
+    delete doc.bankHistory.txs[rec.txid]; // the vault never recorded it as listed either
+    doc.bankHistory.complete = false;
     doc.savedAt = Date.now();
     c.store.save(doc);
     explorerBusyFor(s, rec.txid);

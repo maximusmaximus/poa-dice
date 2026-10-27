@@ -376,6 +376,8 @@ test('audit lists a CONFIRMED payout that a complete ledger read does not show (
     let audit = await s.auditAgainstChain();
     assert.deepEqual(audit.confirmedNotOnLedger, [], 'listed on the ledger: nothing to report');
     c.mock.hide(rec.txid); // the ledger's history never shows it (live: payout 269433a2, receipt "included")
+    delete s.state.bankHistory.txs[rec.txid]; // ...and the vault never recorded it as listed
+    s.state.bankHistory.complete = false;
     const realRecent = s.client.getRecentTransfers.bind(s.client);
     s.client.getRecentTransfers = async (n) => {
       const m = await realRecent(n);
