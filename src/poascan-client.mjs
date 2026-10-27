@@ -82,13 +82,19 @@ export class PoaScanClient {
   async addressTxs(address, { maxPages = 20 } = {}) {
     const out = [];
     let cursor = null;
+    let coverage = null;
     for (let page = 0; page < maxPages; page++) {
       const q = `limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
       const { status, body } = await this._get(`/api/v1/address/${encodeURIComponent(address)}/txs?${q}`);
       if (status !== 200 || !body || !Array.isArray(body.txs)) throw new PoaScanError(`POAScan history for ${address} unreadable (HTTP ${status})`, { status });
-      for (const t of body.txs) if (t && t.id) out.push({ id: String(t.id).toLowerCase(), from: t.from_addr || null, to: t.to_addr || null, amount: t.amount || null, memo: t.memo ?? null, final: t.final === 1 || t.final === true });
+      for (const t of body.txs) if (t && t.id) out.push({ id: String(t.id).toLowerCase(), type: t.type || 'transfer', from: t.from_addr || null, to: t.to_addr || null, amount: t.amount || null, memo: t.memo ?? null, final: t.final === 1 || t.final === true, ts: t.ts ?? null });
+      if (body.coverage && !coverage) coverage = body.coverage;
       cursor = body.next_cursor || null;
-      if (!cursor) return out;
+      if (!cursor) {
+        // POAScan's own view of how complete its archive is (nonce_gap > 0: it missed some sent txs).
+        Object.defineProperty(out, 'coverage', { value: coverage, enumerable: false });
+        return out;
+      }
     }
     throw new PoaScanError(`POAScan history for ${address} has more than ${maxPages} pages`);
   }

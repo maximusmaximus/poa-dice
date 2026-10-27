@@ -220,6 +220,9 @@ export function createDiceServer(options = {}) {
                     const url = options.poascanUrl ?? signerEnv.POA_DICE_POASCAN_URL ?? (/^https:\/\/(www\.)?minepoa\.com\/?$/.test(String(client.nodeUrl || '')) ? 'https://poascan.io' : '');
                     return url && url !== 'off' ? new PoaScanClient({ baseUrl: url, fetchImpl: options.poascanFetch || globalThis.fetch }) : null;
                   })(),
+            // minepoa lists only an address's newest 100 transfers; older bank history is kept and backfilled.
+            addressListCap: options.addressListCap,
+            historyBackfillEveryMs: options.historyBackfillEveryMs,
             engine,
             watcher,
             client,

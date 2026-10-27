@@ -17,6 +17,8 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
   // answers 404 "not in segments" for that txid.
   const receipts = new Map(); // txid -> rejected receipt
   const hidden = new Set(); // txids the address page does not list yet (read-node lag)
+  let addressCap = 0; // >0: the address page lists only the newest N txs (minepoa.com: 100)
+  let feedCap = 200; // the recent-transfer feed's window
   let readFaults = []; // queue of '503' | 'busy' for GET /api/explorer/tx and /api/receipt
   const bal = new Map(Object.entries(balances).map(([a, v]) => [a, toMicros(v)]));
   // realistic=true mimics minepoa.com read-node v0.2 (observed 2026-10-25):
@@ -137,6 +139,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       const list = [...txs.values()]
         .filter((t) => (t.body.from === a || t.body.to === a) && !hidden.has(t.id))
         .sort((x, y) => y.seq - x.seq)
+        .slice(0, addressCap > 0 ? addressCap : undefined)
         .map((t) => {
           const row = { id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo, ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0 };
           if (realistic) delete row.memo;
@@ -147,7 +150,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     }
     if (p === '/api/explorer/txs') {
       if (!realistic) return json(res, 404, { error: 'mock: not enabled' });
-      const limit = Math.min(200, Number(url.searchParams.get('limit') || 50));
+      const limit = Math.min(feedCap, Number(url.searchParams.get('limit') || 50));
       const type = url.searchParams.get('type');
       const list = [...txs.values()]
         .filter((t) => !type || t.body.type === type)
@@ -195,6 +198,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     },
     tx: (id) => txs.get(id),
     transfersFrom: (a) => [...txs.values()].filter((t) => t.body.from === a && t.body.type === 'transfer'),
+    transfersOf: (a) => [...txs.values()].filter((t) => (t.body.from === a || t.body.to === a) && t.body.type === 'transfer').sort((x, y) => y.seq - x.seq),
     inject: (...f) => faults.push(...f),
     clearFaults: () => faults.splice(0),
     /** A direct ledger transfer (like `poa.mjs send`), bypassing the vault API. */
@@ -208,6 +212,14 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     /** The address page stops listing these txids (read-node lag) until unhideAll(). */
     hide: (...ids) => ids.forEach((id) => hidden.add(id)),
     unhideAll: () => hidden.clear(),
+    /** The address page lists only the newest n transfers (0 = all), like minepoa.com's cap of 100. */
+    setAddressCap: (n) => {
+      addressCap = Number(n) || 0;
+    },
+    /** The recent-transfer feed lists at most n transfers (default 200). */
+    setFeedCap: (n) => {
+      feedCap = Number(n);
+    },
     /** The next GETs of /api/explorer/tx/* and /api/receipt/* fail: '503' or 'busy' (200 with an error). */
     failReads: (...modes) => {
       readFaults = readFaults.concat(modes);
