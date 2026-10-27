@@ -530,6 +530,19 @@ function setStatus(text, st) {
   $('sseStatusBadge').dataset.state = st;
 }
 
+/** "Average play: 52 s (over 18 plays)" from /api/state playTime (server-side timings, all settled plays). */
+export function avgPlayText(pt) {
+  if (!pt || typeof pt.avgPlaySeconds !== 'number' || !Number.isFinite(pt.avgPlaySeconds) || !(pt.plays > 0)) return 'Average play: — (no timed plays yet)';
+  const secs = pt.avgPlaySeconds >= 10 ? Math.round(pt.avgPlaySeconds) : Math.round(pt.avgPlaySeconds * 10) / 10;
+  return `Average play: ${secs} s (over ${pt.plays} ${pt.plays === 1 ? 'play' : 'plays'})`;
+}
+
+function renderAvgPlayTime(pt) {
+  const el = document.getElementById('avgPlayTime');
+  if (!el || pt === undefined) return;
+  el.textContent = avgPlayText(pt);
+}
+
 function applyStateSnapshot(data) {
   state.summary = data;
   const paused = data?.settlement ? data.settlement.trading === 'PAUSED_LEDGER_UNAVAILABLE' : state.ledgerPaused;
@@ -545,6 +558,7 @@ function applyStateSnapshot(data) {
     $('topBankAvail').textContent = `${formatNum(b.availableBankrollPoa, 4)} POA`;
     $('topKellyMax').textContent = `Kelly cap ${formatNum(b.kellyMaxProfitPoa, 2)} POA profit / roll`;
   }
+  renderAvgPlayTime(data.playTime);
   if (data.stats) {
     $('statTotalBets').textContent = String(data.stats.totalBetsCount);
     $('statHouseNet').textContent = `House net ${formatNum(data.stats.netHouseProfitPoa, 4)} POA`;
