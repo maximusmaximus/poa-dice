@@ -80,6 +80,12 @@ function debounce(fn, ms) {
 function wagerValue() {
   return String($('wagerInput').value || '').trim();
 }
+function randomClientSeed() {
+  const bytes = new Uint8Array(6);
+  window.crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, (x) => x.toString(16).padStart(2, '0')).join('');
+  return `poa-seed-${hex}-${Date.now().toString(36)}`;
+}
 function seedValue() {
   return String($('clientSeedInput').value || '').trim();
 }
@@ -1224,9 +1230,11 @@ function bindEvents() {
     setWager(Math.floor(Number(sel?.maxWagerForCountPoa || 1) * 100) / 100);
   });
   $('btnRandomSeed').addEventListener('click', () => {
-    $('clientSeedInput').value = `poa-seed-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    $('clientSeedInput').value = randomClientSeed();
     onRollInput();
   });
+  // Every visitor starts with their own random client seed (never a shared default).
+  if (!String($('clientSeedInput').value || '').trim()) $('clientSeedInput').value = randomClientSeed();
   $('playerAddressInput').addEventListener('input', () => {
     const a = String($('playerAddressInput').value || '').trim();
     state.playerAddress = ADDR_RE.test(a) ? a : '';

@@ -116,7 +116,10 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       assert.ok(await page.isVisible('.site-header #walletVipBadge'));
       const href = await page.getAttribute('.site-footer a#repoLink', 'href');
       assert.equal(href, 'https://github.com/maximusmaximus/poa-dice');
-      assert.match(await page.textContent('.site-footer'), /Built with/);
+      assert.doesNotMatch(await page.textContent('.site-footer'), /Built with/);
+      const seed = await page.inputValue('#clientSeedInput');
+      assert.match(seed, /^poa-seed-[0-9a-f]{12}-[0-9a-z]+$/, 'client seed is randomized at startup');
+      assert.doesNotMatch(await page.content(), /tessellate-agent-seed/);
       if (shotsDir) await page.screenshot({ path: path.join(shotsDir, 'top.png'), clip: { x: 0, y: 0, width: 1400, height: 1000 } });
     });
 

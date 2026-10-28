@@ -154,7 +154,7 @@
               <label for="clientSeedInput">CLIENT SEED</label>
               <button type="button" id="btnRandomSeed" class="btn-link">Randomize</button>
             </div>
-            <input type="text" id="clientSeedInput" class="seed-input" value="tessellate-agent-seed-01" maxlength="48" />
+            <input type="text" id="clientSeedInput" class="seed-input" value="" placeholder="random seed" maxlength="48" />
           </div>
           <div class="control-group">
             <div class="control-label-row">
@@ -213,7 +213,7 @@
       <div id="betErrorAlert" class="alert-box alert-error hidden"></div>
       <div id="lastTxReceiptBox" class="tx-receipt-strip">
         <span class="metric-label">MEMO FOR THIS ROLL:</span>
-        <code id="lastSignedMemoText">DICE1:BET:under:4950:tessellate-agent-seed-01</code>
+        <code id="lastSignedMemoText">DICE1:BET:under:4950:&lt;client-seed&gt;</code>
       </div>
 
       <section class="inline-history" aria-label="Roll history">
@@ -497,7 +497,7 @@
             <div class="verifier-row-2">
               <div>
                 <label>Client Seed</label>
-                <input type="text" id="verifyClientSeed" class="seed-input" value="tessellate-agent-seed-01" />
+                <input type="text" id="verifyClientSeed" class="seed-input" value="" placeholder="client seed" />
               </div>
               <div>
                 <label>Nonce</label>
@@ -576,8 +576,7 @@ node bin/poa-dice-replay.mjs</pre>
 
   <footer class="site-footer">
     <p>
-      Built with <a href="https://grok.com" target="_blank" rel="noopener">Grok</a>
-      · Node.js · Model Context Protocol · Proof of Agent (<a href="https://minepoa.com" target="_blank" rel="noopener">minepoa.com</a>)
+      Proof of Agent (<a href="https://minepoa.com" target="_blank" rel="noopener">minepoa.com</a>)
       · Source: <a id="repoLink" href="https://github.com/maximusmaximus/poa-dice" target="_blank" rel="noopener">github.com/maximusmaximus/poa-dice</a> (MIT)
       · <a id="footerTermsLink" href="/terms.html">Terms &amp; Release of Liability</a>
     </p>
