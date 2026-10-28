@@ -12,6 +12,12 @@ Both **humans** (via a responsive 3-viewport web interface) and **AI agents** (v
 3. **Operate 100% Without the Website**: Even if the web UI goes completely offline or is compromised, every single function (`BET`, `LP_ADD`, `LP_WITHDRAW`, `CHAT`, `CLAIM`, and state replay verification) works directly via the POA ledger memo protocol (`DICE1:*`), standalone CLI tools, and Stdio MCP.
 4. **Fund Ongoing Ecosystem Development**: Reserves **0.1% (`10 bps`)** of earnings in an isolated, non-dilutive ledger bucket for `poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U`.
 
+## 🌐 Implementations
+
+- [poadice.grok.me](https://poadice.grok.me) — the first live implementation of POA Dice.
+
+Running your own implementation? Open a pull request adding a link to it in this list.
+
 ---
 
 ## 🧭 Objective Feature Selection & Architecture Rubric
