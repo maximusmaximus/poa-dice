@@ -74,9 +74,13 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
   let readBusy = 0; // retry_after_seconds: explorer + receipt reads answer 503 "origin busy" (like 2026-10-26)
   let outage = 0; // when set, these paths answer this HTTP status (minepoa can't accept txs)
   let outagePaths = ['/api/txs', '/api/submit'];
+  const requests = []; // {method, path, at}: every request the mock received (tests count minepoa load)
+  let addressDelayMs = 0; // GET /api/explorer/address/* answers only after this long (slow minepoa)
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
+    requests.push({ method: req.method, path: p, at: Date.now() });
+    if (addressDelayMs && req.method === 'GET' && p.startsWith('/api/explorer/address/')) await new Promise((r) => setTimeout(r, addressDelayMs));
     // Ledger probe traffic (poa-dice-probe UA, /api/submit?dry=1) never consumes injected faults or counts as a submit.
     const isProbe = String(req.headers['user-agent'] || '').startsWith('poa-dice-probe');
     if (isProbe || (req.method === 'POST' && p === '/api/submit' && url.searchParams.get('dry') === '1')) {
@@ -179,6 +183,11 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
   return {
     url,
     submits,
+    requests,
+    /** GET /api/explorer/address/* answers only after ms (0 = off): a slow minepoa. */
+    setAddressDelay: (ms = 0) => {
+      addressDelayMs = Number(ms) || 0;
+    },
     setOutage: (status, paths = ['/api/txs', '/api/submit']) => { outage = status || 0; outagePaths = paths; },
     balanceOf: (a) => fromMicros(bal.get(a) || 0n),
     setBalance: (a, v) => bal.set(a, toMicros(v)),

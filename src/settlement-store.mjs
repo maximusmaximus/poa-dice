@@ -31,6 +31,8 @@
  *   peek(key): the claimed value or null (never creates),
  *   lease(name, holder, ttlMs): {held, holder, token, expiresAt} - one holder at a time; the fencing
  *     token increases every time the lease changes hands,
+ *   renewLease(name, holder, token, ttlMs): extends the lease only while it is still held by that holder
+ *     with that token (never takes a free or expired lease: a heartbeat must not re-acquire),
  *   releaseLease(name, holder).
  * Postgres additionally fences document writes: once setFence({name, holder, token}) is called, a save
  * only lands while that lease is still held with that token. Redis has no lease support, so a vault on
@@ -100,6 +102,9 @@ export function createFileStore(dir, name = 'settlement.json') {
     lease(name, holder, ttlMs) {
       return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => leaseBook(book, holder, ttlMs, Date.now()));
     },
+    renewLease(name, holder, token, ttlMs) {
+      return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => leaseRenewBook(book, holder, token, ttlMs, Date.now()));
+    },
     releaseLease(name, holder) {
       return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => {
         if (book.holder === holder) book.expiresAt = 0;
@@ -131,6 +136,18 @@ export function leaseBook(book, holder, ttlMs, nowMs) {
   }
   book.expiresAt = nowMs + ttlMs;
   return { held: true, holder, token: book.token, expiresAt: book.expiresAt };
+}
+
+/**
+ * Heartbeat renewal for the memory and file stores: extends the lease only while `holder` still holds it
+ * with `token`. A free, expired or re-issued lease is left alone (held: false), so a heartbeat can never
+ * take a lease the instance had already lost.
+ */
+export function leaseRenewBook(book, holder, token, ttlMs, nowMs) {
+  const live = book.holder && Number(book.expiresAt || 0) > nowMs;
+  if (!live || book.holder !== holder || Number(book.token || 0) !== Number(token)) return { held: false, holder: live ? book.holder : null, token: Number(book.token || 0), expiresAt: Number(book.expiresAt || 0) };
+  book.expiresAt = nowMs + ttlMs;
+  return { held: true, holder, token: Number(book.token), expiresAt: book.expiresAt };
 }
 
 /** Read-modify-write a JSON book under an O_EXCL lock file (single host, many processes). */
@@ -236,6 +253,13 @@ export function createMemoryStore(initial = null, { claims = createClaimTable() 
       const book = claims.has(k) ? JSON.parse(claims.get(k)) : {};
       const out = leaseBook(book, holder, ttlMs, Date.now());
       claims.set(k, JSON.stringify(book));
+      return out;
+    },
+    renewLease(name, holder, token, ttlMs) {
+      const k = `__lease__:${name}`;
+      const book = claims.has(k) ? JSON.parse(claims.get(k)) : {};
+      const out = leaseRenewBook(book, holder, token, ttlMs, Date.now());
+      if (out.held) claims.set(k, JSON.stringify(book));
       return out;
     },
     releaseLease(name, holder) {
@@ -510,6 +534,21 @@ export function createPostgresStore({ connectionString, key, query = null }) {
          WHERE poa_dice_leases.holder = EXCLUDED.holder OR poa_dice_leases.expires_at <= now()
          RETURNING holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
         [lk, holder, String(ttlMs)]
+      );
+      if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: Number(r.rows[0].expires_ms) };
+      const cur = await q("SELECT holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
+      const row = cur.rows[0] || {};
+      return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: Number(row.expires_ms || 0) };
+    },
+    /** Heartbeat: extend the lease only while this holder still holds it with this token (never re-takes it). */
+    async renewLease(name, holder, token, ttlMs) {
+      await init();
+      const lk = `${key}:${name}`;
+      const r = await q(
+        `UPDATE poa_dice_leases SET expires_at = now() + ($4 || ' milliseconds')::interval
+         WHERE key = $1 AND holder = $2 AND token = $3 AND expires_at > now()
+         RETURNING holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
+        [lk, holder, String(token), String(ttlMs)]
       );
       if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: Number(r.rows[0].expires_ms) };
       const cur = await q("SELECT holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);

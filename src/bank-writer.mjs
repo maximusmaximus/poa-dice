@@ -19,6 +19,13 @@
  *      (ChainSettlement checks this). A copy of the database (for example a branch made for a preview)
  *      misses the outflows made after the copy and stays read-only (STALE_STORE).
  *   6. Not a Vercel preview/development deployment (VERCEL_ENV other than "production" is always read-only).
+ *
+ * Heartbeat: while a settlement pass runs, or while the writer waits on minepoa to take over, a timer renews
+ * the lease every heartbeatMs on its own, so a slow or busy minepoa call cannot let the lease lapse and hand
+ * it to another instance (on 2026-10-28 the lease bounced between two instances for 45+ minutes, tokens
+ * 30655 -> 31341, while minepoa answered "busy"). The heartbeat only extends a lease this instance still holds
+ * with the same token (store.renewLease); it never takes a free or expired one. It stops renewing when the
+ * settlement loop has not checked in for heartbeatStallMs (a wedged pass must not hold the lease forever).
  */
 import crypto from 'node:crypto';
 
@@ -37,7 +44,7 @@ export const WRITER_REASONS = {
 };
 
 export class BankWriter {
-  constructor({ store, bankAddress, enabled = false, expectedStoreId = null, leaseMs = 30000, holderId = null, now = () => Date.now(), deploymentEnv = null } = {}) {
+  constructor({ store, bankAddress, enabled = false, expectedStoreId = null, leaseMs = 30000, holderId = null, now = () => Date.now(), deploymentEnv = null, heartbeatMs = null, heartbeatStallMs = null } = {}) {
     this.store = store;
     this.bankAddress = bankAddress;
     this.enabled = Boolean(enabled);
@@ -52,6 +59,14 @@ export class BankWriter {
     this.lease = null; // {held, holder, token, expiresAt}
     this.tokenAtTickStart = null;
     this.lastError = null;
+    // Lease heartbeat (see the header). 0 turns it off.
+    this.heartbeatMs = heartbeatMs === null || heartbeatMs === undefined ? Math.max(100, Math.floor(leaseMs / 3)) : Math.max(0, Number(heartbeatMs) || 0);
+    this.heartbeatStallMs = heartbeatStallMs === null || heartbeatStallMs === undefined ? Math.max(3 * 60 * 1000, 6 * leaseMs) : Number(heartbeatStallMs);
+    this.onBeat = null; // called after every successful renewal (ChainSettlement publishes its waiting status)
+    this._hbTimer = null;
+    this._hbBusy = false;
+    this._touchedAt = 0;
+    this.heartbeat = { running: false, beats: 0, lastBeatAt: null, lastError: null, stalled: false, lostAt: null };
     // Until this instance proves it is the writer, nothing it saves may land (Postgres fencing).
     if (typeof this.store?.setFence === 'function') this.store.setFence({ name: WRITER_LEASE, holder: this.holderId, token: -1 });
   }
@@ -85,8 +100,76 @@ export class BankWriter {
 
   _set(status) {
     this.status = status;
-    if (status !== 'LEADER' && typeof this.store?.setFence === 'function') this.store.setFence({ name: WRITER_LEASE, holder: this.holderId, token: -1 }); // nothing lands
+    if (status !== 'LEADER') {
+      if (typeof this.store?.setFence === 'function') this.store.setFence({ name: WRITER_LEASE, holder: this.holderId, token: -1 }); // nothing lands
+      this.stopHeartbeat();
+    }
     return status === 'LEADER';
+  }
+
+  supportsHeartbeat() {
+    return this.heartbeatMs > 0 && typeof this.store?.renewLease === 'function';
+  }
+
+  /** The settlement loop is alive (a pass started, or a wait was re-checked). Keeps the heartbeat renewing. */
+  touch() {
+    this._touchedAt = this.now();
+    this.heartbeat.stalled = false;
+  }
+
+  /** Start renewing the lease on a timer (no-op unless this instance is the LEADER and the store supports it). */
+  startHeartbeat() {
+    if (this._hbTimer || !this.supportsHeartbeat() || this.status !== 'LEADER' || !this.lease?.held) return false;
+    if (!this._touchedAt) this.touch();
+    this._hbTimer = setInterval(() => {
+      this._beat().catch(() => {});
+    }, this.heartbeatMs);
+    if (this._hbTimer.unref) this._hbTimer.unref();
+    this.heartbeat.running = true;
+    return true;
+  }
+
+  stopHeartbeat() {
+    if (this._hbTimer) clearInterval(this._hbTimer);
+    this._hbTimer = null;
+    if (this.heartbeat) this.heartbeat.running = false;
+  }
+
+  /** One renewal. Same holder + same token only; anything else means the lease is gone: read-only at once. */
+  async _beat() {
+    if (this._hbBusy) return;
+    if (this.status !== 'LEADER' || !this.lease?.held) return this.stopHeartbeat();
+    if (this.now() - this._touchedAt > this.heartbeatStallMs) {
+      this.heartbeat.stalled = true; // let the lease lapse: the settlement loop has stopped checking in
+      return;
+    }
+    const token = this.lease.token;
+    this._hbBusy = true;
+    try {
+      const r = await this.store.renewLease(WRITER_LEASE, this.holderId, token, this.leaseMs);
+      if (this.status !== 'LEADER' || !this.lease || this.lease.token !== token) return; // refresh()/release() moved on meanwhile
+      if (r && r.held && r.token === token) {
+        this.lease = r;
+        this.heartbeat.beats += 1;
+        this.heartbeat.lastBeatAt = this.now();
+        this.heartbeat.lastError = null;
+        if (typeof this.onBeat === 'function') {
+          try {
+            this.onBeat();
+          } catch {
+            // the callback's own errors never stop the heartbeat
+          }
+        }
+      } else {
+        this.heartbeat.lostAt = this.now();
+        this.lease = r || null;
+        this._set('STANDBY');
+      }
+    } catch (err) {
+      this.heartbeat.lastError = String(err?.message || err); // the lease simply runs out if the store stays down
+    } finally {
+      this._hbBusy = false;
+    }
   }
 
   /** True while the lease is held and not about to expire. */
@@ -142,6 +225,7 @@ export class BankWriter {
       binding: this.binding ? { bankAddress: this.binding.bankAddress, storeId: this.binding.storeId, boundAt: this.binding.boundAt, via: this.binding.via, recovery: Boolean(this.binding.recovery) } : null,
       lease: this.lease ? { held: this.lease.held, token: this.lease.token, expiresAt: this.lease.expiresAt ? new Date(this.lease.expiresAt).toISOString() : null, holderIsMe: this.lease.holder === this.holderId } : null,
       blocked: this.blocked,
+      heartbeat: { running: this.heartbeat.running, everyMs: this.heartbeatMs, beats: this.heartbeat.beats, lastBeatAt: this.heartbeat.lastBeatAt ? new Date(this.heartbeat.lastBeatAt).toISOString() : null, stalled: this.heartbeat.stalled, lastError: this.heartbeat.lastError },
       lastError: this.lastError
     };
   }

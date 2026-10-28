@@ -187,6 +187,9 @@ export function createDiceServer(options = {}) {
             enabled: options.bankSigner !== undefined ? Boolean(options.bankSigner) : signerEnv.POA_DICE_BANK_SIGNER === '1',
             expectedStoreId: options.storeId || signerEnv.POA_DICE_STORE_ID || null,
             leaseMs: options.writerLeaseMs ?? 30000,
+            // Renews the lease on a timer during a pass and while waiting on minepoa to take over (see bank-writer.mjs).
+            heartbeatMs: options.writerHeartbeatMs ?? (Number(signerEnv.POA_DICE_WRITER_HEARTBEAT_MS) || null),
+            heartbeatStallMs: options.writerHeartbeatStallMs ?? null,
             deploymentEnv: signerEnv.VERCEL_ENV || null
           });
           const bindTarget = options.bindStore !== undefined ? (options.bindStore ? key.wallet.address : null) : signerEnv.POA_DICE_BIND_STORE || null;
@@ -223,6 +226,9 @@ export function createDiceServer(options = {}) {
             // minepoa lists only an address's newest 100 transfers; older bank history is kept and backfilled.
             addressListCap: options.addressListCap,
             historyBackfillEveryMs: options.historyBackfillEveryMs,
+            // Writer takeover while minepoa is busy: retry with jittered exponential backoff, never before retry_after.
+            takeoverBackoffBaseMs: options.takeoverBackoffBaseMs ?? 2000,
+            takeoverBackoffMaxMs: options.takeoverBackoffMaxMs ?? 2 * 60 * 1000,
             engine,
             watcher,
             client,
