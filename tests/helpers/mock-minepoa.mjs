@@ -70,6 +70,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
 
   let readBusyReceipts = true; // false: only the explorer is busy, receipts still answer (seen live)
   const receiptOverrides = new Map(); // txid -> receipt body to serve instead
+  let busyUnknown = 0; // retry_after_seconds: explorer answers 503 "origin busy" for UNKNOWN txids only (live 2026-10-27)
   let readBusy = 0; // retry_after_seconds: explorer + receipt reads answer 503 "origin busy" (like 2026-10-26)
   let outage = 0; // when set, these paths answer this HTTP status (minepoa can't accept txs)
   let outagePaths = ['/api/txs', '/api/submit'];
@@ -131,6 +132,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     }
     if ((m = p.match(/^\/api\/explorer\/tx\/(.+)$/))) {
       const t = txs.get(m[1]);
+      if (!t && busyUnknown) return json(res, 503, { error: 'origin busy — served capacity is reserved for mining/grading right now; retry shortly', retry_after_seconds: busyUnknown });
       if (!t) return json(res, 404, { error: asyncReject ? 'not in segments' : 'not found' });
       return json(res, 200, { id: t.id, type: t.body.type, from_addr: t.body.from, to_addr: t.body.to, amount: t.body.amount, memo: t.body.memo, ts: t.body.ts, atts: t.atts, final: t.final ? 1 : 0, body: t.body });
     }
@@ -163,7 +165,7 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
       if (receiptOverrides.has(m[1])) return json(res, 200, receiptOverrides.get(m[1]));
       if (receipts.has(m[1]) && !txs.has(m[1])) return json(res, 200, receipts.get(m[1]));
       const t = txs.get(m[1]);
-      if (!t) return json(res, 404, { error: 'not found' });
+      if (!t) return json(res, 404, { error: 'unknown txid — not seen by this node (queue receipts, origin txs, and covered history all resolve here)' });
       return json(res, 200, { txid: t.id, status: 'included', from: t.body.from, next_nonce: (nonces.get(t.body.from) || 0) + 1 });
     }
     if (p === '/api/txs') {
@@ -228,6 +230,10 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     setReadBusy: (seconds = 60, { receipts = true } = {}) => {
       readBusy = seconds || 0;
       readBusyReceipts = receipts;
+    },
+    /** GET /api/explorer/tx/<unknown txid> answers 503 "origin busy" with this retry_after (0 = off); known txids answer normally. */
+    setBusyForUnknownTx: (seconds = 60) => {
+      busyUnknown = seconds || 0;
     },
     /** Serve this body for GET /api/receipt/<txid> (null = back to normal). */
     setReceipt: (txid, body) => {

@@ -93,6 +93,7 @@ export class MinepoaClient {
 
   _noteBusy(scope, retryAfterMs) {
     const ms = Math.min(this.busyMaxMs, Math.max(1000, retryAfterMs));
+    for (const k of Object.keys(this._busyUntil)) if (k.startsWith('tx:') && this._busyUntil[k] <= Date.now()) delete this._busyUntil[k];
     this._busyUntil[scope] = Math.max(this._busyUntil[scope] || 0, Date.now() + ms);
     this.stats.busy += 1;
     return ms;
@@ -120,9 +121,9 @@ export class MinepoaClient {
     return 'read';
   }
 
-  async _get(path) {
+  async _get(path, { scope: scopeOverride = null } = {}) {
     let lastErr = null;
-    const scope = MinepoaClient.busyScope(path);
+    const scope = scopeOverride || MinepoaClient.busyScope(path);
     this._failFast(scope, path.split('?')[0]);
     for (let attempt = 1; attempt <= this.retries; attempt++) {
       const t0 = Date.now();
@@ -219,9 +220,15 @@ export class MinepoaClient {
     return String(tx.memo || '');
   }
 
-  /** null when the node has never seen the tx. */
-  async getTx(txid) {
-    const j = await this._get(`/api/explorer/tx/${encodeURIComponent(txid)}`);
+  /**
+   * null when the node has never seen the tx.
+   * opts.isolateBusy: a busy answer for THIS txid opens a busy window for this txid only, not for every
+   * explorer read. minepoa has answered 503 "origin busy" for unknown txids while it still answered real
+   * ones normally (2026-10-27), so one unknown tx must not make every other lookup fail fast.
+   */
+  async getTx(txid, { isolateBusy = false } = {}) {
+    const path = `/api/explorer/tx/${encodeURIComponent(txid)}`;
+    const j = await this._get(path, isolateBusy ? { scope: `tx:${txid}` } : {});
     if (!j) return null;
     if (!j.id) {
       // Only an explicit "unknown / not found" means never seen. A read node that is re-deriving
@@ -249,6 +256,43 @@ export class MinepoaClient {
 
   getReceipt(txid) {
     return this._get(`/api/receipt/${encodeURIComponent(txid)}`);
+  }
+
+  /**
+   * What minepoa's receipt endpoint says about a txid, keeping the 404 body (getReceipt maps every 404
+   * to null). Used when the explorer cannot answer for one tx.
+   *   {state:'unknown'}             definite 404 "unknown txid" (not seen by this node)
+   *   {state:'rejected', receipt}   the node refused it (never on the ledger)
+   *   {state:'known', receipt}      queued / included / final: the node has it
+   *   {state:'unavailable', error}  busy, timeout, or any other answer: no verdict
+   */
+  async receiptLookup(txid) {
+    const path = `/api/receipt/${encodeURIComponent(txid)}`;
+    try {
+      this._failFast('receipt', '/api/receipt');
+    } catch (err) {
+      return { state: 'unavailable', error: err.message };
+    }
+    let resp;
+    this.stats.calls += 1;
+    try {
+      resp = await this.fetch(`${this.nodeUrl}${path}`, { headers: { Accept: 'application/json', 'User-Agent': 'poa-dice-settlement/1.1' }, signal: AbortSignal.timeout(this.timeoutMs) });
+    } catch (err) {
+      return { state: 'unavailable', error: `minepoa /api/receipt -> ${err?.message || err}` };
+    }
+    const j = await resp.json().catch(() => null);
+    const errText = String(j?.error || '');
+    if (resp.status === 404) {
+      if (j && /unknown txid|not seen by|^not found$/i.test(errText)) return { state: 'unknown' };
+      return { state: 'unavailable', error: `minepoa /api/receipt -> HTTP 404${errText ? `: ${errText.slice(0, 80)}` : ''}` };
+    }
+    if (resp.ok && j && !j.error && (!j.txid || j.txid === txid) && j.status) {
+      return /^(rejected|invalid|failed)$/i.test(String(j.status)) ? { state: 'rejected', receipt: j } : { state: 'known', receipt: j };
+    }
+    if (resp.ok && j && j.error && /rejected|invalid/i.test(String(j.status || ''))) return { state: 'rejected', receipt: j };
+    const ra = Number(j?.retry_after_seconds || resp.headers?.get?.('retry-after') || 0) * 1000 || 0;
+    if ((resp.status === 429 || resp.status >= 500 || (resp.ok && j?.error)) && ra > IN_CALL_RETRY_AFTER_MS) this._noteBusy('receipt', ra);
+    return { state: 'unavailable', error: `minepoa /api/receipt -> HTTP ${resp.status}${errText ? `: ${errText.slice(0, 80)}` : ''}` };
   }
 
   /** Two most recent valid txids, oldest first (what poa.mjs buildTx uses as parents). */

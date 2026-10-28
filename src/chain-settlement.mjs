@@ -334,9 +334,16 @@ export class ChainSettlement {
       this.engine.restoreState(doc.engine);
       this.engine.bankAddress = this.bankAddress;
     }
-    // A crash mid-broadcast leaves SUBMITTING: treat as broadcast; it is booked if the ledger has it,
-    // and expires (releasing its reservation) if it never shows up.
-    for (const rec of Object.values(this.state.inbound)) if (rec.status === 'SUBMITTING') rec.status = 'BROADCAST';
+    // A crash mid-broadcast (or a write-ahead copy of a submit that was then refused) leaves SUBMITTING:
+    // treat it as broadcast. It is booked if the ledger has it, and expires after inboundExpireMs
+    // (releasing its reservation) once minepoa says the txid is unknown, even while the explorer answers
+    // "busy" for it (receipt fallback in _confirmInbound). It never holds up the other open bets.
+    for (const rec of Object.values(this.state.inbound)) {
+      if (rec.status !== 'SUBMITTING') continue;
+      rec.status = 'BROADCAST';
+      rec.recoveredFrom = 'SUBMITTING';
+      if (!Number.isFinite(Number(rec.submittedAt))) rec.submittedAt = now();
+    }
     // Rebuild the pending-bet reservations from the stored open bets (never added on top of what this
     // process already held: that double count drove the stored lock to -4.55 POA on 2026-10-26).
     this._rebuildReservations();
@@ -534,6 +541,7 @@ export class ChainSettlement {
     } catch (err) {
       delete this.state.inbound[txid];
       this._releaseCoverage(rec);
+      await this._forgetUnsent(txid);
       throw Object.assign(new Error(`Vault store unavailable; not broadcast: ${err.message}`), { status: 503, txid });
     }
 
@@ -564,6 +572,26 @@ export class ChainSettlement {
     this._emit('settlement.updated', this._inboundView(rec));
     this.kick();
     return this._inboundView(rec);
+  }
+
+  /**
+   * A submit was refused before broadcast (its write-ahead did not land): make sure no copy of its record
+   * can reach the store later. The failed snapshot that carried it stays queued for retry in the persist
+   * queue, and another save on this instance during the failed write may have carried it too. Write the
+   * document again without it when this instance may write; otherwise drop the queued snapshot (a
+   * non-writer's snapshot never lands, and the next writer starts from the stored document).
+   * On 2026-10-27 a refused bet (daba9f3f, "vault write fenced off") was found in the store as BROADCAST
+   * and held up every later bet. Should a copy still be stored, it expires (see _applyDoc, _confirmInbound).
+   */
+  async _forgetUnsent(txid) {
+    let saved = false;
+    try {
+      saved = this._save(); // queues the document without the record (replaces the failed snapshot)
+      if (saved) await this.flush();
+    } catch (err) {
+      if (this.logger) this.logger(`refused submit ${String(txid).slice(0, 16)}: re-save without it failed: ${err.message}`);
+    }
+    if (!saved) this._persist.dropPending?.();
   }
 
   _releaseReserve(rec) {
@@ -747,17 +775,30 @@ export class ChainSettlement {
   }
 
   async _confirmInbound() {
+    // Oldest first. A lookup that fails for ONE tx (minepoa busy for that txid, or an error body) skips
+    // that tx and carries on: on 2026-10-27 minepoa answered 503 "origin busy" for a never-broadcast bet
+    // (daba9f3f) while it answered real txs normally, and stopping the loop there left every later bet,
+    // including a ledger-final one (c9b155eb), unbooked. Only a node-wide outage stops the pass.
+    const blockedFrom = new Set(); // senders with an older tx we could not read: keep their txs in order
     for (const rec of Object.values(this.state.inbound).sort((a, b) => a.seq - b.seq)) {
       if (!OPEN_IN.has(rec.status) || rec.status === 'SUBMITTING') continue;
+      if (blockedFrom.has(rec.from)) continue;
       let tx;
       try {
-        tx = await this.client.getTx(rec.txid);
+        tx = await this.client.getTx(rec.txid, { isolateBusy: true });
       } catch (err) {
         this._tickErrors.push(err.message);
-        return; // node unreachable: try next tick
+        if (this._ledgerDown(err)) return; // node unreachable: try next tick
+        const verdict = await this._inboundFallback(rec);
+        if (verdict === 'not_found') tx = null;
+        else {
+          blockedFrom.add(rec.from);
+          continue; // no answer for this tx: try it next tick, keep going with the rest
+        }
       }
       if (!tx) {
         if (now() - rec.submittedAt > this.inboundExpireMs) {
+          if (!(await this._safeToExpire(rec))) continue;
           rec.status = 'EXPIRED';
           rec.error = 'Not seen on the minepoa ledger in time; nothing was booked';
           this._releaseReserve(rec);
@@ -785,6 +826,55 @@ export class ChainSettlement {
       const booked = await this._book(rec, tx);
       if (booked === false) return; // store unreachable: retry next tick, in order
     }
+  }
+
+  /**
+   * A tx lookup failure that means minepoa as a whole is down (the ledger probe holds, or the request
+   * never got an HTTP answer: network error / timeout). A busy or error answer about one txid is not.
+   */
+  _ledgerDown(err) {
+    if (this.ledgerProbe?.hold?.()) return true;
+    if (err && (err.busy || err.name === 'BusyError')) return false;
+    const msg = String(err?.message || err || '');
+    if (/cannot answer for|-> HTTP \d{3}/.test(msg)) return false;
+    return true;
+  }
+
+  /**
+   * The explorer could not answer for this inbound tx: ask minepoa's receipt endpoint instead.
+   * 'not_found' only for a definite 404 "unknown txid" (or a rejected receipt: never on the ledger);
+   * 'known' when the node has it (wait for the explorer to give its body and finality); else 'unknown'.
+   */
+  async _inboundFallback(rec) {
+    if (typeof this.client.receiptLookup !== 'function') return 'unknown';
+    const r = await this.client.receiptLookup(rec.txid).catch((err) => ({ state: 'unavailable', error: err.message }));
+    if (r.state === 'unknown' || r.state === 'rejected') return 'not_found';
+    if (r.state === 'known') return 'known';
+    // Busy / slow answers are reported with the pass; anything else only logged (a hard tick error would
+    // mark the pass not good, and standbys stop taking bets without a recent good pass).
+    if (r.error && isLedgerBusy(r.error)) this._tickErrors.push(r.error);
+    else if (r.error && this.logger) this.logger(`inbound ${String(rec.txid).slice(0, 16)}: receipt gave no verdict: ${r.error}`);
+    return 'unknown';
+  }
+
+  /**
+   * Last check before an inbound tx is expired: never expire one an independent index (POAScan) has.
+   * minepoa's own "not found" / "unknown txid" already got us here. An index that cannot answer does not
+   * block (minepoa's definite answer stands); one that lists the tx does.
+   */
+  async _safeToExpire(rec) {
+    const ix = this.indexer;
+    if (!ix || typeof ix.lookupTx !== 'function') return true;
+    try {
+      const look = await ix.lookupTx(rec.txid);
+      if (look && look.found) {
+        if (this.logger) this.logger(`inbound ${String(rec.txid).slice(0, 16)}: minepoa does not know it but ${ix.name || 'POAScan'} does; not expired`);
+        return false;
+      }
+    } catch {
+      // no definite answer from the index: minepoa's definite not-found stands
+    }
+    return true;
   }
 
   /** Make every instance use the same committed seed pair for the active epoch. */
