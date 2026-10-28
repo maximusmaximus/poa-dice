@@ -79,6 +79,7 @@ export const LEADER_STATUS_KEY = 'leader-status';
 export const NO_ACTIVE_LEADER = 'NO_ACTIVE_LEADER';
 const STANDBY_STATUS_REFRESH_MS = 2000;
 const REPLICA_RELOAD_MS = 30000;
+export const WRITER_LEASE_RENEWING_REASON = 'The bank writer lease is being renewed or handed over between server instances. Try again in a few seconds.';
 
 export function tradingLabel(hold) {
   if (!hold) return 'OPEN';
@@ -478,8 +479,8 @@ export class ChainSettlement {
       if (!this.writer.canWrite()) {
         if (this.writer.status === 'STANDBY') return this._submitAsStandby({ body, txid, parsed, reserve, groupId, coverage });
         if (!known) {
-          const h = this.writer.hold();
-          throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY', txid });
+          const h = this._writerRefusal();
+          throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY', retryable: true, txid });
         }
       }
     }
@@ -2129,7 +2130,7 @@ export class ChainSettlement {
     await this.tick();
     const writer = this.writer.canWrite();
     if (!writer) {
-      if (this.writer.status !== 'STANDBY') throw new Error(this.writer.hold()?.reason || 'read-only');
+      if (this.writer.status !== 'STANDBY') throw Object.assign(new Error(this._writerRefusal().reason), { status: 503, code: 'SIGNER_READ_ONLY', retryable: true });
       await this._readShared();
       if (!this._sharedFresh()) throw new Error(this._standbyHold().reason);
     }
@@ -3370,6 +3371,15 @@ export class ChainSettlement {
     const wh = this.writer.hold();
     if (wh) return wh;
     return this._leaderHold();
+  }
+
+  /**
+   * Why this instance cannot write right now. writer.hold() is null while the status is LEADER, but
+   * canWrite() is also false in the lease's last seconds or while it is being renewed / handed over
+   * between server instances, so fall back to a clear, temporary reason instead of dereferencing null.
+   */
+  _writerRefusal() {
+    return this.writer.hold() || { status: 'SIGNER_READ_ONLY', reason: WRITER_LEASE_RENEWING_REASON, writer: 'LEASE_RENEWING' };
   }
 
   /** Standby: the writer's published hold, or NO_ACTIVE_LEADER when its status is missing or stale. */

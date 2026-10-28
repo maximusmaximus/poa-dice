@@ -937,7 +937,7 @@ export function createDiceServer(options = {}) {
         try {
           return sendJson(res, 200, { ok: true, ...(await settlement.ackForeignOutflows({ txids: Array.isArray(body.txids) ? body.txids : [], mode: body.mode, note: typeof body.note === 'string' ? body.note : null })) });
         } catch (err) {
-          return sendJson(res, 409, { ok: false, error: redactSecrets(err.message) });
+          return sendJson(res, err.status || 409, { ok: false, error: redactSecrets(err.message) });
         }
       }
 
