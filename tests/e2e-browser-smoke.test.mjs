@@ -10,7 +10,8 @@
  * copy-prompt buttons for every action with exact args, enabled/disabled edge cases
  * (bank 0, bank cannot cover the count, chain down, bad input), server-side rejection
  * of oversize batches (MCP + HTTP), concurrent reservations, MCP bank tools, live page
- * updates without reload (SSE) with measured latency, and the polling fallback.
+ * updates without reload (SSE) with measured latency, the polling fallback, the standalone
+ * Latest rolls module and the site-wide notice row under the header (CHAIN DOWN).
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -155,6 +156,43 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       assert.equal(await page.getAttribute('#brandLogo', 'aria-hidden'), 'true');
     });
 
+    await t.test('latest rolls is its own module; site-wide notices sit in one full row right under the header', async () => {
+      const layout = await page.evaluate(() => {
+        const rolls = document.getElementById('rollsPanel');
+        const list = document.getElementById('inlineRollHistory');
+        const header = document.querySelector('.site-header');
+        const notices = document.getElementById('siteNotices');
+        const cs = getComputedStyle(list);
+        return {
+          rollsTag: rolls?.tagName,
+          rollsIsPanel: rolls?.classList.contains('panel'),
+          rollsParentIsGrid: rolls?.parentElement?.classList.contains('workspace-grid'),
+          rollsInsidePlay: Boolean(rolls?.closest('.panel-dice')),
+          listInRolls: rolls?.contains(list),
+          countInRolls: rolls?.contains(document.getElementById('inlineHistoryCount')),
+          listMaxHeight: cs.maxHeight,
+          listOverflowY: cs.overflowY,
+          afterHeader: header?.nextElementSibling?.id,
+          noticeIds: [...(notices?.children || [])].map((e) => e.id),
+          noticesWidth: notices?.getBoundingClientRect().width,
+          gridWidth: document.querySelector('.workspace-grid').getBoundingClientRect().width,
+        };
+      });
+      assert.equal(layout.rollsTag, 'SECTION');
+      assert.equal(layout.rollsIsPanel, true, 'latest rolls is a panel of its own');
+      assert.equal(layout.rollsParentIsGrid, true, 'latest rolls is a top-level module in the grid');
+      assert.equal(layout.rollsInsidePlay, false, 'latest rolls is not nested in the roll builder');
+      assert.equal(layout.listInRolls, true);
+      assert.equal(layout.countInRolls, true);
+      assert.notEqual(layout.listMaxHeight, 'none', 'latest rolls list has a bounded height');
+      assert.match(layout.listOverflowY, /auto|scroll/, 'latest rolls list scrolls inside its module');
+      assert.match(await page.textContent('#rollsPanel .panel-title'), /Latest rolls/);
+      assert.equal(layout.afterHeader, 'siteNotices', 'notice row comes directly after the header');
+      for (const id of ['chainDownNotice', 'ledgerPausedBanner', 'legalNotice']) assert.ok(layout.noticeIds.includes(id), `#${id} lives in the notice row`);
+      assert.ok(layout.noticesWidth >= layout.gridWidth - 1, 'notice row spans the full page width');
+      assert.equal(await page.isVisible('#chainDownNotice'), false, 'no CHAIN DOWN notice while the chain is up');
+    });
+
     await t.test('/api/wallet/dev and /api/wallet/generate are not publicly served; the browser never sends privkeys', async () => {
       for (const [method, p] of [['GET', '/api/wallet/dev'], ['POST', '/api/wallet/dev'], ['POST', '/api/wallet/generate']]) {
         const r = await fetch(srv.url + p, { method });
@@ -234,9 +272,24 @@ test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', 
       await setInput(page, '#wagerInput', '1.000000');
       await page.waitForFunction(() => /CHAIN DOWN/.test(document.getElementById('promptBlockReason').textContent));
       assert.ok(await page.$eval('#btnSubmitDeposit', (b) => b.disabled), 'stake is off while chain is down');
+      // The CHAIN DOWN message shows once, site-wide, in the notice row directly under the header
+      await page.waitForSelector('#siteNotices > #chainDownNotice:not(.hidden)', { timeout: 5000 });
+      assert.equal(await page.textContent('#chainDownText'), 'minepoa.com chain is unavailable (CHAIN DOWN), so rolls are paused');
+      const pos = await page.evaluate(() => {
+        const n = document.getElementById('chainDownNotice').getBoundingClientRect();
+        const h = document.querySelector('.site-header').getBoundingClientRect();
+        const s = document.querySelector('.stat-strip').getBoundingClientRect();
+        const g = document.querySelector('.workspace-grid').getBoundingClientRect();
+        return { top: n.top, headerBottom: h.bottom, stripTop: s.top, gridTop: g.top, width: n.width, gridWidth: g.width };
+      });
+      assert.ok(pos.top >= pos.headerBottom - 1 && pos.top < pos.stripTop && pos.top < pos.gridTop, `notice sits under the header, above every module: ${JSON.stringify(pos)}`);
+      assert.ok(pos.width >= pos.gridWidth - 32 - 1, 'notice is a full-width row');
+      assert.match(await page.textContent('#promptBlockReason'), /notice at the top/);
+      if (shotsDir) await page.screenshot({ path: path.join(shotsDir, 'chain-down-notice.png'), fullPage: false });
       down = false;
       await setInput(page, '#wagerInput', '1.000000');
       await page.waitForFunction(() => !document.getElementById('btnCopyPrompt').disabled);
+      await page.waitForSelector('#chainDownNotice.hidden', { state: 'attached', timeout: 5000 });
     });
 
     await t.test('MCP initialize names the browser prompts as the entry point and lists the new tools', async () => {

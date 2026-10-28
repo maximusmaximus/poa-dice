@@ -20,6 +20,9 @@ const AMOUNT_RE = /^\d+(?:\.\d{1,6})?$/;
 const ADDR_RE = /^poa1[1-9A-HJ-NP-Za-km-z]{30,60}$/;
 const POLL_MS = 4000;
 export const LEDGER_PAUSED_TEXT = "Betting is paused: the PoA ledger isn't accepting transactions right now. It resumes automatically.";
+// Site-wide conditions are explained once in the notice row under the header; the buttons point there.
+export const LEDGER_PAUSED_INLINE_TEXT = 'Betting is paused while the PoA ledger is unavailable. See the notice at the top of the page.';
+export const CHAIN_DOWN_INLINE_TEXT = 'Paused while minepoa.com is unavailable (CHAIN DOWN). See the notice at the top of the page.';
 const POLL_MS_DISCONNECTED = 2000;
 
 const state = {
@@ -30,6 +33,8 @@ const state = {
   playerAddress: '',
   summary: null,
   ledgerPaused: false,
+  chainDownRolls: null, // reason text from a batch quote with code chain_down, or null
+  chainDownActions: null, // same, from the action quotes (stake / withdraw / claim / auto-bet)
   lastBetQuote: null,
   batchQuotes: null,
   actionQuotes: null,
@@ -354,9 +359,20 @@ function setReason(id, text) {
   }
 }
 
+/** Site-wide notice row under the header: CHAIN DOWN shows there whenever a quote reports chain_down. */
+function renderSiteNotices() {
+  const text = state.chainDownRolls || state.chainDownActions;
+  const el = document.getElementById('chainDownNotice');
+  if (!el) return;
+  if (text) $('chainDownText').textContent = text;
+  el.classList.toggle('hidden', !text);
+}
+
 function renderRollAvailability() {
   const local = localRollProblem();
   const quotes = state.batchQuotes;
+  if (quotes) state.chainDownRolls = quotes.find((x) => x && x.code === 'chain_down')?.reason || null;
+  renderSiteNotices();
   document.querySelectorAll('[data-roll-count]').forEach((btn) => {
     const n = Number(btn.getAttribute('data-roll-count'));
     const q = quotes?.find((x) => x.count === n);
@@ -370,10 +386,10 @@ function renderRollAvailability() {
   $('batchTotalWager').textContent = sel ? `${formatNum(sel.totalWagerPoa, 2)} POA` : '—';
   $('batchExposure').textContent = sel ? `${formatNum(sel.maxBankExposurePoa, 2)} POA` : '—';
   $('batchBankAvail').textContent = sel ? `${formatNum(sel.availableBankrollPoa, 2)} POA` : '—';
-  let reason = state.ledgerPaused ? LEDGER_PAUSED_TEXT : local;
+  let reason = state.ledgerPaused ? LEDGER_PAUSED_INLINE_TEXT : local;
   if (!reason && !quotes) reason = 'Waiting for the bank quote…';
-  if (!reason && sel && !sel.valid) reason = sel.reason;
-  if (!reason && quotes && !quotes.some((q) => q.valid)) reason = quotes[0]?.reason;
+  if (!reason && sel && !sel.valid) reason = sel.code === 'chain_down' ? CHAIN_DOWN_INLINE_TEXT : sel.reason;
+  if (!reason && quotes && !quotes.some((q) => q.valid)) reason = quotes[0]?.code === 'chain_down' ? CHAIN_DOWN_INLINE_TEXT : quotes[0]?.reason;
   const btn = $('btnCopyPrompt');
   btn.disabled = Boolean(reason);
   setReason('promptBlockReason', reason);
@@ -414,13 +430,15 @@ const ACTIONS = [
 
 function renderActionAvailability() {
   const q = state.actionQuotes;
+  if (q) state.chainDownActions = ACTIONS.map((a) => q[a.kind]).find((x) => x && x.code === 'chain_down')?.reason || null;
+  renderSiteNotices();
   for (const a of ACTIONS) {
     const aq = q?.[a.kind];
     let reason = null;
-    if (state.ledgerPaused) reason = LEDGER_PAUSED_TEXT;
+    if (state.ledgerPaused) reason = LEDGER_PAUSED_INLINE_TEXT;
     else if (!q) reason = 'Checking availability…';
     else if (q.addressError) reason = q.addressError;
-    else if (!aq?.valid) reason = aq?.reason || 'Unavailable';
+    else if (!aq?.valid) reason = aq?.code === 'chain_down' ? CHAIN_DOWN_INLINE_TEXT : aq?.reason || 'Unavailable';
     if (a.kind === 'autoBet' && !reason) {
       const local = localRollProblem();
       if (local) reason = local;
