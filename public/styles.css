@@ -1771,3 +1771,125 @@ body.modal-open { overflow: hidden; }
     right: 6px;
   }
 }
+
+/* ---------- Site-wide notices: one full-width row right under the header ---------- */
+.site-notices {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+.site-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: none;
+  margin: 10px 0 0;
+  padding: 11px 18px;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+.site-notice-icon { font-size: 1.1rem; flex: 0 0 auto; }
+.site-notice-danger {
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.12);
+  color: #fecaca;
+}
+.site-notices .ledger-banner { justify-content: flex-start; text-align: left; margin: 10px 0 0; max-width: none; }
+.site-notices .legal-strip {
+  justify-content: space-between;
+  border: 1px solid rgba(245, 158, 11, 0.38);
+  font-weight: 400;
+  padding: 10px 16px;
+}
+.site-notice.hidden { display: none; }
+
+/* ---------- Module layout ----------
+   Desktop (>1280px): Play (2 cols) | Latest rolls over Feed; then Bank (2 cols) | MCP
+   Laptop / small desktop (821–1280px): Play full width; Latest rolls | Feed; Bank; MCP
+   Tablet and phone (<=820px): one column in page order: Play, Latest rolls, Feed, Bank, MCP */
+.workspace-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.95fr);
+  grid-template-areas:
+    'play play rolls'
+    'play play feed'
+    'bank bank mcp';
+  padding-top: 12px;
+}
+.panel-dice { grid-area: play; }
+.panel-rolls { grid-area: rolls; }
+.panel-feed { grid-area: feed; }
+.panel-bank { grid-area: bank; }
+.panel-mcp { grid-area: mcp; }
+.panel-mcp .mcp-grid { grid-template-columns: minmax(0, 1fr); }
+
+/* Play module: two inner columns so the roll stage, target, wager, count and Copy prompt fit on one screen */
+.play-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0 18px;
+  align-items: start;
+}
+.play-col { display: flex; flex-direction: column; min-width: 0; }
+.play-col > .builder-step:first-child, .play-col > .roll-stage:first-child { margin-top: 0; }
+.play-col-b .tx-receipt-strip { margin-top: 12px; }
+.panel-dice .prompt-preview { max-height: 150px; }
+
+/* Latest rolls module: bounded height, scrolls inside, never stretches other modules */
+.panel-rolls { gap: 10px; }
+.panel-rolls .inline-history-head .panel-title { margin: 0; }
+.panel-rolls .inline-history-list {
+  max-height: 340px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+.panel-rolls .roll-card { padding: 6px 10px; }
+.panel-rolls .roll-card-num { font-size: 1.2rem; }
+
+@media (max-width: 1280px) {
+  .workspace-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      'play play'
+      'rolls feed'
+      'bank bank'
+      'mcp mcp';
+  }
+  .panel-rolls .inline-history-list { max-height: 420px; }
+  .panel-mcp .mcp-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .stat-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .stat-value { font-size: 17px; }
+}
+@media (max-width: 1000px) {
+  .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 820px) {
+  .workspace-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: 'play' 'rolls' 'feed' 'bank' 'mcp';
+  }
+  .site-notices { padding-left: 10px; padding-right: 10px; }
+  .site-notices .legal-strip { flex-direction: column; align-items: stretch; }
+  .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 12px 10px 4px; }
+  .panel-rolls .inline-history-list { max-height: 300px; }
+  .panel-mcp .mcp-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 700px) {
+  .play-cols { grid-template-columns: minmax(0, 1fr); }
+  .play-col-b > .builder-step:first-child { margin-top: 16px; }
+}
+@media (max-width: 480px) {
+  .stat-card { padding: 10px 12px; }
+  .stat-label { font-size: 10px; letter-spacing: 0.05em; }
+  .stat-value { font-size: 14px; }
+  .stat-sub { font-size: 11px; }
+  .site-notice { padding: 10px 12px; font-size: 0.84rem; }
+  .site-notices .ledger-banner { margin: 10px 0 0; }
+}

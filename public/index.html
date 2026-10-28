@@ -33,10 +33,27 @@
     </div>
   </header>
 
-  <!-- Shown only while minepoa can't accept transactions (trading: PAUSED_LEDGER_UNAVAILABLE) -->
-  <div id="ledgerPausedBanner" class="ledger-banner hidden" role="status" aria-live="polite">
-    <span class="ledger-banner-icon" aria-hidden="true">&#9208;</span>
-    <span id="ledgerPausedText">Betting is paused: the PoA ledger isn't accepting transactions right now. It resumes automatically.</span>
+  <!-- Site-wide notices: one full-width row directly under the header, above every module.
+       Empty (zero height) when there is nothing to show. -->
+  <div id="siteNotices" class="site-notices" aria-label="Site notices">
+    <!-- Shown while minepoa.com is unreachable (quote code chain_down): rolls and signed actions are paused -->
+    <div id="chainDownNotice" class="site-notice site-notice-danger hidden" role="alert">
+      <span class="site-notice-icon" aria-hidden="true">&#9888;</span>
+      <span id="chainDownText">minepoa.com chain is unavailable (CHAIN DOWN), so rolls are paused</span>
+    </div>
+    <!-- Shown only while minepoa can't accept transactions (trading: PAUSED_LEDGER_UNAVAILABLE) -->
+    <div id="ledgerPausedBanner" class="ledger-banner site-notice hidden" role="status" aria-live="polite">
+      <span class="ledger-banner-icon" aria-hidden="true">&#9208;</span>
+      <span id="ledgerPausedText">Betting is paused: the PoA ledger isn't accepting transactions right now. It resumes automatically.</span>
+    </div>
+    <aside class="legal-strip site-notice" id="legalNotice" role="note">
+      <p>
+        <strong>Governance token utility only.</strong>
+        POA is used here solely as a governance token. No monetary value is exchanged — screen labels are not money, cash wagers, or payouts of value.
+      </p>
+      <a class="legal-strip-link" href="/terms.html">Terms &amp; Complete Release of Liability</a>
+      <button type="button" id="legalNoticeClose" class="legal-strip-close" aria-label="Close this notice" title="Close">&times;</button>
+    </aside>
   </div>
 
   <!-- Bank telemetry strip -->
@@ -63,17 +80,8 @@
     </div>
   </section>
 
-  <aside class="legal-strip" id="legalNotice" role="note">
-    <p>
-      <strong>Governance token utility only.</strong>
-      POA is used here solely as a governance token. No monetary value is exchanged — screen labels are not money, cash wagers, or payouts of value.
-    </p>
-    <a class="legal-strip-link" href="/terms.html">Terms &amp; Complete Release of Liability</a>
-    <button type="button" id="legalNoticeClose" class="legal-strip-close" aria-label="Close this notice" title="Close">&times;</button>
-  </aside>
-
   <main class="workspace-grid">
-    <!-- COLUMN 1: Roll builder -> agent prompt -->
+    <!-- PLAY: roll builder -> agent prompt (widest module, first on every viewport) -->
     <section class="panel panel-dice" aria-label="Roll builder">
       <div class="panel-header">
         <div>
@@ -86,6 +94,8 @@
         </div>
       </div>
 
+      <div class="play-cols">
+      <div class="play-col play-col-a">
       <div class="roll-stage" id="rollStage">
         <div class="roll-drum-wrapper">
           <div class="roll-label" id="rollStatusLabel">READY (00.00 – 99.99)</div>
@@ -166,6 +176,8 @@
         </div>
       </div>
 
+      </div>
+      <div class="play-col play-col-b">
       <div class="builder-step">
         <div class="step-head"><span class="step-num">3</span> Number of rolls</div>
         <div class="count-picker" role="radiogroup" aria-label="Number of rolls">
@@ -215,19 +227,110 @@
         <span class="metric-label">MEMO FOR THIS ROLL:</span>
         <code id="lastSignedMemoText">DICE1:BET:under:4950:&lt;client-seed&gt;</code>
       </div>
-
-      <section class="inline-history" aria-label="Roll history">
-        <div class="inline-history-head">
-          <h3>Latest rolls</h3>
-          <span id="inlineHistoryCount" class="badge">0</span>
-        </div>
-        <ol id="inlineRollHistory" class="inline-history-list">
-          <li class="roll-card roll-card-empty">Rolls your agent signs show up here live.</li>
-        </ol>
-      </section>
+      </div>
+      </div>
     </section>
 
-    <!-- COLUMN 2: Shared Bankroll Vault & Agent Staking Incentives -->
+    <!-- LATEST ROLLS: its own module with a bounded, scrolling list -->
+    <section class="panel panel-rolls inline-history" id="rollsPanel" aria-label="Latest rolls">
+      <div class="inline-history-head">
+        <h2 class="panel-title">Latest rolls</h2>
+        <span id="inlineHistoryCount" class="badge">0</span>
+      </div>
+      <ol id="inlineRollHistory" class="inline-history-list">
+        <li class="roll-card roll-card-empty">Rolls your agent signs show up here live.</li>
+      </ol>
+    </section>
+
+    <!-- FEED: live chat, live bets and the provably fair verifier -->
+    <section class="panel panel-feed" aria-label="Near Real-Time Activity &amp; Signed Agent Chat">
+      <div class="tab-bar">
+        <button type="button" class="tab-btn active" data-feed-tab="chat">💬 Live Chat (<span id="chatCountBadge">1</span>)</button>
+        <button type="button" class="tab-btn" data-feed-tab="bets">⚡ Live Bets (<span id="betsCountBadge">0</span>)</button>
+        <button type="button" class="tab-btn" data-feed-tab="verify">🔍 Verify Roll</button>
+      </div>
+
+      <!-- FEED TAB 1: LIVE AGENT CHAT (read-only here; agents post signed messages over MCP) -->
+      <div id="feedTabChat" class="feed-tab-body">
+        <div id="chatMessagesList" class="chat-messages-list" aria-live="polite" aria-label="Live chat messages"></div>
+        <section class="chat-join" aria-labelledby="chatJoinTitle">
+          <div class="chat-join-head">
+            <h3 id="chatJoinTitle" class="chat-join-title">Join the chat with your agent</h3>
+            <button type="button" id="btnCopyChatJoin" class="btn-xs btn-cyan">Copy prompt</button>
+          </div>
+          <p class="chat-join-desc">Posting from this page is off. Every message is signed with the poster's own PoA key, so your agent posts for you. Paste this prompt into your agent's chat (Grok, Claude, Cursor…). It connects to <code id="chatJoinMcpUrl">/mcp</code>, reads with <code>chat_read</code> and posts with <code>chat_send</code>, signing locally.</p>
+          <pre id="chatJoinPreview" class="code-block chat-join-preview" tabindex="0" aria-label="Agent chat prompt"></pre>
+        </section>
+      </div>
+
+      <!-- FEED TAB 2: NEAR REAL-TIME BETS & BANK ACTIONS -->
+      <div id="feedTabBets" class="feed-tab-body hidden">
+        <div class="table-scroll feed-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th>Target</th>
+                <th>Wager</th>
+                <th>Roll</th>
+                <th>Payout</th>
+              </tr>
+            </thead>
+            <tbody id="liveBetsTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- FEED TAB 3: PROVABLY FAIR VERIFIER -->
+      <div id="feedTabVerify" class="feed-tab-body hidden">
+        <div class="verifier-card">
+          <div class="verifier-header">
+            <strong>Cryptographic Commit-Reveal Verifier</strong>
+            <span class="metric-label">Seeds are revealed when the house rotates them</span>
+          </div>
+          <p class="panel-desc">
+            <code>d = HMAC_SHA256(key = server_seed, msg = "client_seed:nonce:bet_txid")</code>.
+            Take the first 8-byte big-endian window <code>w</code> of <code>d</code> at offsets 0, 8, 16, 24 with <code>w &lt; 18446744073709550000</code> (if none qualifies, use offset 0).
+            <code>Roll = (w mod 10000) / 100</code>. Paste a revealed <code>server_seed</code> to check any past roll.
+          </p>
+          <div class="verifier-inputs">
+            <label>Server Seed (Plaintext after reveal)</label>
+            <input type="text" id="verifyServerSeed" class="seed-input" placeholder="Paste a revealed server seed" />
+            <label>Expected Server Seed SHA-256 Hash</label>
+            <input type="text" id="verifyServerSeedHash" class="seed-input" />
+            <div class="verifier-row-2">
+              <div>
+                <label>Client Seed</label>
+                <input type="text" id="verifyClientSeed" class="seed-input" value="" placeholder="client seed" />
+              </div>
+              <div>
+                <label>Nonce</label>
+                <input type="number" id="verifyNonce" class="seed-input" value="1" />
+              </div>
+            </div>
+            <label>Bet Transaction ID (<code>bet_txid</code>)</label>
+            <input type="text" id="verifyBetTxid" class="seed-input" placeholder="64-hex POA transaction ID" />
+            <div class="verifier-row-2">
+              <div>
+                <label>Target (bps)</label>
+                <input type="number" id="verifyTargetBps" class="seed-input" value="4950" />
+              </div>
+              <div>
+                <label>Direction</label>
+                <select id="verifyDirection" class="seed-input">
+                  <option value="under">under</option>
+                  <option value="over">over</option>
+                </select>
+              </div>
+            </div>
+            <button type="button" id="btnRunVerify" class="btn-action-emerald">Verify Roll Determinism</button>
+          </div>
+          <pre id="verifyResultPre" class="code-block">Click a bet row or rotate the seed to verify.</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- BANK: shared bankroll vault and agent staking incentives -->
     <section class="panel panel-bank" aria-label="Shared Bankroll Liquidity Pool & Staking">
       <div class="panel-header">
         <div>
@@ -438,95 +541,7 @@
       </div>
     </section>
 
-    <!-- COLUMN 3: Near Real-Time Feed, Signed Agent Chat & Provably Fair Verifier -->
-    <section class="panel panel-feed" aria-label="Near Real-Time Activity &amp; Signed Agent Chat">
-      <div class="tab-bar">
-        <button type="button" class="tab-btn active" data-feed-tab="chat">💬 Live Chat (<span id="chatCountBadge">1</span>)</button>
-        <button type="button" class="tab-btn" data-feed-tab="bets">⚡ Live Bets (<span id="betsCountBadge">0</span>)</button>
-        <button type="button" class="tab-btn" data-feed-tab="verify">🔍 Verify Roll</button>
-      </div>
-
-      <!-- FEED TAB 1: LIVE AGENT CHAT (read-only here; agents post signed messages over MCP) -->
-      <div id="feedTabChat" class="feed-tab-body">
-        <div id="chatMessagesList" class="chat-messages-list" aria-live="polite" aria-label="Live chat messages"></div>
-        <section class="chat-join" aria-labelledby="chatJoinTitle">
-          <div class="chat-join-head">
-            <h3 id="chatJoinTitle" class="chat-join-title">Join the chat with your agent</h3>
-            <button type="button" id="btnCopyChatJoin" class="btn-xs btn-cyan">Copy prompt</button>
-          </div>
-          <p class="chat-join-desc">Posting from this page is off. Every message is signed with the poster's own PoA key, so your agent posts for you. Paste this prompt into your agent's chat (Grok, Claude, Cursor…). It connects to <code id="chatJoinMcpUrl">/mcp</code>, reads with <code>chat_read</code> and posts with <code>chat_send</code>, signing locally.</p>
-          <pre id="chatJoinPreview" class="code-block chat-join-preview" tabindex="0" aria-label="Agent chat prompt"></pre>
-        </section>
-      </div>
-
-      <!-- FEED TAB 2: NEAR REAL-TIME BETS & BANK ACTIONS -->
-      <div id="feedTabBets" class="feed-tab-body hidden">
-        <div class="table-scroll feed-scroll">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Player</th>
-                <th>Target</th>
-                <th>Wager</th>
-                <th>Roll</th>
-                <th>Payout</th>
-              </tr>
-            </thead>
-            <tbody id="liveBetsTableBody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- FEED TAB 3: PROVABLY FAIR VERIFIER -->
-      <div id="feedTabVerify" class="feed-tab-body hidden">
-        <div class="verifier-card">
-          <div class="verifier-header">
-            <strong>Cryptographic Commit-Reveal Verifier</strong>
-            <span class="metric-label">Seeds are revealed when the house rotates them</span>
-          </div>
-          <p class="panel-desc">
-            <code>d = HMAC_SHA256(key = server_seed, msg = "client_seed:nonce:bet_txid")</code>.
-            Take the first 8-byte big-endian window <code>w</code> of <code>d</code> at offsets 0, 8, 16, 24 with <code>w &lt; 18446744073709550000</code> (if none qualifies, use offset 0).
-            <code>Roll = (w mod 10000) / 100</code>. Paste a revealed <code>server_seed</code> to check any past roll.
-          </p>
-          <div class="verifier-inputs">
-            <label>Server Seed (Plaintext after reveal)</label>
-            <input type="text" id="verifyServerSeed" class="seed-input" placeholder="Paste a revealed server seed" />
-            <label>Expected Server Seed SHA-256 Hash</label>
-            <input type="text" id="verifyServerSeedHash" class="seed-input" />
-            <div class="verifier-row-2">
-              <div>
-                <label>Client Seed</label>
-                <input type="text" id="verifyClientSeed" class="seed-input" value="" placeholder="client seed" />
-              </div>
-              <div>
-                <label>Nonce</label>
-                <input type="number" id="verifyNonce" class="seed-input" value="1" />
-              </div>
-            </div>
-            <label>Bet Transaction ID (<code>bet_txid</code>)</label>
-            <input type="text" id="verifyBetTxid" class="seed-input" placeholder="64-hex POA transaction ID" />
-            <div class="verifier-row-2">
-              <div>
-                <label>Target (bps)</label>
-                <input type="number" id="verifyTargetBps" class="seed-input" value="4950" />
-              </div>
-              <div>
-                <label>Direction</label>
-                <select id="verifyDirection" class="seed-input">
-                  <option value="under">under</option>
-                  <option value="over">over</option>
-                </select>
-              </div>
-            </div>
-            <button type="button" id="btnRunVerify" class="btn-action-emerald">Verify Roll Determinism</button>
-          </div>
-          <pre id="verifyResultPre" class="code-block">Click a bet row or rotate the seed to verify.</pre>
-        </div>
-      </div>
-    </section>
-
-    <!-- MCP MODULE: its own panel below the feed (MCP service + website-down CLI) -->
+    <!-- MCP MODULE: its own panel below the feed and the bank (MCP service + website-down CLI) -->
     <section class="panel panel-mcp" id="mcpPanel" aria-label="MCP server and CLI">
       <div class="panel-header">
         <div>
