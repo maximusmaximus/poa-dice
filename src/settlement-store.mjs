@@ -488,7 +488,7 @@ export function createPostgresStore({ connectionString, key, query = null }) {
         'INSERT INTO poa_dice_docs (key, doc, updated_at) SELECT $1, $2::jsonb, now() WHERE EXISTS (SELECT 1 FROM poa_dice_leases WHERE key = $3 AND holder = $4 AND token = $5 AND expires_at > now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now() RETURNING key',
         [key, JSON.stringify(doc), `${key}:${fence.name}`, fence.holder, String(fence.token)]
       );
-      if (!r.rows || !r.rows.length) throw new Error('vault write fenced off: this instance no longer holds the bank writer lease');
+      if (!r.rows || !r.rows.length) throw Object.assign(new Error('vault write fenced off: this instance no longer holds the bank writer lease'), { fenced: true });
     },
     async peek(claimKey) {
       await init();
@@ -612,6 +612,11 @@ export function resolveStore({ env = process.env, dataDir, dataDirIsPersistent =
   return null;
 }
 
+/** A store write refused because this instance no longer holds the bank writer lease. */
+export function isFencedError(err) {
+  return Boolean(err && (err.fenced === true || /fenced off/i.test(String(err.message || ''))));
+}
+
 /**
  * Ordered write-behind queue in front of a (possibly async) store.
  * save() snapshots the doc immediately (so later mutations cannot leak into an earlier write);
@@ -650,9 +655,21 @@ export class PersistQueue {
         this._error = null;
       } catch (err) {
         this._error = err;
-        if (this._pending === null) this._pending = next; // retried by the next save()/flush()
+        // Retried by the next save()/flush(), except a write fenced off because this instance lost the
+        // writer lease: that snapshot must never land later under a new lease (the next writer starts
+        // from the stored document). On 2026-10-27 such a snapshot carried the write-ahead record of a
+        // bet that was then refused as "not broadcast" (daba9f3f), and it ended up in the store.
+        if (this._pending === null && !isFencedError(err)) this._pending = next;
       }
     });
+  }
+
+  /**
+   * Forget a snapshot that failed to write and is waiting for its retry. Only for a caller that knows the
+   * snapshot must not land (e.g. it carries a record of a submit that was then refused).
+   */
+  dropPending() {
+    this._pending = null;
   }
 
   /** Atomic insert-if-absent across instances (see adapter docs). Always returns a promise. */
