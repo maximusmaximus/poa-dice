@@ -79,6 +79,8 @@ export const LEADER_STATUS_KEY = 'leader-status';
 export const NO_ACTIVE_LEADER = 'NO_ACTIVE_LEADER';
 const STANDBY_STATUS_REFRESH_MS = 2000;
 const REPLICA_RELOAD_MS = 30000;
+/** Hold `writer` tag while the lease holder waits on minepoa to finish taking over (trading RECONCILING). */
+export const LEADER_WAITING = 'LEADER_WAITING_ON_MINEPOA';
 export const WRITER_LEASE_RENEWING_REASON = 'The bank writer lease is being renewed or handed over between server instances. Try again in a few seconds.';
 
 export function tradingLabel(hold) {
@@ -139,6 +141,9 @@ export class ChainSettlement {
     indexer = null,
     addressListCap = MINEPOA_ADDRESS_CAP,
     historyBackfillEveryMs = 2 * 60 * 1000,
+    takeoverBackoffBaseMs = 2000,
+    takeoverBackoffMaxMs = 2 * 60 * 1000,
+    random = Math.random,
     logger = null
   }) {
     if (!bankWallet || !bankWallet.address) throw new Error('ChainSettlement needs the bank wallet');
@@ -187,6 +192,16 @@ export class ChainSettlement {
     // While the explorer is busy, the last complete bank read (plus our own in-flight txs) stands in for it.
     this.trustedBalanceMaxAgeMs = trustedBalanceMaxAgeMs;
     this._lastPass = null; // {holder, token, savedAt, at}: the last pass THIS instance completed as writer
+    // Writer takeover while minepoa is busy or slow: the writer KEEPS the lease (heartbeat in bank-writer.mjs),
+    // publishes "leader active, waiting on minepoa", and retries the takeover check with jittered exponential
+    // backoff that never comes back before minepoa's retry_after. Trading stays held until a pass completes.
+    this.takeoverBackoffBaseMs = takeoverBackoffBaseMs;
+    this.takeoverBackoffMaxMs = takeoverBackoffMaxMs;
+    this._random = random;
+    this._takeoverWait = null; // {since, attempts, nextAt, retryAfterMs, lastError}
+    this._waitBase = null; // the last real writer status when the wait began (its pass times are kept, never refreshed)
+    this._takeoverErr = null;
+    this.writer.onBeat = () => this._onWriterBeat();
     this._observePromise = null;
     this.passes = { started: 0, completed: 0, lastStartedAt: null, lastCompletedAt: null, lastMs: null };
     this.shared = null; // last leader status read from (or written to) the store
@@ -387,6 +402,7 @@ export class ChainSettlement {
 
   /** Queue the vault document for writing. Returns false (and writes nothing) when this instance may not write. */
   _save() {
+    if (this._noSave) return false;
     if (!this._loaded) return false; // never overwrite stored state with a pre-load blank
     if (!this.writer.canWrite()) return false; // read-only instances never write the shared vault document
     this.state.engine = this.engine.serializeState();
@@ -489,6 +505,15 @@ export class ChainSettlement {
           const h = this._writerRefusal();
           throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: 'SIGNER_READ_ONLY', retryable: true, txid });
         }
+      }
+    }
+    // Holding the lease but still waiting on minepoa to finish taking over: these books are not checked
+    // against the ledger yet, so nothing new is taken in (retryable; the player's tx is not broadcast).
+    if (this._waitingOnTakeover() && !this.state.inbound[txid] && !this.engine.processedTxids.has(txid)) {
+      await this.tick().catch(() => {});
+      if (this._waitingOnTakeover()) {
+        const h = this._waitingHold();
+        throw Object.assign(new Error(`${h.reason} Not broadcast; nothing was booked.`), { status: 503, code: h.status, retryable: true, txid });
       }
     }
     // Ledger can't accept transactions: refuse every NEW broadcast (bets, stakes, withdrawals, chat) up front.
@@ -656,7 +681,7 @@ export class ChainSettlement {
     if (now() - this._sharedReadAt > STANDBY_STATUS_REFRESH_MS) await this._readShared();
     if (!this._sharedFresh()) {
       const h = this._standbyHold();
-      throw refuse(`${h.reason} Not broadcast; nothing was booked.`, 503, NO_ACTIVE_LEADER);
+      throw refuse(`${h.reason} Not broadcast; nothing was booked.`, 503, h?.status || NO_ACTIVE_LEADER);
     }
     if (this.ledgerProbe) {
       await this.ledgerProbe.maybeProbe().catch(() => {});
@@ -1376,7 +1401,10 @@ export class ChainSettlement {
     if (!doc) return false;
     const st = await this._readShared();
     if (!st || st.docSavedAt === undefined || st.docSavedAt === null) return false;
-    return st.docSavedAt === this._loadedSavedAt && now() - Number(st.at || 0) <= this.trustedBalanceMaxAgeMs;
+    // A "waiting on minepoa" status is republished by a writer that has NOT checked the document against the
+    // ledger yet: only the time of the last real pass (verifiedAt) counts here, never the waiting heartbeat.
+    const verified = Number(st.verifiedAt ?? (st.waiting ? 0 : st.at) ?? 0);
+    return st.docSavedAt === this._loadedSavedAt && verified > 0 && now() - verified <= this.trustedBalanceMaxAgeMs;
   }
 
   /** Remember the last complete bank read (in the vault document, so every instance has it). */
@@ -1921,6 +1949,8 @@ export class ChainSettlement {
       token: this.writer.lease?.token ?? null,
       leaseExpiresAt: Number(this.writer.lease?.expiresAt || 0),
       at: now(),
+      verifiedAt: now(),
+      waiting: null,
       trading: tradingLabel(hold),
       hold: hold ? { status: hold.status, reason: hold.reason } : null,
       reconcile: { status: r.status || null, reason: r.reason || null, at: r.at || null, inReview: r.inReview || [], audit: r.audit || null },
@@ -1979,14 +2009,22 @@ export class ChainSettlement {
   leaderView() {
     const s = this.shared;
     const self = this.writer.canWrite();
+    const waitingHere = self && this._waitingOnTakeover();
+    const waitingThere = !self && this._sharedWaitingLive();
+    const active = self || this._sharedFresh() || waitingThere;
+    const w = waitingHere ? this._takeoverWait : waitingThere ? s.waiting : null;
     return {
-      active: self || this._sharedFresh(),
+      active,
+      // ACTIVE: a recent pass; WAITING_ON_MINEPOA: a live writer holds the lease but minepoa has not let it
+      // finish its first pass yet (trading held); NONE: no live writer (NO_ACTIVE_LEADER).
+      state: waitingHere || waitingThere ? 'WAITING_ON_MINEPOA' : active ? 'ACTIVE' : 'NONE',
+      waiting: w ? { on: 'minepoa', since: w.since ? new Date(Number(w.since)).toISOString() : null, attempts: w.attempts ?? null, retryAt: (w.nextAt ?? w.retryAt) ? new Date(Number(w.nextAt ?? w.retryAt)).toISOString() : null, lastError: w.lastError ?? null } : null,
       passMode: this.passMode,
       lastPassAt: s?.at ? new Date(Number(s.at)).toISOString() : null,
       lastGoodPassAt: s?.goodAt ? new Date(Number(s.goodAt)).toISOString() : null,
       goodPassAgeMs: s?.goodAt ? Math.max(0, now() - Number(s.goodAt)) : null,
       passRunningHere: Boolean(this._tickPromise),
-      thisInstance: self ? 'WRITER' : this.writer.status,
+      thisInstance: self ? (waitingHere ? 'WRITER_WAITING_ON_MINEPOA' : 'WRITER') : this.writer.status,
       statusAt: s?.at ? new Date(Number(s.at)).toISOString() : null,
       statusAgeMs: s?.at ? Math.max(0, now() - Number(s.at)) : null,
       maxAgeMs: this.leaderStatusMaxAgeMs,
@@ -2019,12 +2057,19 @@ export class ChainSettlement {
     return applied;
   }
 
-  async _reloadFromStore() {
+  async _reloadFromStore({ save = true } = {}) {
     const doc = await this.store.load();
     this._loadedSavedAt = doc?.savedAt ?? null; // as stored (applying the document may re-save it)
     if (doc && doc.version === 1) {
       this.state = { version: 1, bankAddress: this.bankAddress, bankNonce: null, inbound: {}, outbound: {}, groups: {}, ledgerOut: {}, seq: 0, createdAt: Math.floor(now() / 1000) };
-      this._applyDoc(doc);
+      // Takeover: do not re-save the document before it has been checked against the ledger. A re-save
+      // changes its savedAt, so the next instance could no longer match it to the last published status.
+      this._noSave = !save;
+      try {
+        this._applyDoc(doc);
+      } finally {
+        this._noSave = false;
+      }
     }
     this._seedSyncedEpoch = null;
     return doc && doc.version === 1 ? doc : null;
@@ -2054,10 +2099,12 @@ export class ChainSettlement {
    */
   async _unaccountedOutflows(doc) {
     this._takeoverMatches = [];
+    this._takeoverErr = null;
     let row;
     try {
       row = await this.client.getAddress(this.bankAddress);
-    } catch {
+    } catch (err) {
+      this._takeoverErr = err;
       return undefined;
     }
     const known = ChainSettlement.docKnownIds(doc).out;
@@ -3192,20 +3239,39 @@ export class ChainSettlement {
         }
         if (!leader) {
           this._leaderToken = null;
+          this._takeoverWait = null; // a later takeover starts its own wait (and adopts a published one)
+          this._waitBase = null;
           if (this.writer.status === 'STANDBY') await this._standbyTick();
           else await this._readOnlyTick();
           return;
         }
+        // Keep the lease alive on a timer for as long as this pass (or a takeover wait) runs: a slow or busy
+        // minepoa call must not let it lapse and pass to another instance mid-pass.
+        this.writer.touch();
+        this.writer.startHeartbeat();
         passStarted = true;
         this.passes.started += 1;
         this.passes.lastStartedAt = now();
         if (this._leaderToken !== this.writer.lease.token) {
           // Newly the writer (or the lease changed hands): start from the shared document, not our copy,
           // and only if that document accounts for every bank outflow on the ledger.
-          const doc = await this._reloadFromStore();
+          const doc = await this._reloadFromStore({ save: false });
           // Pass mode: re-taking the lease right after our own pass (nobody held it in between, the
           // document is exactly what we left) is the same writer continuing; the check already passed.
           const continuing = Boolean(this._lastPass && doc && this._lastPass.holder === this.writer.holderId && this.writer.lease.token === this._lastPass.token + 1 && this._loadedSavedAt === this._lastPass.savedAt);
+          if (!continuing) {
+            // Back off: neither this instance's own retry time nor the one another writer published (minepoa's
+            // retry_after) has come yet. Keep the lease, say so, and do not call minepoa at all.
+            await this._readShared();
+            const sh = this.shared;
+            // The status the waiting one is based on: another writer's (real or waiting), or our own last real pass.
+            if (sh && (sh.holder !== this.writer.holderId || !sh.waiting)) this._waitBase = sh;
+            this._adoptSharedWait();
+            if (this._takeoverWait && now() < this._takeoverWait.nextAt) {
+              await this._finishWaitingTick();
+              return;
+            }
+          }
           let missing = continuing ? [] : await this._unaccountedOutflows(doc);
           if (missing === undefined && (await this._handoverFromFreshStatus(doc))) {
             // minepoa's explorer is busy: the document is exactly the one the last writer published, and
@@ -3218,8 +3284,11 @@ export class ChainSettlement {
           const unexplained = (missing || []).filter((id) => !attest.has(id));
           if (missing === undefined || unexplained.length) {
             if (missing === undefined) {
-              this._tickErrors.push('writer takeover: minepoa did not answer; retrying');
-              await this.writer.release();
+              // minepoa did not answer: keep the lease (heartbeat), publish that the writer is waiting on
+              // minepoa, and retry after a backoff. Nothing is booked, rolled or signed meanwhile.
+              this._noteTakeoverBusy(this._takeoverErr);
+              await this._finishWaitingTick();
+              return;
             } else {
               const msg = `stored vault does not account for bank transfer(s) ${unexplained.map((id) => id.slice(0, 16)).join(', ')}: refusing to sign (old copy of the store, or a transfer made outside this vault)`;
               this._tickErrors.push(`writer takeover: ${msg}`);
@@ -3233,6 +3302,8 @@ export class ChainSettlement {
             if (rec && rec.txid !== mt.txid && !TERMINAL_OUT.has(rec.status)) this._applyOrderMatch(rec, mt.txid, { via: `takeover:${mt.via}`, claim: mt.claim, final: mt.final });
           }
           this._takeoverMatches = [];
+          this._takeoverWait = null;
+          this._waitBase = null;
           if (attest.size) {
             this.state.attestedOutflows = this.state.attestedOutflows || {};
             for (const id of attest) this.state.attestedOutflows[id] = { at: new Date(now()).toISOString() };
@@ -3283,10 +3354,149 @@ export class ChainSettlement {
           await this.writer.release().catch(() => {});
         }
       } finally {
+        // The heartbeat keeps running between ticks only while a takeover wait is pending (it re-runs the
+        // takeover when the backoff is up); otherwise the next tick's refresh() renews the lease as before.
+        if (!this._waitingOnTakeover()) this.writer.stopHeartbeat();
         this._tickPromise = null;
       }
     })();
     return this._tickPromise;
+  }
+
+  // ─── Writer takeover while minepoa is busy ────────────────────────────────
+
+  /** This instance holds the lease but has not finished the takeover check for it (state not trusted yet). */
+  _takeoverPending() {
+    return this.writer.status === 'LEADER' && Boolean(this.writer.lease?.held) && this._leaderToken !== this.writer.lease.token;
+  }
+
+  /** Holding the lease while waiting on minepoa to finish the takeover check (see _noteTakeoverBusy). */
+  _waitingOnTakeover() {
+    return Boolean(this._takeoverWait) && this._takeoverPending();
+  }
+
+  /**
+   * Retry delay after a busy / unanswered takeover check: jittered exponential backoff (base * 2^(n-1),
+   * capped), never shorter than minepoa's retry_after (plus up to 20% jitter so instances do not line up).
+   */
+  _takeoverDelay(attempts, retryAfterMs = 0) {
+    const ra = Math.max(0, Number(retryAfterMs) || 0);
+    const exp = Math.min(this.takeoverBackoffMaxMs, this.takeoverBackoffBaseMs * 2 ** Math.max(0, attempts - 1));
+    const jittered = exp * (0.5 + 0.5 * this._random());
+    const floor = ra > 0 ? ra * (1 + 0.2 * this._random()) : 0;
+    return Math.round(Math.max(jittered, floor));
+  }
+
+  _noteTakeoverBusy(err) {
+    const t = now();
+    const retryAfterMs = Math.max(Number(err?.retryAfterMs) || 0, this.client?.busy?.('read')?.retryAfterMs || 0);
+    const prev = this._takeoverWait;
+    const attempts = (prev?.attempts || 0) + 1;
+    const delay = this._takeoverDelay(attempts, retryAfterMs);
+    const msg = err ? String(err.message || err).slice(0, 200) : 'no answer';
+    this._takeoverWait = { since: prev?.since || t, attempts, triedAt: t, nextAt: t + delay, retryAfterMs, lastError: msg };
+    this._tickErrors.push(`writer takeover: minepoa did not answer (${msg}); keeping the lease, retry in ${Math.ceil(delay / 1000)} s`);
+  }
+
+  /**
+   * Another writer published that it was waiting on minepoa (and then lost or gave up the lease): take over
+   * its backoff, so a new writer does not call a busy minepoa before the retry time it was given.
+   */
+  _adoptSharedWait() {
+    const w = this.shared?.waiting;
+    if (!w || (this.shared.holder === this.writer.holderId && this._takeoverWait)) return;
+    const t = now();
+    // never more than one max backoff (plus retry_after jitter) ahead: a bad row cannot park the writer forever
+    const retryAt = Math.min(Number(w.retryAt) || 0, t + Math.max(this.takeoverBackoffMaxMs, this.client?.busyMaxMs || 0) * 1.2);
+    if (retryAt <= t) return; // its retry time has passed: nothing to wait for
+    const own = this._takeoverWait;
+    if (own && own.nextAt >= retryAt) return;
+    this._takeoverWait = { since: Math.min(own?.since || t, Number(w.since) || t), attempts: Math.max(own?.attempts || 0, Number(w.attempts) || 0), nextAt: retryAt, retryAfterMs: own?.retryAfterMs || 0, lastError: own?.lastError || (w.lastError ? String(w.lastError).slice(0, 200) : null), adopted: true };
+  }
+
+  _waitingReason() {
+    const w = this._takeoverWait || this.shared?.waiting || {};
+    const since = w.since ? new Date(Number(w.since)).toISOString() : 'just now';
+    const next = Number(w.nextAt ?? w.retryAt ?? 0);
+    const left = next > now() ? `next try in ${Math.ceil((next - now()) / 1000)} s` : 'retrying now';
+    return `The bank writer is active and waiting on minepoa (since ${since}; ${left}) to confirm the bank's ledger before its first settlement pass. Bets and withdrawals are held until that pass completes; nothing is lost.`;
+  }
+
+  _waitingHold() {
+    return { status: 'RECONCILING', reason: this._waitingReason(), writer: LEADER_WAITING };
+  }
+
+  /** The status a waiting writer publishes: its lease is live, but no pass time is refreshed. */
+  _waitingStatusDoc() {
+    const base = this._waitBase || {};
+    const w = this._takeoverWait || {};
+    const hold = this._waitingHold();
+    return {
+      v: 1,
+      holder: this.writer.holderId,
+      token: this.writer.lease?.token ?? null,
+      leaseExpiresAt: Number(this.writer.lease?.expiresAt || 0),
+      at: now(),
+      // Kept from the last real pass: a waiting writer has not checked anything yet.
+      verifiedAt: base.verifiedAt ?? (base.waiting ? null : base.at ?? null),
+      goodAt: base.goodAt ?? null,
+      lastGoodTick: base.lastGoodTick ?? null,
+      docSavedAt: base.docSavedAt ?? null,
+      seed: base.seed ?? null,
+      foreignOutflows: base.foreignOutflows || [],
+      onChainBankBalancePoa: base.onChainBankBalancePoa ?? null,
+      reconcile: base.reconcile ?? null,
+      trading: tradingLabel(hold),
+      hold: { status: hold.status, reason: hold.reason },
+      coverage: { known: false, code: LEADER_WAITING, reason: hold.reason },
+      waiting: { on: 'minepoa', phase: 'takeover', since: w.since ?? now(), attempts: w.attempts ?? 0, retryAt: w.nextAt ?? null, lastError: w.lastError ?? null },
+      passMode: this.passMode,
+      ledger: this.ledgerProbe ? { status: this.ledgerProbe.status, lastError: this.ledgerProbe.lastError || null, lastOkAt: this.ledgerProbe.lastOkAt ?? null } : (base.ledger ?? null),
+      lastError: this.lastError || null
+    };
+  }
+
+  async _publishWaiting() {
+    if (typeof this.store.putStatus !== 'function' || !this.writer.canWrite() || !this._waitingOnTakeover()) return;
+    if (!this._waitBase) this._waitBase = this.shared && !(this.shared.waiting && this.shared.holder === this.writer.holderId) ? this.shared : {};
+    try {
+      const doc = this._waitingStatusDoc();
+      await this.store.putStatus(LEADER_STATUS_KEY, doc);
+      this.shared = doc;
+      this._sharedReadAt = now();
+    } catch (err) {
+      this._tickErrors.push(`writer status publish: ${err.message}`);
+    }
+  }
+
+  /** End a tick that is waiting on minepoa to take over: publish the waiting status and keep the lease. */
+  async _finishWaitingTick() {
+    await this._publishWaiting();
+    this.lastTick = now();
+    if (this._takeoverWait?.lastError && !this._tickErrors.some((e) => e.startsWith('writer takeover'))) this._tickErrors.push(`writer takeover: waiting on minepoa (${this._takeoverWait.lastError})`);
+    this.lastError = this._tickErrors.length ? this._tickErrors.join('; ') : null;
+    if (this.lastError) this.lastErrorAt = now();
+  }
+
+  /** Heartbeat callback: refresh the waiting status, and re-run the takeover once its backoff is up. */
+  _onWriterBeat() {
+    if (!this._waitingOnTakeover()) return;
+    if (!this._tickPromise) this.writer.touch(); // idle between retries is healthy; only a wedged pass is not
+    if (this._tickPromise) {
+      this._publishWaiting().catch(() => {});
+      return;
+    }
+    if (now() >= this._takeoverWait.nextAt) this.tick();
+    else this._publishWaiting().catch(() => {});
+  }
+
+  /** A standby's view: the writer published "waiting on minepoa" and that status and its lease are live. */
+  _sharedWaitingLive(s = this.shared) {
+    if (!s || !s.waiting) return false;
+    const t = now();
+    const at = Number(s.at || 0);
+    const freshFor = Math.min(this.leaderStatusMaxAgeMs, Math.max(2 * (this.writer.leaseMs || 30000), 3000));
+    return Number(s.leaseExpiresAt || 0) > t && t - at <= freshFor;
   }
 
   kick(delayMs = 50) {
@@ -3460,6 +3670,8 @@ export class ChainSettlement {
     if (!this.writer.canWrite() && this.writer.status === 'STANDBY') return this._standbyHold();
     const wh = this.writer.hold();
     if (wh) return wh;
+    // Holding the lease is not enough: until the takeover check has passed, this instance's books are not trusted.
+    if (this._waitingOnTakeover()) return this._waitingHold();
     return this._leaderHold();
   }
 
@@ -3474,6 +3686,9 @@ export class ChainSettlement {
 
   /** Standby: the writer's published hold, or NO_ACTIVE_LEADER when its status is missing or stale. */
   _standbyHold() {
+    // The writer is alive and holds the lease, but is waiting on minepoa before its first pass: say so
+    // (RECONCILING), not NO_ACTIVE_LEADER. Trading stays held either way.
+    if (!this._sharedFresh() && this._sharedWaitingLive()) return { status: 'RECONCILING', reason: this.shared.hold?.reason || this._waitingReason(), writer: LEADER_WAITING };
     if (!this._sharedFresh()) {
       const age = this.shared?.at ? `${Math.round((now() - Number(this.shared.at)) / 1000)} s ago` : 'never';
       const good = this.shared?.goodAt ? `${Math.round((now() - Number(this.shared.goodAt)) / 1000)} s ago` : 'never';
