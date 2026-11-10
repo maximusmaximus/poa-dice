@@ -126,6 +126,40 @@ export function createDiceServer(options = {}) {
 
   if (options.nodeUrl) watcher.nodeUrl = String(options.nodeUrl).replace(/\/+$/, '');
   const sseClients = new Set();
+  const sseCountByIp = new Map();
+  const maxSsePerIp = options.maxSsePerIp ?? 32;
+  const sseKeepaliveMs = options.sseKeepaliveMs ?? 15000;
+  const sentEventIds = new Set();
+  const sentEventOrder = [];
+  const broadcastSseEvent = (evt) => {
+    if (evt && evt.id) {
+      if (sentEventIds.has(evt.id)) return;
+      sentEventIds.add(evt.id);
+      sentEventOrder.push(evt.id);
+      if (sentEventOrder.length > 2000) sentEventIds.delete(sentEventOrder.shift());
+    }
+    const frame = sseFrame(evt);
+    for (const client of sseClients) {
+      try {
+        client.write(frame);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  };
+  const ssePingTimer =
+    sseKeepaliveMs > 0
+      ? setInterval(() => {
+          for (const client of sseClients) {
+            try {
+              client.write(': ping\n\n');
+            } catch {
+              sseClients.delete(client);
+            }
+          }
+        }, sseKeepaliveMs)
+      : null;
+  if (ssePingTimer?.unref) ssePingTimer.unref();
   // Chain settlement = real minepoa deposits/payouts. On whenever the watcher is not simulated.
   const chainSettlement = options.chainSettlement !== undefined ? Boolean(options.chainSettlement) : watcher.mode !== 'simulated';
   const requireChain = chainSettlement || (options.requireChain !== undefined ? Boolean(options.requireChain) : watcher.mode !== 'simulated');
@@ -195,6 +229,11 @@ export function createDiceServer(options = {}) {
           const bindTarget = options.bindStore !== undefined ? (options.bindStore ? key.wallet.address : null) : signerEnv.POA_DICE_BIND_STORE || null;
           settlement = new ChainSettlement({
             writer,
+            onRemoteEvent: broadcastSseEvent,
+            maxHotInbound: options.maxHotInbound ?? 2000,
+            maxHotOutbound: options.maxHotOutbound ?? 2000,
+            maxBankHistoryRecent: options.maxBankHistoryRecent ?? 2000,
+            compactAgeMs: options.compactAgeMs ?? 15 * 60 * 1000,
             // A failed vault load is retried on later ticks; read-only (fail-closed) until one succeeds.
             onLoadStateChange: (v) => {
               if (v.status === 'LOADED') {
@@ -296,6 +335,30 @@ export function createDiceServer(options = {}) {
   const chainCache = new Map();
   const pendingSpend = new Map(); // address -> micros reserved by in-flight batches
   let chainDebits = dataDir ? loadDebits(dataDir) : [];
+  const rateLimitMax = options.rateLimitMax ?? Number(process.env.POA_DICE_RATE_LIMIT_PER_MIN ?? 600);
+  const ipBuckets = new Map();
+
+  function clientIpOf(req) {
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return xff || req.socket?.remoteAddress || 'unknown';
+  }
+
+  function checkRateLimit(req) {
+    if (!Number.isFinite(rateLimitMax) || rateLimitMax <= 0) return true;
+    const ip = clientIpOf(req);
+    const nowMs = Date.now();
+    let b = ipBuckets.get(ip);
+    if (!b || nowMs >= b.resetAt) {
+      if (ipBuckets.size >= 4000) {
+        const oldest = ipBuckets.keys().next().value;
+        if (oldest !== undefined) ipBuckets.delete(oldest);
+      }
+      b = { count: 0, resetAt: nowMs + 60000 };
+      ipBuckets.set(ip, b);
+    }
+    b.count += 1;
+    return b.count <= rateLimitMax;
+  }
 
   async function cachedExplorer(address, { withTxDetails = false } = {}) {
     const hit = chainCache.get(address);
@@ -303,6 +366,10 @@ export function createDiceServer(options = {}) {
     if (hit && Date.now() - hit.at < chainCacheMs) row = hit.row;
     else {
       row = await chainFetch(address);
+      if (!chainCache.has(address) && chainCache.size >= 1000) {
+        const oldest = chainCache.keys().next().value;
+        if (oldest !== undefined) chainCache.delete(oldest);
+      }
       chainCache.set(address, { at: Date.now(), row });
     }
     if (withTxDetails && !row.txDetails) {
@@ -374,6 +441,7 @@ export function createDiceServer(options = {}) {
     bankAddress: () => publicBankAddress(),
     chainId: () => chainIdValue(),
     waitPollMs: options.mcpWaitPollMs,
+    runAdminMutation: (fn, opts) => (settlement ? settlement.runAdminMutation(fn, opts) : Promise.resolve(fn())),
     reserveSpend(address, micros) {
       pendingSpend.set(address, (pendingSpend.get(address) || 0n) + BigInt(micros));
     },
@@ -388,22 +456,24 @@ export function createDiceServer(options = {}) {
   };
   const mcpHandler = new McpHandler({ engine, watcher, hooks: mcpHooks });
 
+  function sha256Equal(a, b) {
+    const ha = crypto.createHash('sha256').update(String(a)).digest();
+    const hb = crypto.createHash('sha256').update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
+  }
+
   function isAdmin(req) {
     if (!adminToken) return false;
     const auth = String(req.headers.authorization || '');
-    const given = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    const a = Buffer.from(given);
-    const b = Buffer.from(String(adminToken));
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!auth.startsWith('Bearer ')) return false;
+    return sha256Equal(auth.slice(7), adminToken);
   }
 
   function bearerIs(req, secret) {
     if (!secret) return false;
     const auth = String(req.headers.authorization || '');
-    const given = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    const a = Buffer.from(given);
-    const b = Buffer.from(String(secret));
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!auth.startsWith('Bearer ')) return false;
+    return sha256Equal(auth.slice(7), secret);
   }
 
   function denyAdmin(res) {
@@ -451,24 +521,7 @@ export function createDiceServer(options = {}) {
   // event type travels inside the JSON, so EventSource.onmessage, curl and agents all see it once.
   // (Previously each event was written twice: a named `event:` frame plus a generic copy.)
   // A bounded id set also drops an event that is published twice (e.g. re-emitted after a reload).
-  const sentEventIds = new Set();
-  const sentEventOrder = [];
-  engine.onEvent((evt) => {
-    if (evt && evt.id) {
-      if (sentEventIds.has(evt.id)) return;
-      sentEventIds.add(evt.id);
-      sentEventOrder.push(evt.id);
-      if (sentEventOrder.length > 2000) sentEventIds.delete(sentEventOrder.shift());
-    }
-    const frame = sseFrame(evt);
-    for (const client of sseClients) {
-      try {
-        client.write(frame);
-      } catch {
-        sseClients.delete(client);
-      }
-    }
-  });
+  engine.onEvent(broadcastSseEvent);
 
   function settlementBrief() {
     if (!chainSettlement) return { mode: 'simulated', status: 'SIMULATED', readOnly: false, note: 'Local demo ledger: nothing moves on minepoa' };
@@ -539,6 +592,15 @@ export function createDiceServer(options = {}) {
       // passEveryMs (work after the response is not guaranteed on a host that freezes instances).
       if (settlement && settlement.passMode && (!readOnlyState || readOnlyState.retrying) && req.method === 'GET' && (pathname === '/api/health' || pathname === '/api/settlement' || /^\/api\/tx\/[0-9a-f]+\/status$/.test(pathname))) {
         await settlement.maybePass({ budgetMs: readPassBudgetMs }).catch(() => {});
+      }
+
+      if (
+        (req.method === 'POST' || pathname === '/api/audit/chain' || pathname.startsWith('/api/wallet/')) &&
+        pathname !== '/api/settlement/tick' &&
+        !checkRateLimit(req)
+      ) {
+        res.setHeader('Retry-After', '5');
+        return sendJson(res, 429, { ok: false, error: 'Too many requests; retry shortly.' });
       }
 
       if (readOnlyState && req.method === 'POST' && WRITE_PATHS.has(pathname)) {
@@ -636,6 +698,12 @@ export function createDiceServer(options = {}) {
 
       // 2. Near Real-Time SSE Stream
       if (pathname === '/api/stream' && req.method === 'GET') {
+        const ip = clientIpOf(req);
+        const curSse = sseCountByIp.get(ip) || 0;
+        if (maxSsePerIp > 0 && curSse >= maxSsePerIp) {
+          return sendJson(res, 429, { ok: false, error: 'Too many concurrent SSE streams from this IP.' });
+        }
+        sseCountByIp.set(ip, curSse + 1);
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
@@ -656,6 +724,9 @@ export function createDiceServer(options = {}) {
         sseClients.add(res);
         req.on('close', () => {
           sseClients.delete(res);
+          const left = (sseCountByIp.get(ip) || 1) - 1;
+          if (left > 0) sseCountByIp.set(ip, left);
+          else sseCountByIp.delete(ip);
         });
         return;
       }
@@ -774,10 +845,16 @@ export function createDiceServer(options = {}) {
             out[k] = { ...out[k], valid: false, code: readOnlyState.status, reason: `Vault is read-only (${readOnlyState.status.replace(/_/g, ' ')})` };
           }
         } else if (settlement) {
-          out.autoBet = { ...out.autoBet, valid: false, code: 'chain_settled', reason: 'Auto-bet needs each roll settled first; use the roll builder batch instead' };
+          out.autoBet = { ...out.autoBet, executionMode: 'sequential_mcp' };
           const hold = await tradingHold();
           // A ledger outage also stops stakes: the deposit could not be broadcast or confirmed.
-          if (hold) for (const k of hold.status === LEDGER_HOLD ? ['stake', 'withdraw', 'claim'] : ['withdraw', 'claim']) out[k] = holdBlock(out[k], hold);
+          if (hold) {
+            for (const k of hold.status === LEDGER_HOLD ? ['stake', 'withdraw', 'claim', 'autoBet'] : ['withdraw', 'claim', 'autoBet']) {
+              out[k] = holdBlock(out[k], hold);
+            }
+          } else if (out.autoBet?.valid && out.autoBet.quote?.payoutOnWinMicros) {
+            out.autoBet = coverageBlock(out.autoBet, await betCoverage(BigInt(out.autoBet.quote.payoutOnWinMicros)));
+          }
         }
         const addr = address || undefined;
         if (out.stake?.valid) out.stake.transferTemplate = templateFor('bank_stake', { amount_poa: out.stake.amountPoa, lock_epochs: out.stake.lockEpochs, referrer: out.stake.referrer || undefined, address: addr });
@@ -966,6 +1043,15 @@ export function createDiceServer(options = {}) {
 
       if (pathname === '/api/seed/rotate' && req.method === 'POST') {
         if (!isAdmin(req)) return denyAdmin(res);
+        if (readOnlyState) return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });
+        const body = await readJsonBody(req).catch(() => ({}));
+        if (settlement) {
+          const rotated = await settlement.runAdminMutation(() => engine.seedManager.rotateSeed(), {
+            forbidOpenServerBets: body?.force !== true
+          });
+          engine._emit('seed.rotated', rotated);
+          return sendJson(res, 200, { ok: true, ...rotated });
+        }
         const rotated = engine.seedManager.rotateSeed();
         engine._saveToDisk();
         engine._emit('seed.rotated', rotated);
@@ -975,6 +1061,11 @@ export function createDiceServer(options = {}) {
       // 8. 0.1% Dev Reserve Sweep (Strictly to poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U)
       if (pathname === '/api/dev/sweep' && req.method === 'POST') {
         if (!isAdmin(req)) return denyAdmin(res);
+        if (settlement) {
+          const resSweep = await settlement.runAdminMutation(() => engine.sweepDevReserve());
+          settlement.kick();
+          return sendJson(res, 200, { ok: true, ...resSweep });
+        }
         const resSweep = engine.sweepDevReserve();
         watcher.flushOutboundQueueSync();
         return sendJson(res, 200, { ok: true, ...resSweep });
@@ -983,6 +1074,10 @@ export function createDiceServer(options = {}) {
       // 9. Epoch Advance & Agent Staking Incentive Compounding
       if (pathname === '/api/epoch/advance' && req.method === 'POST') {
         if (!isAdmin(req)) return denyAdmin(res);
+        if (settlement) {
+          const resEpoch = await settlement.runAdminMutation(() => engine.advanceEpoch({ distributeIncentives: true }));
+          return sendJson(res, 200, { ok: true, ...resEpoch });
+        }
         const resEpoch = engine.advanceEpoch({ distributeIncentives: true });
         return sendJson(res, 200, { ok: true, ...resEpoch });
       }
@@ -1033,8 +1128,14 @@ export function createDiceServer(options = {}) {
       // 12. Static Responsive Web UI
       let relPath = pathname === '/' ? '/index.html' : pathname;
       relPath = path.normalize(relPath).replace(/^(\.\.(\/|\\|$))+/, '');
-      const filePath = path.join(PUBLIC_DIR, relPath);
-      if (filePath.startsWith(PUBLIC_DIR) && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      const filePath = path.resolve(PUBLIC_DIR, `.${path.sep}${relPath}`);
+      const relFromPublic = path.relative(PUBLIC_DIR, filePath);
+      if (
+        !relFromPublic.startsWith('..') &&
+        !path.isAbsolute(relFromPublic) &&
+        fs.existsSync(filePath) &&
+        fs.statSync(filePath).isFile()
+      ) {
         const ext = path.extname(filePath).toLowerCase();
         const contentType = MIME_TYPES[ext] || 'application/octet-stream';
         res.writeHead(200, {
@@ -1049,6 +1150,8 @@ export function createDiceServer(options = {}) {
     } catch (err) {
       return sendJson(res, err.status || 400, {
         ok: false,
+        ...(err.code ? { code: err.code } : {}),
+        ...(err.retryable !== undefined ? { retryable: Boolean(err.retryable) } : {}),
         error: redactSecrets(err.message || 'Bad request')
       });
     }
@@ -1077,11 +1180,13 @@ export function createDiceServer(options = {}) {
       };
     },
     async close() {
+      if (ssePingTimer) clearInterval(ssePingTimer);
       watcher.stopPolling();
       if (settlement) settlement.stop();
       if (settlement) {
         await settlement.idle().catch(() => {});
-        await settlement.writer.release();
+        await settlement.writer.release().catch(() => {});
+        await Promise.resolve(settlement.store?.close?.()).catch(() => {});
       }
       for (const client of sseClients) {
         try {
@@ -1091,6 +1196,7 @@ export function createDiceServer(options = {}) {
         }
       }
       sseClients.clear();
+      sseCountByIp.clear();
       if (typeof server.closeAllConnections === 'function') {
         server.closeAllConnections();
       }
@@ -1099,7 +1205,17 @@ export function createDiceServer(options = {}) {
   };
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+function isEntrypoint(metaUrl) {
+  if (!process.argv[1]) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(selfPath);
+  } catch {
+    return path.resolve(process.argv[1]).toLowerCase() === path.resolve(selfPath).toLowerCase();
+  }
+}
+
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) {
   const port = Number(process.env.PORT || 3080);
   const host = process.env.HOST || '127.0.0.1';

@@ -206,41 +206,62 @@ test('E2E 1: HTTP API + Near Real-Time SSE Stream + Streamable HTTP MCP (14 Tool
 });
 
 test('E2E 2: Website-Independent Stdio MCP Server (node src/mcp-server.mjs --stdio)', async () => {
+  const stdioDataDir = makeTempDataDir('stdio-mcp');
   const proc = spawn(process.execPath, ['src/mcp-server.mjs', '--stdio'], {
     cwd: path.resolve(import.meta.dirname, '..'),
+    env: { ...process.env, POA_DICE_DATA_DIR: stdioDataDir },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  const responses = [];
-  proc.stdout.setEncoding('utf8');
-  proc.stdout.on('data', (chunk) => {
-    for (const line of chunk.split('\n').filter(Boolean)) {
-      responses.push(JSON.parse(line));
-    }
-  });
+  try {
+    proc.stdout.setEncoding('utf8');
+    let buf = '';
+    const firstLinePromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timed out waiting for stdio MCP response')), 10000);
+      proc.stdout.on('data', (chunk) => {
+        buf += chunk;
+        const nl = buf.indexOf('\n');
+        if (nl >= 0) {
+          clearTimeout(timer);
+          const line = buf.slice(0, nl).trim();
+          try {
+            resolve(JSON.parse(line));
+          } catch (err) {
+            reject(err);
+          }
+        }
+      });
+      proc.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
 
-  proc.stdin.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      id: 101,
-      method: 'tools/call',
-      params: {
-        name: 'offline_memo_builder',
-        arguments: {
-          action: 'BET',
-          amount_poa: '10.000000',
-          direction: 'under',
-          target_bps: 4950,
-          client_seed: 'stdio-offline-seed',
+    proc.stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 101,
+        method: 'tools/call',
+        params: {
+          name: 'offline_memo_builder',
+          arguments: {
+            action: 'BET',
+            amount_poa: '10.000000',
+            direction: 'under',
+            target_bps: 4950,
+            client_seed: 'stdio-offline-seed',
+          },
         },
-      },
-    }) + '\n'
-  );
+      }) + '\n'
+    );
 
-  await new Promise((r) => setTimeout(r, 250));
-  proc.kill();
-
-  assert.equal(responses.length >= 1, true);
-  const payload = JSON.parse(responses[0].result.content[0].text);
-  assert.equal(payload.memo, 'DICE1:BET:under:4950:stdio-offline-seed');
+    const response = await firstLinePromise;
+    const payload = JSON.parse(response.result.content[0].text);
+    assert.equal(payload.memo, 'DICE1:BET:under:4950:stdio-offline-seed');
+  } finally {
+    const exited = new Promise((r) => proc.once('exit', r));
+    proc.kill();
+    await exited;
+    fs.rmSync(stdioDataDir, { recursive: true, force: true });
+  }
 });

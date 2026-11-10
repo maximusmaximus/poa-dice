@@ -70,6 +70,26 @@ function formatNum(poaStr, decimals = 4) {
   return num.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
+function formatBigIntStr(str) {
+  try {
+    return BigInt(String(str ?? '0').trim() || '0').toLocaleString('en-US');
+  } catch {
+    return String(str ?? '0');
+  }
+}
+
+function parsePoaMicros(str) {
+  const m = String(str ?? '').trim().match(/^(\d+)(?:\.(\d{1,6}))?$/);
+  if (!m) return null;
+  return BigInt(m[1]) * 1000000n + BigInt((m[2] || '').padEnd(6, '0'));
+}
+
+function formatPoaMicros(micros) {
+  const v = BigInt(micros || 0n);
+  const abs = v < 0n ? -v : v;
+  return `${v < 0n ? '-' : ''}${abs / 1000000n}.${String(abs % 1000000n).padStart(6, '0')}`;
+}
+
 function escapeHtml(str) {
   return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -141,9 +161,19 @@ export function diceMemo(spec) {
 /** Fallback when the server quote did not carry a transferTemplate (same shape). */
 function localTemplate({ amount, memo, count = 1 }) {
   const to = state.summary?.bankAddress;
-  if (!to || !memo || !AMOUNT_RE.test(String(amount))) return null;
-  const amt = Number(amount).toFixed(6);
-  return { ok: true, kind: 'transfer', chainId: state.summary?.chainId || 'poa-mainnet-1', to, amount: amt, memo, count, totalPoa: (Number(amt) * count).toFixed(6) };
+  const micros = parsePoaMicros(amount);
+  if (!to || !memo || micros === null) return null;
+  const amt = formatPoaMicros(micros);
+  return {
+    ok: true,
+    kind: 'transfer',
+    chainId: state.summary?.chainId || 'poa-mainnet-1',
+    to,
+    amount: amt,
+    memo,
+    count,
+    totalPoa: formatPoaMicros(micros * BigInt(count))
+  };
 }
 
 function transferLines(tpl) {
@@ -212,10 +242,11 @@ export function buildAgentPrompt({ title, tool, args, quoteTool, quoteArgs, spen
 function rollArgs() {
   const count = state.rollCount;
   const wager = wagerValue();
-  const total = AMOUNT_RE.test(wager) ? (Number(wager) * count).toFixed(6) : '0';
+  const wagerMicros = parsePoaMicros(wager);
+  const total = wagerMicros !== null ? formatPoaMicros(wagerMicros * BigInt(count)) : '0';
   return {
     count,
-    amount_poa: AMOUNT_RE.test(wager) ? Number(wager).toFixed(6) : wager,
+    amount_poa: wagerMicros !== null ? formatPoaMicros(wagerMicros) : wager,
     target_bps: state.targetBps,
     direction: state.direction,
     client_seed: seedValue(),
@@ -314,10 +345,40 @@ function actionPrompt(kind) {
     });
   }
   if (kind === 'autoBet') {
-    const wager = AMOUNT_RE.test(wagerValue()) ? Number(wagerValue()).toFixed(6) : wagerValue();
+    const wagerMicros = parsePoaMicros(wagerValue());
+    const wager = wagerMicros !== null ? formatPoaMicros(wagerMicros) : wagerValue();
     const strategy = $('autoStrategySelect').value || 'flat';
     const rolls = Number($('autoRollsInput').value || 5);
-    const cap = state.actionQuotes?.autoBet?.maxTotalSpendPoa || (Number(wager) * rolls).toFixed(6);
+    const cap =
+      state.actionQuotes?.autoBet?.maxTotalSpendPoa ||
+      (wagerMicros !== null ? formatPoaMicros(wagerMicros * BigInt(rolls)) : '0.000000');
+    const isChainSequential =
+      state.summary?.settlement?.mode === 'chain' ||
+      state.actionQuotes?.autoBet?.executionMode === 'sequential_mcp';
+    if (isChainSequential) {
+      const bankTo = state.summary?.bankAddress || '<bankAddress from dice_quote_bet>';
+      const cid = state.summary?.chainId || 'poa-mainnet-1';
+      return [
+        `Please run this non-custodial sequential POA Dice strategy for me through the POA Dice MCP server.`,
+        ``,
+        `MCP server: ${mcpUrl()} (Streamable HTTP, JSON-RPC 2.0).`,
+        `Action: Sequential strategy · ${rolls} rolls · ${strategy} from ${wager} POA · roll ${state.direction} ${(state.targetBps / 100).toFixed(2)}`,
+        addr
+          ? `My PoA address: ${addr}. Sign every roll locally from this address; never send my private key.`
+          : `My PoA address: not given, so sign locally from your own PoA wallet; never send a private key. ${VIP_LINE}`,
+        ``,
+        `For each roll i = 1 .. ${rolls} (sequential confirm-per-roll loop):`,
+        `1. Call \`dice_quote_bet\` with {"amount_poa": <current_wager>, "target_bps": ${state.targetBps}, "direction": "${state.direction}"${addr ? `, "address": "${addr}"` : ''}}. Stop if valid is false.`,
+        `2. Size the wager according to "${strategy}" (flat = ${wager} POA; quarter_kelly = quote.kellySizing.quarterKellyPoa; martingale_capped = 2x after loss, reset to ${wager} POA on win; paroli = 2x up to 3 consecutive wins, reset on loss), clamped to quote.maxAllowedWagerPoa and the remaining spend cap.`,
+        `3. Sign LOCALLY 1 transfer on ${cid} to ${bankTo} with memo "DICE1:BET:${state.direction}:${state.targetBps}:${seedValue()}-r<i>" and call \`dice_place_bet\` with "signed_tx" and "wait_seconds": ${PROMPT_WAIT_SECONDS} (if waitStatus is PENDING, poll \`tx_status\` until settled before sizing roll i+1).`,
+        `Safety: never pass "privkey" and never resend a transaction.`,
+        `Spend cap: never send more than ${cap} POA in total across all rolls.`,
+        `Stop condition: stop after ${rolls} rolls, when cumulative wagers would exceed ${cap} POA, or if any quote/roll is rejected.`,
+        `4. Report back: rolls executed, wins, losses, net POA, stopped reason, and each bet_txid + rollDisplay.`,
+        ``,
+        `(Generated by the POA Dice page at ${window.location.origin}${window.location.pathname}. Governance-token utility only; no monetary value is exchanged.)`
+      ].join('\n');
+    }
     return buildAgentPrompt({
       title: `Auto-bet: ${rolls} rolls, ${strategy} strategy from ${wager} POA, roll ${state.direction} ${(state.targetBps / 100).toFixed(2)}`,
       tool: 'dice_auto_strategy',
@@ -662,7 +723,7 @@ async function fetchDepositQuote() {
     const qs = new URLSearchParams({ amountPoa, lockEpochs: String(lockEpochs), address: state.playerAddress });
     const q = await (await fetch(api(`/api/quote/deposit?${qs}`))).json();
     if (!q.valid) return;
-    $('quoteSharesMinted').textContent = Number(q.sharesMinted).toLocaleString('en-US');
+    $('quoteSharesMinted').textContent = formatBigIntStr(q.sharesMinted);
     $('quoteBankPercent').textContent = `${q.shareOfLpPoolPercent}% of Bank`;
     $('quoteVipUnlocked').textContent = `${q.unlockedVipTier.name} (${q.unlockedVipTier.houseEdgePercent}% Dice Edge)`;
     $('depositProjectionsBody').innerHTML = (q.projections || [])
@@ -682,7 +743,7 @@ async function fetchWithdrawQuote() {
       $('withdrawQuoteShares').textContent = '0 (No Active Position)';
       return;
     }
-    $('withdrawQuoteShares').textContent = Number(q.sharesRedeemed).toLocaleString('en-US');
+    $('withdrawQuoteShares').textContent = formatBigIntStr(q.sharesRedeemed);
     $('withdrawQuoteGross').textContent = `${formatNum(q.grossValuePoa, 6)} POA`;
     $('withdrawQuoteFee').textContent = `${formatNum(q.earlyExitFeePoa, 6)} POA (${q.earlyExitFeeBps} bps)`;
     $('withdrawQuoteNet').textContent = `${formatNum(q.netPayoutPoa, 6)} POA`;
@@ -761,7 +822,7 @@ function renderInlineHistory() {
     return;
   }
   list.innerHTML = bets
-    .slice(0, 8)
+    .slice(0, 50)
     .map((b) => {
       const cond = `${b.direction === 'under' ? 'Under' : 'Over'} ${b.targetDisplay || (b.targetBps / 100).toFixed(2)}`;
       return `<li class="roll-card ${b.won ? 'is-win' : 'is-loss'}" data-bet-txid="${escapeHtml(b.betTxid)}"><div class="roll-card-num">${escapeHtml(b.rollDisplay)}</div><div class="roll-card-meta"><strong>${b.won ? 'Win' : 'Loss'}</strong><span>${escapeHtml(cond)} · ${formatNum(b.wagerPoa, 2)} POA</span><span>${b.won ? '+' + formatNum(b.payoutPoa, 4) : '0.0000'} POA</span><code class="roll-card-sig">${escapeHtml(shortAddr(b.address))}</code></div></li>`;
@@ -1167,22 +1228,30 @@ function handleRealtimeEvent(msg) {
   switch (msg.type) {
     case 'bet.settled':
       upsertBet(p);
-      if (state.batch && !state.batch.completed && p.address === state.batch.address) state.batch.done = Math.max(state.batch.done || 0, (state.batch.done || 0) + 1);
+      if (state.batch && !state.batch.completed && p.address === state.batch.address) {
+        if (!state.batch.countedTxids) state.batch.countedTxids = new Set();
+        if (p.betTxid) state.batch.countedTxids.add(p.betTxid);
+        state.batch.done = Math.max(state.batch.done || 0, state.batch.countedTxids.size);
+      }
       renderBetsSoon();
       renderBatchProgress();
       refreshStateSoon();
       refreshQuotesSoon();
       break;
     case 'batch.started':
-      state.batch = { ...p, done: 0, wins: 0, netPoa: '0', completed: false };
+      state.batch = { ...p, done: 0, wins: 0, netPoa: '0', completed: false, countedTxids: new Set() };
       renderBatchProgress();
       break;
-    case 'batch.progress':
-      state.batch = { ...(state.batch || {}), ...p };
+    case 'batch.progress': {
+      const countedTxids = state.batch?.countedTxids || new Set();
+      const prevDone = state.batch?.done || 0;
+      state.batch = { ...(state.batch || {}), ...p, countedTxids };
+      state.batch.done = Math.max(prevDone, Number(p.done || 0), countedTxids.size);
       renderBatchProgress();
       break;
+    }
     case 'batch.completed':
-      state.batch = { ...(state.batch || {}), ...p, completed: true };
+      state.batch = { ...(state.batch || {}), ...p, completed: true, countedTxids: state.batch?.countedTxids || new Set() };
       renderBatchProgress();
       refreshStateSoon();
       refreshQuotesSoon();
@@ -1200,7 +1269,11 @@ function handleRealtimeEvent(msg) {
 // ─── Events ─────────────────────────────────────────────────────────────────
 
 function switchTab(attr, prefix, names, tabName) {
-  document.querySelectorAll(`[${attr}]`).forEach((btn) => btn.classList.toggle('active', btn.getAttribute(attr) === tabName));
+  document.querySelectorAll(`[${attr}]`).forEach((btn) => {
+    const isActive = btn.getAttribute(attr) === tabName;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
   for (const n of names) $(`${prefix}${n[0].toUpperCase()}${n.slice(1)}`).classList.toggle('hidden', n !== tabName);
 }
 

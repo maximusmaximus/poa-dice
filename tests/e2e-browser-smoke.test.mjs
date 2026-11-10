@@ -22,7 +22,30 @@ import { createDiceServer } from '../src/server.mjs';
 import { genKeypair, signRaw } from '../src/crypto-poa.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from '../src/bankroll-engine.mjs';
 
-const CHROME = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+function findBrowserBinary() {
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+  const candidates = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  ];
+  const winRoots = [
+    process.env.PROGRAMFILES,
+    process.env['PROGRAMFILES(X86)'],
+    process.env.LOCALAPPDATA,
+  ].filter(Boolean);
+  for (const root of winRoots) {
+    candidates.push(path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+    candidates.push(path.join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return '/usr/bin/google-chrome';
+}
+
+const CHROME = findBrowserBinary();
 const ADMIN = 'browser-e2e-admin';
 let chromium = null;
 try {
@@ -32,7 +55,7 @@ try {
 }
 const haveBrowser = Boolean(chromium) && fs.existsSync(CHROME);
 if (!haveBrowser && process.env.REQUIRE_BROWSER) throw new Error(`Browser e2e required but Chrome/playwright-core missing (${CHROME})`);
-const skip = haveBrowser ? false : `headless Chrome not found at ${CHROME}`;
+const skip = haveBrowser ? false : (!chromium ? 'playwright-core not installed' : `headless Chrome not found at ${CHROME}`);
 
 const latency = {};
 const shotsDir = process.env.E2E_SCREENSHOT_DIR || '';
@@ -56,7 +79,7 @@ async function startServer({ bootstrap = '100000.000000', balances = {}, chainDo
   const info = await app.listen(0, '127.0.0.1');
   balances[app.engine.bankAddress] = balances[app.engine.bankAddress] ?? bootstrap ?? '0.000000';
   balances[DEV_RESERVE_ADDRESS] = balances[DEV_RESERVE_ADDRESS] ?? '10.000000';
-  return { app, url: info.url, close: () => info.close?.() ?? new Promise((r) => app.server.close(r)) };
+  return { app, url: info.url, close: () => app.close() };
 }
 
 let rpcId = 0;
@@ -94,7 +117,8 @@ async function countStates(page) {
 }
 
 async function clipboard(page) {
-  return page.evaluate(() => navigator.clipboard.readText());
+  const text = await page.evaluate(() => navigator.clipboard.readText());
+  return text.replace(/\r\n/g, '\n');
 }
 
 test('browser e2e: clean top, prompts, edge cases, MCP tools and live updates', { skip, timeout: 120000 }, async (t) => {

@@ -78,21 +78,39 @@ export class PoaScanClient {
     throw new PoaScanError(`POAScan gave no definite answer for ${id.slice(0, 16)} (HTTP ${status}${body?.error ? ` ${String(body.error).slice(0, 80)}` : ''})`, { status });
   }
 
-  /** Every transfer POAScan has archived for an address (all pages). Throws on any failed page. */
-  async addressTxs(address, { maxPages = 20 } = {}) {
+  /**
+   * Archived transfers for an address. Supports incremental `stopWhen(pageRows)` so callers with an
+   * existing verified history can stop as soon as a page overlaps known transfers instead of re-reading
+   * to genesis, and defaults `maxPages` to 500 (100,000 transfers) for cold bootstrap.
+   */
+  async addressTxs(address, { maxPages = 500, stopWhen = null } = {}) {
     const out = [];
     let cursor = null;
     let coverage = null;
+    let partial = false;
     for (let page = 0; page < maxPages; page++) {
       const q = `limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
       const { status, body } = await this._get(`/api/v1/address/${encodeURIComponent(address)}/txs?${q}`);
       if (status !== 200 || !body || !Array.isArray(body.txs)) throw new PoaScanError(`POAScan history for ${address} unreadable (HTTP ${status})`, { status });
-      for (const t of body.txs) if (t && t.id) out.push({ id: String(t.id).toLowerCase(), type: t.type || 'transfer', from: t.from_addr || null, to: t.to_addr || null, amount: t.amount || null, memo: t.memo ?? null, final: t.final === 1 || t.final === true, ts: t.ts ?? null });
+      const pageRows = [];
+      for (const t of body.txs) {
+        if (t && t.id) {
+          const row = { id: String(t.id).toLowerCase(), type: t.type || 'transfer', from: t.from_addr || null, to: t.to_addr || null, amount: t.amount || null, memo: t.memo ?? null, final: t.final === 1 || t.final === true, ts: t.ts ?? null };
+          out.push(row);
+          pageRows.push(row);
+        }
+      }
       if (body.coverage && !coverage) coverage = body.coverage;
       cursor = body.next_cursor || null;
       if (!cursor) {
-        // POAScan's own view of how complete its archive is (nonce_gap > 0: it missed some sent txs).
         Object.defineProperty(out, 'coverage', { value: coverage, enumerable: false });
+        Object.defineProperty(out, 'partial', { value: false, enumerable: false });
+        return out;
+      }
+      if (typeof stopWhen === 'function' && pageRows.length > 0 && stopWhen(pageRows, out)) {
+        partial = true;
+        Object.defineProperty(out, 'coverage', { value: coverage, enumerable: false });
+        Object.defineProperty(out, 'partial', { value: partial, enumerable: false });
         return out;
       }
     }

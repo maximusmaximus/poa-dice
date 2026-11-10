@@ -14,6 +14,26 @@ import { isValidPoaAddress, sanitizeUntrustedText, verifyRaw } from './crypto-po
 
 export const CHAT_MAX_CHARS = 240;
 export const CHAT_SENDER_MAX_CHARS = 32;
+export const CHAT_ENVELOPE_PREFIX = 'POA_DICE_CHAT_V2';
+export const CHAT_MAX_SKEW_SECONDS = 300;
+const SEEN_SIG_LIMIT = 5000;
+const seenSignatures = new Map(); // signature -> expiresAtMs
+
+function pruneSeenSignatures(nowMs = Date.now()) {
+  if (seenSignatures.size <= SEEN_SIG_LIMIT) return;
+  for (const [sig, exp] of seenSignatures) {
+    if (exp <= nowMs || seenSignatures.size > SEEN_SIG_LIMIT) seenSignatures.delete(sig);
+  }
+}
+
+/**
+ * Canonical domain-separated v2 payload binding address, senderName, timestamp, nonce, and text.
+ */
+export function formatChatEnvelope({ address, senderName = '', timestamp, nonce, text }) {
+  const cleanName = sanitizeUntrustedText(String(senderName || ''), CHAT_SENDER_MAX_CHARS);
+  return `${CHAT_ENVELOPE_PREFIX}\n${String(address || '').trim()}\n${cleanName}\n${Number(timestamp)}\n${String(nonce || '').trim()}\n${text}`;
+}
+export const formatChatSigningPayloadV2 = formatChatEnvelope;
 
 function reject(code, reason, extra = {}) {
   return { valid: false, rejected: true, code, reason, error: reason, ...extra };
@@ -21,10 +41,15 @@ function reject(code, reason, extra = {}) {
 
 /**
  * Checks a chat post without changing any state.
- * @param {{ text?: string, address?: string, signature?: string, privkey?: string }} args
- * @param {{ recentMessages?: Array<{ signature?: string|null }> }} [ctx]
+ * Supports both replay-safe v2 envelopes (when timestamp + nonce are supplied, or POA_DICE_CHAT_REQUIRE_V2=1)
+ * and legacy raw-text signatures (deduplicated against recentMessages + bounded signature cache).
+ * @param {{ text?: string, address?: string, signature?: string, sender_name?: string, senderName?: string, timestamp?: number, nonce?: string, privkey?: string }} args
+ * @param {{ recentMessages?: Array<{ signature?: string|null }>, nowSeconds?: number, requireV2?: boolean }} [ctx]
  */
-export function validateSignedChat(args = {}, { recentMessages = [] } = {}) {
+export function validateSignedChat(
+  args = {},
+  { recentMessages = [], nowSeconds = Math.floor(Date.now() / 1000), requireV2 = process.env.POA_DICE_CHAT_REQUIRE_V2 === '1' } = {}
+) {
   if (args.privkey !== undefined && args.privkey !== null && args.privkey !== '') {
     return reject('privkey_refused', 'Chat never takes a private key. Sign the text locally and send address + signature.');
   }
@@ -44,27 +69,59 @@ export function validateSignedChat(args = {}, { recentMessages = [] } = {}) {
   if (!isValidPoaAddress(address)) return reject('bad_address', 'address is not a valid poa1 address');
   const signature = typeof args.signature === 'string' ? args.signature.trim() : '';
   if (!signature) return reject('missing_signature', 'signature is required: Base58 Ed25519 signature over the exact text, made with the key of address');
-  if (!verifyRaw(text, signature, address)) {
-    return reject('bad_signature', 'signature does not verify for this text and address (sign the exact UTF-8 text with the key of address, Base58-encode the 64-byte signature)');
+
+  const senderName = sanitizeUntrustedText(String(args.sender_name ?? args.senderName ?? ''), CHAT_SENDER_MAX_CHARS);
+  const hasV2Fields = args.timestamp !== undefined && args.timestamp !== null && args.nonce !== undefined && args.nonce !== null && String(args.nonce).trim() !== '';
+
+  if (requireV2 && !hasV2Fields) {
+    return reject('missing_envelope', 'timestamp (unix seconds) and nonce are required for v2 replay-safe chat signing');
   }
-  if (recentMessages.some((m) => m && m.signature === signature)) {
+
+  let version = 1;
+  if (hasV2Fields) {
+    const tsNum = Number(args.timestamp);
+    if (!Number.isInteger(tsNum) || Math.abs(nowSeconds - tsNum) > CHAT_MAX_SKEW_SECONDS) {
+      return reject('stale_timestamp', `Chat timestamp must be within ±${CHAT_MAX_SKEW_SECONDS}s of server time`);
+    }
+    const nonce = String(args.nonce).trim();
+    if (nonce.length > 64 || !/^[A-Za-z0-9._:-]+$/.test(nonce)) {
+      return reject('bad_nonce', 'Chat nonce must be 1–64 alphanumeric/._:- characters');
+    }
+    const envelope = formatChatEnvelope({ address, senderName, timestamp: tsNum, nonce, text });
+    if (!verifyRaw(envelope, signature, address)) {
+      return reject('bad_signature', 'signature does not verify for this POA_DICE_CHAT_V2 envelope and address');
+    }
+    version = 2;
+  } else {
+    if (!verifyRaw(text, signature, address)) {
+      return reject('bad_signature', 'signature does not verify for this text and address (sign the exact UTF-8 text with the key of address, Base58-encode the 64-byte signature)');
+    }
+  }
+
+  const nowMs = nowSeconds * 1000;
+  const seenExp = seenSignatures.get(signature);
+  if ((seenExp && seenExp > nowMs) || recentMessages.some((m) => m && m.signature === signature)) {
     return reject('replayed_signature', 'This signed message was already posted. Sign a new message to post again.');
   }
-  return { valid: true, text, address, signature };
+
+  return { valid: true, version, text, address, signature, senderName };
 }
 
 /** Validates and posts. Returns the stored message or a rejection object (never throws for bad input). */
 export function postSignedChat(engine, args = {}) {
   const v = validateSignedChat(args, { recentMessages: engine.chatMessages });
   if (!v.valid) return v;
-  const name = sanitizeUntrustedText(String(args.sender_name ?? args.senderName ?? ''), CHAT_SENDER_MAX_CHARS);
+  // Record in bounded TTL cache: 24h for legacy raw signatures, 15m (> 2 * skew) for v2 envelopes
+  const ttlMs = v.version === 2 ? (CHAT_MAX_SKEW_SECONDS * 2 + 300) * 1000 : 24 * 60 * 60 * 1000;
+  seenSignatures.set(v.signature, Date.now() + ttlMs);
+  pruneSeenSignatures();
   const message = engine.postChatMessage({
     address: v.address,
-    senderName: name || `Agent-${v.address.slice(4, 10)}`,
+    senderName: v.senderName || `Agent-${v.address.slice(4, 10)}`,
     text: v.text,
     isAgent: true,
     signature: v.signature,
     verified: true
   });
-  return { ok: true, ...message };
+  return { ok: true, envelopeVersion: v.version, ...message };
 }

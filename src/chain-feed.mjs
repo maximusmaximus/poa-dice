@@ -102,7 +102,10 @@ export async function loadTxDetails(row, fetchTx, { maxDetails = 40, coveredStre
     if (!d) {
       looked += 1;
       d = await fetchTx(t.id);
-      if (cache && isCheckpointCovered(d)) cache.set(t.id, d);
+      if (cache && isCheckpointCovered(d)) {
+        if (cache.size >= 2000) cache.delete(cache.keys().next().value);
+        cache.set(t.id, d);
+      }
     }
     details[t.id] = d;
     streak = isCheckpointCovered(d) ? streak + 1 : 0;
@@ -178,27 +181,10 @@ export function normalizeExplorerTx(tx) {
   };
 }
 
-export function spendableMicros(balance, debits, address) {
-  let bal = 0n;
-  try {
-    bal = toMicros(balance || '0');
-  } catch {
-    bal = 0n;
-  }
-  const spent = (debits || [])
-    .filter((d) => d && d.address === address)
-    .reduce((sum, d) => sum + BigInt(d.amountMicros || '0'), 0n);
-  return bal > spent ? bal - spent : 0n;
-}
-
-export function dropConfirmedDebits(debits, seenTxids) {
-  const seen = seenTxids instanceof Set ? seenTxids : new Set(seenTxids || []);
-  return (debits || []).filter((d) => d && !seen.has(d.txid));
-}
-
-export function rememberDebit(debits, entry) {
+export function rememberDebit(debits, entry, maxEntries = 1000) {
   const next = Array.isArray(debits) ? debits.slice() : [];
   if (!next.some((d) => d.txid === entry.txid)) next.push(entry);
+  if (next.length > maxEntries) next.splice(0, next.length - maxEntries);
   return next;
 }
 

@@ -11,19 +11,20 @@
 
 export const CHAT_MAX_CHARS = 240;
 
-/** Local Ed25519 signer (Node 18+, no dependencies). Prints only the Base58 signature. */
+/** Local Ed25519 signer (Node 18+, no dependencies). Supports raw text or --v2 <addr> <name> <ts> <nonce>. */
 export const CHAT_SIGNER_SCRIPT = [
-  `// sign-chat.mjs  usage: node sign-chat.mjs <poa wallet file> "<exact message text>"`,
+  `// sign-chat.mjs  usage: node sign-chat.mjs <poa wallet file> "<exact message text>" [--v2 <addr> <sender_name> <unix_ts> <nonce>]`,
   `import { createPrivateKey, sign } from 'node:crypto';`,
   `import { readFileSync } from 'node:fs';`,
   `const A = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';`,
   `const dec = (s) => { let n = 0n; for (const c of s) { const i = A.indexOf(c); if (i < 0) throw new Error('bad base58'); n = n * 58n + BigInt(i); } const o = []; while (n > 0n) { o.unshift(Number(n % 256n)); n /= 256n; } for (const c of s) { if (c !== '1') break; o.unshift(0); } return Buffer.from(o); };`,
   `const enc = (b) => { let n = BigInt('0x' + (b.toString('hex') || '0')); let s = ''; while (n > 0n) { s = A[Number(n % 58n)] + s; n /= 58n; } for (const x of b) { if (x) break; s = '1' + s; } return s; };`,
-  `const [file, text] = process.argv.slice(2);`,
+  `const [file, text, flag, addr = '', name = '', ts = '', nonce = ''] = process.argv.slice(2);`,
+  `const payload = flag === '--v2' ? \`POA_DICE_CHAT_V2\\n\${addr}\\n\${name}\\n\${Number(ts)}\\n\${nonce}\\n\${text}\` : text;`,
   `const seed = dec(String(JSON.parse(readFileSync(file, 'utf8')).privkey).trim());`,
   `if (seed.length !== 32) throw new Error('expected a 32-byte Ed25519 private key');`,
   `const key = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]), format: 'der', type: 'pkcs8' });`,
-  `console.log(enc(sign(null, Buffer.from(text, 'utf8'), key)));`,
+  `console.log(enc(sign(null, Buffer.from(payload, 'utf8'), key)));`,
 ].join('\n');
 
 /**

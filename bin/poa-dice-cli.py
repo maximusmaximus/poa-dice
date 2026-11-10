@@ -3,9 +3,9 @@
 bin/poa-dice-cli.py — Cross-Platform Zero-Leak Python 3.7+ CLI for POA Dice
 
 Security Invariant:
-  - Never prints, logs, or echoes ~/.poa/key, pk_*, psk_*, or raw private keys.
-  - Works with the poa-dice HTTP API, or delegates to bin/poa-dice-cli.mjs --offline
-    when the website is unreachable, or builds pure DICE1:* on-chain memos.
+  - Never prints, logs, or echoes ~/.poa/key, ~/.poa-dice-wallet/key, pk_*, psk_*, or raw private keys.
+  - Works with the poa-dice HTTP/MCP API, delegates to bin/poa-dice-cli.mjs with local Ed25519 signing,
+    or runs 100% offline (--offline).
 """
 
 from __future__ import annotations
@@ -42,14 +42,15 @@ def redact_secrets(text: str) -> str:
     out = str(text)
     for pat in SECRET_PATTERNS:
         out = pat.sub("[REDACTED_SECRET]", out)
-    key_path = Path.home() / ".poa" / "key"
-    if key_path.is_file():
-        try:
-            raw_key = key_path.read_text(encoding="utf-8").strip()
-            if len(raw_key) >= 16 and raw_key in out:
-                out = out.replace(raw_key, "[REDACTED_WALLET_KEY]")
-        except Exception:
-            pass
+    for rel in ((".poa", "key"), (".poa-dice-wallet", "key")):
+        key_path = Path.home().joinpath(*rel)
+        if key_path.is_file():
+            try:
+                raw_key = key_path.read_text(encoding="utf-8").strip()
+                if len(raw_key) >= 16 and raw_key in out:
+                    out = out.replace(raw_key, "[REDACTED_WALLET_KEY]")
+            except Exception:
+                pass
     return out
 
 
@@ -94,25 +95,25 @@ def run_node_cli(args_list: List[str]) -> Dict[str, Any]:
     )
     raw = redact_secrets(proc.stdout.strip() or proc.stderr.strip())
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if proc.returncode != 0 and "ok" not in parsed:
+            parsed["ok"] = False
+        return parsed
     except Exception:
         return {"ok": proc.returncode == 0, "output": raw}
 
 
 def run_self_test() -> int:
-    # 1. Verify secret redaction
     sample = "secret pk_1234567890abcdefghijklmnop and psk_abcdef1234567890abcdef"
     redacted = redact_secrets(sample)
     assert "pk_1234567890" not in redacted, "pk_ secret leaked"
     assert "psk_abcdef123456" not in redacted, "psk_ secret leaked"
 
-    # 2. Verify deterministic HMAC-SHA256 roll math
     r1 = verify_roll_local("server-seed-alpha", "client-seed-beta", 1, "a" * 64)
     r2 = verify_roll_local("server-seed-alpha", "client-seed-beta", 1, "a" * 64)
     assert r1["rollBps"] == r2["rollBps"], "Roll must be deterministic"
     assert 0 <= r1["rollBps"] <= 9999, "Roll out of bounds"
 
-    # 3. Verify 0.1% dev reserve constant
     assert DEV_RESERVE_ADDRESS == "poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U"
     assert DEV_FEE_BPS == 10
 
@@ -138,16 +139,36 @@ def main() -> int:
         "command",
         nargs="?",
         default="status",
-        help="Command: status, quote-bet, bet, auto-bet, quote-deposit, stake, withdraw, chat, sweep-dev, audit, offline-tx",
+        help=(
+            "Command: status, quote-bet, bet, quote-batch, batch-roll, auto-bet, verify-roll, audit, "
+            "quote-deposit, stake, quote-withdraw, withdraw, claim-yield, position, incentives, "
+            "chat, chat-read, feed, tx-templates, tx-status, wallet-balance, sweep-dev, offline-tx"
+        ),
     )
+    parser.add_argument("--server", default=None, help="POA Dice server URL")
+    parser.add_argument("--node", default=None, help="Minepoa node URL")
+    parser.add_argument("--to", default=None, help="Bank vault address for offline-tx")
+    parser.add_argument("--address", default=None, help="Target POA address")
+    parser.add_argument("--txid", default=None, help="Transaction ID (64 hex)")
+    parser.add_argument("--tool", default=None, help="Tool name for tx-templates")
     parser.add_argument("--amount", default="10.000000", help="Amount in POA")
     parser.add_argument("--under", type=float, default=49.50, help="Roll Under target")
     parser.add_argument("--over", type=float, default=None, help="Roll Over target")
     parser.add_argument("--epochs", type=int, default=4, help="Conviction lock epochs")
     parser.add_argument("--bps", type=int, default=10000, help="Withdraw share basis points (1..10000)")
+    parser.add_argument("--shares", default=None, help="Exact share units to withdraw")
+    parser.add_argument("--count", type=int, default=None, help="Batch roll count")
     parser.add_argument("--seed", default="py-agent-seed-01", help="Client seed")
+    parser.add_argument("--server-seed", dest="server_seed", default=None, help="Revealed server seed")
+    parser.add_argument("--seed-hash", dest="seed_hash", default=None, help="Expected server seed SHA-256")
+    parser.add_argument("--nonce", type=int, default=None, help="Nonce")
     parser.add_argument("--strategy", default="quarter_kelly", help="Auto-bet strategy")
     parser.add_argument("--rolls", type=int, default=5, help="Auto-bet roll count")
+    parser.add_argument("--stop-on-profit", dest="stop_on_profit", default=None, help="Take-profit in POA")
+    parser.add_argument("--stop-on-loss", dest="stop_on_loss", default=None, help="Stop-loss in POA")
+    parser.add_argument("--max-spend", dest="max_spend", default=None, help="Max total spend in POA")
+    parser.add_argument("--sequential", action="store_true", help="Confirm-per-roll sequential batch")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Dry run (claim-yield)")
     parser.add_argument("--message", default="GM from Python agent", help="Chat message")
     parser.add_argument("--offline", action="store_true", help="Force website-independent offline execution")
 
@@ -174,6 +195,29 @@ def main() -> int:
         "--message",
         str(args.message),
     ]
+    optional_pairs = [
+        ("--server", args.server),
+        ("--node", args.node),
+        ("--to", args.to),
+        ("--address", args.address),
+        ("--txid", args.txid),
+        ("--tool", args.tool),
+        ("--shares", args.shares),
+        ("--count", args.count),
+        ("--server-seed", args.server_seed),
+        ("--seed-hash", args.seed_hash),
+        ("--nonce", args.nonce),
+        ("--stop-on-profit", args.stop_on_profit),
+        ("--stop-on-loss", args.stop_on_loss),
+        ("--max-spend", args.max_spend),
+    ]
+    for flag, val in optional_pairs:
+        if val is not None:
+            node_args += [flag, str(val)]
+    if args.sequential:
+        node_args.append("--sequential")
+    if args.dry_run:
+        node_args.append("--dry-run")
     if args.offline:
         node_args.append("--offline")
 

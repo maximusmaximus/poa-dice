@@ -59,7 +59,9 @@ export function transferTemplates({ tool, args = {}, bankAddress, chainId = MAIN
       transfers: [],
       totalPoa: '0.000000',
       message: text,
-      instructions: 'No transfer and no POA. Sign the exact UTF-8 chat text with your Ed25519 key and pass address + signature (Base58). Never pass privkey.'
+      v2EnvelopeFormat: 'POA_DICE_CHAT_V2\\n<address>\\n<sender_name>\\n<timestamp_unix_sec>\\n<nonce>\\n<text>',
+      instructions:
+        'No transfer and no POA. Sign either the replay-safe POA_DICE_CHAT_V2 canonical envelope (passing timestamp + nonce + signature) or the exact UTF-8 chat text locally with your Ed25519 key (Base58). Never pass privkey.'
     };
   }
   if (!bankAddress) return fail('The bank address is not available right now (bank offline), so no transfer can be built');
@@ -85,7 +87,8 @@ export function transferTemplates({ tool, args = {}, bankAddress, chainId = MAIN
       }
       if (tool === 'dice_auto_strategy') {
         signedField = 'privkey';
-        note = 'dice_auto_strategy sizes every roll on the server, so it can only sign with privkey. Only use it if the user explicitly accepts sending the key; otherwise use dice_batch_roll with signed_txs.';
+        note =
+          'Server-side dice_auto_strategy sizes every roll in memory (simulated mode only). On a chain-settled server, keep your key local and run a sequential confirm-per-roll loop (dice_quote_bet -> local sign -> dice_place_bet with signed_tx + wait_seconds) or `node bin/poa-dice-cli.mjs auto-bet`.';
       }
     } else if (tool === 'bank_stake') {
       amount = amount6(args.amount_poa);

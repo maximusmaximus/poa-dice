@@ -58,9 +58,10 @@ export const VIP_TIERS = [
 export class BankrollEngine {
   constructor(options = {}) {
     this.dataDir = options.dataDir || null;
+    this.externalPersistence = Boolean(options.externalPersistence);
     this.bankAddress = options.bankAddress || DEFAULT_BANK_ADDRESS;
     this.devReserveAddress = DEV_RESERVE_ADDRESS; // Locked to Max's PoA address
-    this.devFeeMode = options.devFeeMode || 'gross_and_earnings'; // 'gross_and_earnings' | 'net_profit_only'
+    this.devFeeMode = options.devFeeMode || process.env.POA_DICE_DEV_FEE_MODE || 'gross_and_earnings'; // 'gross_and_earnings' | 'net_profit_only'
     this.maxBankrollCapMicros = toMicros(options.maxBankrollCapPoa ?? '500000000.000000');
     this.kellyMaxProfitBps = BigInt(options.kellyMaxProfitBps ?? KELLY_MAX_PROFIT_BPS);
     this.currentEpoch = Number(options.currentEpoch ?? 1);
@@ -399,6 +400,7 @@ export class BankrollEngine {
         shares: 0n,
         principalDepositedMicros: 0n,
         principalWithdrawnMicros: 0n,
+        yieldWithdrawnMicros: 0n,
         netInvestedMicros: 0n,
         incentivesEarnedMicros: 0n,
         referralEarnedMicros: 0n,
@@ -581,6 +583,13 @@ export class BankrollEngine {
 
   _executeImmediateWithdraw({ txid, address, redeemShares, triggerRefundMicros = 0n, ts }) {
     const pos = this.lpPositions.get(address);
+    const posValueBefore = this.microsForShares(pos.shares);
+    const costBasisBefore =
+      pos.principalDepositedMicros > pos.principalWithdrawnMicros
+        ? pos.principalDepositedMicros - pos.principalWithdrawnMicros
+        : 0n;
+    const unrealizedGainBefore = posValueBefore > costBasisBefore ? posValueBefore - costBasisBefore : 0n;
+
     const grossMicros = this.microsForShares(redeemShares);
     const lastDepEpoch = pos.lastDepositEpoch ?? pos.stakedAtEpoch ?? this.currentEpoch;
     const sameEpochExit = this.currentEpoch <= lastDepEpoch;
@@ -588,9 +597,14 @@ export class BankrollEngine {
     const exitFeeMicros = (grossMicros * exitFeeBps) / 10000n;
     const netPayoutMicros = grossMicros - exitFeeMicros;
 
+    // Deduct realized yield above cost basis first so pure yield claims never erode staked principal.
+    const yieldPortion = netPayoutMicros <= unrealizedGainBefore ? netPayoutMicros : unrealizedGainBefore;
+    const principalPortion = netPayoutMicros - yieldPortion;
+
     pos.shares -= redeemShares;
-    pos.principalWithdrawnMicros += netPayoutMicros;
-    pos.netInvestedMicros = pos.netInvestedMicros > netPayoutMicros ? pos.netInvestedMicros - netPayoutMicros : 0n;
+    pos.yieldWithdrawnMicros = (pos.yieldWithdrawnMicros || 0n) + yieldPortion;
+    pos.principalWithdrawnMicros += principalPortion;
+    pos.netInvestedMicros = pos.netInvestedMicros > principalPortion ? pos.netInvestedMicros - principalPortion : 0n;
     pos.updatedAt = ts;
 
     this.totalShares -= redeemShares;
@@ -672,6 +686,9 @@ export class BankrollEngine {
         currentValuePoa: '0.000000',
         principalDepositedPoa: pos ? fromMicros(pos.principalDepositedMicros) : '0.000000',
         principalWithdrawnPoa: pos ? fromMicros(pos.principalWithdrawnMicros) : '0.000000',
+        netPrincipalPoa: '0.000000',
+        yieldWithdrawnPoa: pos ? fromMicros(pos.yieldWithdrawnMicros || 0n) : '0.000000',
+        claimableYieldPoa: '0.000000',
         unrealizedPnlPoa: '0.000000',
         convictionMultiplier: '1.00x',
         vipTier: this.getVipTierForAddress(address)
@@ -679,8 +696,14 @@ export class BankrollEngine {
     }
     const currentValueMicros = this.microsForShares(pos.shares);
     const shareOfLpPct = this.totalShares > 0n ? Number((pos.shares * 1000000n) / this.totalShares) / 10000 : 0;
-    const totalRealizedAndCurrent = currentValueMicros + pos.principalWithdrawnMicros;
+    const yieldWithdrawn = pos.yieldWithdrawnMicros || 0n;
+    const totalRealizedAndCurrent = currentValueMicros + pos.principalWithdrawnMicros + yieldWithdrawn;
     const netPnlMicros = totalRealizedAndCurrent - pos.principalDepositedMicros;
+    const costBasisMicros =
+      pos.principalDepositedMicros > pos.principalWithdrawnMicros
+        ? pos.principalDepositedMicros - pos.principalWithdrawnMicros
+        : 0n;
+    const claimableYieldMicros = currentValueMicros > costBasisMicros ? currentValueMicros - costBasisMicros : 0n;
     const convBps = this.convictionMultiplierBps(pos);
 
     return {
@@ -692,6 +715,9 @@ export class BankrollEngine {
       currentValueMicros: currentValueMicros.toString(),
       principalDepositedPoa: fromMicros(pos.principalDepositedMicros),
       principalWithdrawnPoa: fromMicros(pos.principalWithdrawnMicros),
+      netPrincipalPoa: fromMicros(costBasisMicros),
+      yieldWithdrawnPoa: fromMicros(yieldWithdrawn),
+      claimableYieldPoa: fromMicros(claimableYieldMicros),
       netPnlPoa: fromMicros(netPnlMicros),
       incentivesEarnedPoa: fromMicros(pos.incentivesEarnedMicros),
       referralEarnedPoa: fromMicros(pos.referralEarnedMicros),
@@ -739,9 +765,10 @@ export class BankrollEngine {
 
     // 0.1% (10 bps) Dev Reserve for poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U
     const devFeeMicros = amountMicros > 0n ? (amountMicros * DEV_FEE_BPS >= 10000n ? (amountMicros * DEV_FEE_BPS) / 10000n : 1n) : 0n;
+    const winCaseDevFeeMicros = this.devFeeMode === 'net_profit_only' ? 0n : devFeeMicros;
     // 0.05% (5 bps) Agent Staking Incentive Pool
     const incentiveFeeMicros = (amountMicros * INCENTIVE_POOL_BPS) / 10000n;
-    const requiredBankLockMicros = profitMicros + devFeeMicros + incentiveFeeMicros;
+    const requiredBankLockMicros = profitMicros + winCaseDevFeeMicros + incentiveFeeMicros;
 
     const minBetOk = amountMicros >= MIN_BET_MICROS;
     const maxProfitOk = profitMicros <= maxProfitMicros && requiredBankLockMicros <= availMicros && availMicros > 0n;
@@ -781,7 +808,9 @@ export class BankrollEngine {
       profitOnWinPoa: fromMicros(profitMicros),
       profitOnWinMicros: profitMicros.toString(),
       expectedValuePoa: `-${fromMicros(expectedLossMicros)}`,
+      devFeeMode: this.devFeeMode,
       devReserveFeePoa: fromMicros(devFeeMicros),
+      devFeeOnWinPoa: fromMicros(winCaseDevFeeMicros),
       devReserveAddress: this.devReserveAddress,
       incentivePoolFeePoa: fromMicros(incentiveFeeMicros),
       maxAllowedWagerPoa: fromMicros(maxWagerMicros),
@@ -1203,10 +1232,19 @@ export class BankrollEngine {
       this.totalDevSweptMicros += fromDev;
       remaining -= fromDev;
     }
-    let fromNav = remaining > this.bankNavMicros ? this.bankNavMicros : remaining;
+    const minNavFloor = this.lockedCollateralMicros > 0n && this.bankNavMicros >= this.lockedCollateralMicros ? this.lockedCollateralMicros : 0n;
+    const freeNav = this.bankNavMicros > minNavFloor ? this.bankNavMicros - minNavFloor : 0n;
+    let fromNav = remaining > freeNav ? freeNav : remaining;
     this.bankNavMicros -= fromNav;
     this.netHouseProfitMicros -= fromNav;
-    const uncovered = remaining - fromNav;
+    remaining -= fromNav;
+    let fromIncentive = 0n;
+    if (remaining > 0n && this.incentivePoolMicros > 0n) {
+      fromIncentive = remaining > this.incentivePoolMicros ? this.incentivePoolMicros : remaining;
+      this.incentivePoolMicros -= fromIncentive;
+      remaining -= fromIncentive;
+    }
+    const uncovered = remaining;
     const rec = {
       kind: 'UNMATCHED_OUTFLOW',
       to,
@@ -1214,11 +1252,12 @@ export class BankrollEngine {
       amountPoa: fromMicros(BigInt(amountMicros)),
       fromDevReservePoa: fromMicros(fromDev),
       bankDeductionPoa: fromMicros(fromNav),
+      incentiveDeductionPoa: fromMicros(fromIncentive),
       uncoveredPoa: fromMicros(uncovered),
       at: ts
     };
     this.recoveredOutflows.set(txid, rec);
-    if (this.lockedCollateralMicros > this.bankNavMicros) this.lockedCollateralMicros = this.bankNavMicros;
+    this._syncLocked();
     this.assertAccountingInvariant();
     this._saveToDisk();
     this._emit('bank.reconciled', { txid, ...rec });
@@ -1403,8 +1442,10 @@ export class BankrollEngine {
       const minerBps = pos.isPoaMiner ? 11000n : 10000n; // +10% for active PoA miners
       const w = (pos.shares * convBps * minerBps) / 100000000n;
       if (w > 0n) {
-        weights.push({ pos, weight: w });
-        totalWeight += w;
+        const refPos = pos.referrer && this.lpPositions.has(pos.referrer) ? this.lpPositions.get(pos.referrer) : null;
+        const refWeight = refPos ? w / 10n : 0n;
+        weights.push({ pos, weight: w, refPos, refWeight });
+        totalWeight += w + refWeight;
       }
     }
 
@@ -1412,22 +1453,26 @@ export class BankrollEngine {
       return { distributedPoa: '0.000000', recipients: 0 };
     }
 
+    const nav0 = this.bankNavMicros;
+    const shares0 = this.totalShares;
     let totalAllocated = 0n;
+    const shareCredits = new Map(); // pos -> creditMicros
     const payouts = [];
-    for (const { pos, weight } of weights) {
+    for (const { pos, weight, refPos, refWeight } of weights) {
       const rewardMicros = (poolToDistribute * weight) / totalWeight;
       if (rewardMicros <= 0n) continue;
       totalAllocated += rewardMicros;
       pos.incentivesEarnedMicros += rewardMicros;
+      shareCredits.set(pos, (shareCredits.get(pos) || 0n) + rewardMicros);
 
-      // Syndicate Referral Bonus: if referred, referrer gets 10% bonus carved from remaining pool/protocol
+      // Syndicate Referral Bonus: included in totalWeight so totalAllocated <= poolToDistribute always holds
       let refBonusMicros = 0n;
-      if (pos.referrer && this.lpPositions.has(pos.referrer)) {
-        const refPos = this.lpPositions.get(pos.referrer);
-        refBonusMicros = rewardMicros / 10n;
-        if (totalAllocated + refBonusMicros <= poolToDistribute) {
+      if (refPos && refWeight > 0n) {
+        refBonusMicros = (poolToDistribute * refWeight) / totalWeight;
+        if (refBonusMicros > 0n && totalAllocated + refBonusMicros <= poolToDistribute) {
           totalAllocated += refBonusMicros;
           refPos.referralEarnedMicros += refBonusMicros;
+          shareCredits.set(refPos, (shareCredits.get(refPos) || 0n) + refBonusMicros);
         } else {
           refBonusMicros = 0n;
         }
@@ -1441,7 +1486,19 @@ export class BankrollEngine {
       });
     }
 
-    // Reinvest distributed incentives directly into bankNavMicros so all LP shares appreciate compounding!
+    // Mint dilution-free shares at the pre-distribution price so conviction, miner, and referral
+    // multipliers translate directly into differential redeemable LP equity while preserving share invariants.
+    const denomNav = nav0 > 0n ? nav0 : totalAllocated;
+    if (shares0 > 0n && denomNav > 0n) {
+      for (const [recipientPos, creditMicros] of shareCredits.entries()) {
+        const bonusShares = (creditMicros * shares0) / denomNav;
+        if (bonusShares > 0n) {
+          recipientPos.shares += bonusShares;
+          this.totalShares += bonusShares;
+        }
+      }
+    }
+
     this.incentivePoolMicros -= totalAllocated;
     this.bankNavMicros += totalAllocated;
     this.totalIncentivesDistributedMicros += totalAllocated;
@@ -1769,7 +1826,13 @@ export class BankrollEngine {
       devFeeMode: this.devFeeMode,
       bankNavMicros: this.bankNavMicros.toString(),
       // Locks of bets being settled right now; reservations are rebuilt from the open bets on load.
-      lockedCollateralMicros: (this.derivedLockedMicros() - this.reservedExposureMicros).toString(),
+      lockedCollateralMicros: (
+        this.derivedLockedMicros() > this.reservedExposureMicros
+          ? (this.derivedLockedMicros() - this.reservedExposureMicros > this.bankNavMicros
+              ? this.bankNavMicros
+              : this.derivedLockedMicros() - this.reservedExposureMicros)
+          : 0n
+      ).toString(),
       totalShares: this.totalShares.toString(),
       devReserveMicros: this.devReserveMicros.toString(),
       totalDevEarnedMicros: this.totalDevEarnedMicros.toString(),
@@ -1788,6 +1851,7 @@ export class BankrollEngine {
           shares: v.shares.toString(),
           principalDepositedMicros: v.principalDepositedMicros.toString(),
           principalWithdrawnMicros: v.principalWithdrawnMicros.toString(),
+          yieldWithdrawnMicros: (v.yieldWithdrawnMicros || 0n).toString(),
           netInvestedMicros: v.netInvestedMicros.toString(),
           incentivesEarnedMicros: v.incentivesEarnedMicros.toString(),
           referralEarnedMicros: v.referralEarnedMicros.toString()
@@ -1822,6 +1886,7 @@ export class BankrollEngine {
       } catch {
         // the settlement store reports its own errors
       }
+      if (this.externalPersistence) return;
     }
     if (!this.dataDir) return;
     try {
@@ -1864,7 +1929,11 @@ export class BankrollEngine {
       storedLocked = null;
     }
     this._syncLocked();
-    const storedExpected = this.derivedLockedMicros() - this.reservedExposureMicros;
+    const rawUnreserved =
+      this.derivedLockedMicros() > this.reservedExposureMicros
+        ? this.derivedLockedMicros() - this.reservedExposureMicros
+        : 0n;
+    const storedExpected = rawUnreserved > this.bankNavMicros ? this.bankNavMicros : rawUnreserved;
     if (storedLocked !== storedExpected) {
       this.lockHeal = { at: Date.now(), storedMicros: storedLocked === null ? null : storedLocked.toString(), correctedMicros: storedExpected.toString() };
       this._emit('bank.locked_collateral_healed', this.lockHeal);
@@ -1890,6 +1959,7 @@ export class BankrollEngine {
           shares: BigInt(v.shares || 0),
           principalDepositedMicros: BigInt(v.principalDepositedMicros || 0),
           principalWithdrawnMicros: BigInt(v.principalWithdrawnMicros || 0),
+          yieldWithdrawnMicros: BigInt(v.yieldWithdrawnMicros || 0),
           netInvestedMicros: BigInt(v.netInvestedMicros || 0),
           incentivesEarnedMicros: BigInt(v.incentivesEarnedMicros || 0),
           referralEarnedMicros: BigInt(v.referralEarnedMicros || 0)

@@ -208,7 +208,7 @@
       <details class="builder-step auto-step">
         <summary class="step-head"><span class="step-num">+</span> Agent auto-bet strategy (1–25 rolls)</summary>
         <div class="auto-grid">
-          <label>Strategy
+          <label for="autoStrategySelect">Strategy
             <select id="autoStrategySelect" class="seed-input">
               <option value="flat">flat</option>
               <option value="quarter_kelly">quarter_kelly</option>
@@ -216,7 +216,7 @@
               <option value="paroli">paroli</option>
             </select>
           </label>
-          <label>Rolls <input type="number" id="autoRollsInput" class="seed-input" min="1" max="25" step="1" value="5" /></label>
+          <label for="autoRollsInput">Rolls <input type="number" id="autoRollsInput" class="seed-input" min="1" max="25" step="1" value="5" /></label>
         </div>
         <button type="button" id="btnCopyAutoPrompt" class="btn-action-cyan" data-copy-action="autoBet">Copy auto-bet prompt</button>
         <p id="autoBetReason" class="action-reason hidden" role="status"></p>
@@ -244,14 +244,14 @@
 
     <!-- FEED: live chat, live bets and the provably fair verifier -->
     <section class="panel panel-feed" aria-label="Near Real-Time Activity &amp; Signed Agent Chat">
-      <div class="tab-bar">
-        <button type="button" class="tab-btn active" data-feed-tab="chat">💬 Live Chat (<span id="chatCountBadge">1</span>)</button>
-        <button type="button" class="tab-btn" data-feed-tab="bets">⚡ Live Bets (<span id="betsCountBadge">0</span>)</button>
-        <button type="button" class="tab-btn" data-feed-tab="verify">🔍 Verify Roll</button>
+      <div class="tab-bar" role="tablist" aria-label="Activity tabs">
+        <button type="button" class="tab-btn active" role="tab" aria-selected="true" aria-controls="feedTabChat" data-feed-tab="chat">💬 Live Chat (<span id="chatCountBadge">1</span>)</button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="feedTabBets" data-feed-tab="bets">⚡ Live Bets (<span id="betsCountBadge">0</span>)</button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="feedTabVerify" data-feed-tab="verify">🔍 Verify Roll</button>
       </div>
 
       <!-- FEED TAB 1: LIVE AGENT CHAT (read-only here; agents post signed messages over MCP) -->
-      <div id="feedTabChat" class="feed-tab-body">
+      <div id="feedTabChat" class="feed-tab-body" role="tabpanel">
         <div id="chatMessagesList" class="chat-messages-list" aria-live="polite" aria-label="Live chat messages"></div>
         <section class="chat-join" aria-labelledby="chatJoinTitle">
           <div class="chat-join-head">
@@ -264,7 +264,7 @@
       </div>
 
       <!-- FEED TAB 2: NEAR REAL-TIME BETS & BANK ACTIONS -->
-      <div id="feedTabBets" class="feed-tab-body hidden">
+      <div id="feedTabBets" class="feed-tab-body hidden" role="tabpanel">
         <div class="table-scroll feed-scroll">
           <table class="data-table">
             <thead>
@@ -282,7 +282,7 @@
       </div>
 
       <!-- FEED TAB 3: PROVABLY FAIR VERIFIER -->
-      <div id="feedTabVerify" class="feed-tab-body hidden">
+      <div id="feedTabVerify" class="feed-tab-body hidden" role="tabpanel">
         <div class="verifier-card">
           <div class="verifier-header">
             <strong>Cryptographic Commit-Reveal Verifier</strong>
@@ -294,29 +294,29 @@
             <code>Roll = (w mod 10000) / 100</code>. Paste a revealed <code>server_seed</code> to check any past roll.
           </p>
           <div class="verifier-inputs">
-            <label>Server Seed (Plaintext after reveal)</label>
+            <label for="verifyServerSeed">Server Seed (Plaintext after reveal)</label>
             <input type="text" id="verifyServerSeed" class="seed-input" placeholder="Paste a revealed server seed" />
-            <label>Expected Server Seed SHA-256 Hash</label>
+            <label for="verifyServerSeedHash">Expected Server Seed SHA-256 Hash</label>
             <input type="text" id="verifyServerSeedHash" class="seed-input" />
             <div class="verifier-row-2">
               <div>
-                <label>Client Seed</label>
+                <label for="verifyClientSeed">Client Seed</label>
                 <input type="text" id="verifyClientSeed" class="seed-input" value="" placeholder="client seed" />
               </div>
               <div>
-                <label>Nonce</label>
+                <label for="verifyNonce">Nonce</label>
                 <input type="number" id="verifyNonce" class="seed-input" value="1" />
               </div>
             </div>
-            <label>Bet Transaction ID (<code>bet_txid</code>)</label>
+            <label for="verifyBetTxid">Bet Transaction ID (<code>bet_txid</code>)</label>
             <input type="text" id="verifyBetTxid" class="seed-input" placeholder="64-hex POA transaction ID" />
             <div class="verifier-row-2">
               <div>
-                <label>Target (bps)</label>
+                <label for="verifyTargetBps">Target (bps)</label>
                 <input type="number" id="verifyTargetBps" class="seed-input" value="4950" />
               </div>
               <div>
-                <label>Direction</label>
+                <label for="verifyDirection">Direction</label>
                 <select id="verifyDirection" class="seed-input">
                   <option value="under">under</option>
                   <option value="over">over</option>
@@ -363,14 +363,14 @@
       </div>
 
       <!-- Deposit & Withdraw Tabs -->
-      <div class="tab-bar">
-        <button type="button" class="tab-btn active" data-bank-tab="deposit">➕ Add Funds to Bank (Stake)</button>
-        <button type="button" class="tab-btn" data-bank-tab="withdraw">📤 Withdraw Share &amp; Profit</button>
-        <button type="button" class="tab-btn" data-bank-tab="incentives">⚡ Agent Staking Incentives</button>
+      <div class="tab-bar" role="tablist" aria-label="Bankroll vault tabs">
+        <button type="button" class="tab-btn active" role="tab" aria-selected="true" aria-controls="bankTabDeposit" data-bank-tab="deposit">➕ Add Funds to Bank (Stake)</button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="bankTabWithdraw" data-bank-tab="withdraw">📤 Withdraw Share &amp; Profit</button>
+        <button type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="bankTabIncentives" data-bank-tab="incentives">⚡ Agent Staking Incentives</button>
       </div>
 
       <!-- TAB 1: DEPOSIT CALCULATOR -->
-      <div id="bankTabDeposit" class="bank-tab-body">
+      <div id="bankTabDeposit" class="bank-tab-body" role="tabpanel">
         <div class="control-group">
           <div class="control-label-row">
             <label for="depositAmountInput">DEPOSIT AMOUNT (POA)</label>
@@ -441,7 +441,7 @@
       </div>
 
       <!-- TAB 2: WITHDRAWAL CALCULATOR -->
-      <div id="bankTabWithdraw" class="bank-tab-body hidden">
+      <div id="bankTabWithdraw" class="bank-tab-body hidden" role="tabpanel">
         <div class="control-group">
           <div class="control-label-row">
             <label>PERCENTAGE OF YOUR BANK SHARES TO WITHDRAW</label>
@@ -489,7 +489,7 @@
       </div>
 
       <!-- TAB 3: AGENT STAKING INCENTIVE STRATEGY -->
-      <div id="bankTabIncentives" class="bank-tab-body hidden">
+      <div id="bankTabIncentives" class="bank-tab-body hidden" role="tabpanel">
         <div class="incentives-list">
           <div class="incentive-item">
             <strong>1. Conviction Time-Weight Multiplier (1.00x → 1.50x)</strong>
@@ -551,14 +551,14 @@
       </div>
       <div class="mcp-card mcp-grid">
         <div class="mcp-col">
-          <label class="metric-label">1. STREAMABLE HTTP MCP ENDPOINT:</label>
-          <pre class="code-block" id="mcpEndpointPre">POST /mcp (19 tools: dice_batch_roll, dice_quote_batch, dice_status, dice_quote_bet, dice_place_bet, dice_auto_strategy, dice_verify_roll, dice_audit_solvency, bank_quote_deposit, bank_stake, bank_quote_withdraw, bank_withdraw, bank_claim_yield, bank_position, bank_incentives_info, chat_read, chat_send, feed_recent, offline_memo_builder)
+          <span class="metric-label">1. STREAMABLE HTTP MCP ENDPOINT:</span>
+          <pre class="code-block" id="mcpEndpointPre">POST /mcp (22 tools: dice_batch_roll, dice_quote_batch, dice_status, dice_quote_bet, dice_place_bet, dice_auto_strategy, dice_verify_roll, dice_audit_solvency, bank_quote_deposit, bank_stake, bank_quote_withdraw, bank_withdraw, bank_claim_yield, bank_position, bank_incentives_info, chat_read, chat_send, feed_recent, tx_templates, tx_status, wallet_balance, offline_memo_builder)
 Every "Copy … prompt" button on this page writes a ready-to-paste prompt for one of these tools.</pre>
-          <label class="metric-label">2. STDIO MCP (WORKS WITHOUT WEB SERVER):</label>
+          <span class="metric-label">2. STDIO MCP (WORKS WITHOUT WEB SERVER):</span>
           <pre class="code-block">node src/mcp-server.mjs --stdio</pre>
         </div>
         <div class="mcp-col">
-          <label class="metric-label">3. HEADLESS CLI &amp; LEDGER REPLAY AUDIT:</label>
+          <span class="metric-label">3. HEADLESS CLI &amp; LEDGER REPLAY AUDIT:</span>
           <pre class="code-block">node bin/poa-dice-cli.mjs status
 node bin/poa-dice-cli.mjs bet --amount 10.000000 --under 49.50
 node bin/poa-dice-cli.mjs auto-bet --strategy quarter_kelly --rolls 5
@@ -566,7 +566,7 @@ node bin/poa-dice-cli.mjs stake --amount 1000.000000 --epochs 4
 node bin/poa-dice-cli.mjs audit
 python bin/poa-dice-cli.py status
 node bin/poa-dice-replay.mjs</pre>
-          <label class="metric-label">4. RESERVED 0.1% DEV ADDRESS (CONVERSATION 414e1682):</label>
+          <span class="metric-label">4. RESERVED 0.1% DEV ADDRESS:</span>
           <pre class="code-block">poa12XVYtPngbDsm1igG9GPeWPXAHDFTZ1bBLuSwhjqBrQ5U (10 bps isolated reserve)</pre>
         </div>
         <!-- Website-independent memo command -->

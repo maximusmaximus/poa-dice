@@ -47,24 +47,38 @@ import path from 'node:path';
 
 export function createFileStore(dir, name = 'settlement.json') {
   const file = path.join(dir, name);
+  let fence = null;
+  const assertFileFence = (kind = 'vault') => {
+    if (!fence) return;
+    const lf = path.join(dir, 'claims', `lease-${claimFileName(fence.name)}.json`);
+    const book = fs.existsSync(lf) ? JSON.parse(fs.readFileSync(lf, 'utf8')) : null;
+    if (!book || book.holder !== fence.holder || Number(book.token) !== Number(fence.token) || Number(book.expiresAt || 0) <= Date.now()) {
+      throw Object.assign(new Error(`${kind} write fenced off: this instance no longer holds the bank writer lease`), { fenced: true });
+    }
+  };
   return {
     kind: 'file',
     location: file,
     durable: true,
+    setFence(f) {
+      fence = f ? { ...f } : null;
+    },
     load() {
       if (!fs.existsSync(file)) return null;
       return JSON.parse(fs.readFileSync(file, 'utf8'));
     },
     save(doc) {
+      assertFileFence('vault');
       fs.mkdirSync(dir, { recursive: true });
       const tmp = `${file}.${process.pid}.tmp`;
       const fd = fs.openSync(tmp, 'w');
       try {
-        fs.writeSync(fd, JSON.stringify(doc, null, 2));
+        fs.writeSync(fd, typeof doc === 'string' ? doc : JSON.stringify(doc, null, 2));
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
+      assertFileFence('vault');
       fs.renameSync(tmp, file);
     },
     claim(key, value) {
@@ -99,6 +113,33 @@ export function createFileStore(dir, name = 'settlement.json') {
       const f = path.join(dir, 'claims', `${claimFileName(key)}.json`);
       return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
     },
+    listClaims(prefix = '') {
+      const cdir = path.join(dir, 'claims');
+      if (!fs.existsSync(cdir)) return [];
+      const safePrefix = claimFileName(prefix);
+      const out = [];
+      for (const entry of fs.readdirSync(cdir)) {
+        if (!entry.endsWith('.json') || entry.startsWith('cap-') || entry.startsWith('lease-') || entry.startsWith('status-')) continue;
+        const base = entry.slice(0, -5);
+        if (safePrefix && !base.startsWith(safePrefix)) continue;
+        try {
+          const val = JSON.parse(fs.readFileSync(path.join(cdir, entry), 'utf8'));
+          const reconstructedKey = prefix && base.startsWith(safePrefix) ? prefix + base.slice(safePrefix.length) : base;
+          out.push({ key: reconstructedKey, value: val });
+        } catch {
+          // ignore partial/removed claim file
+        }
+      }
+      return out;
+    },
+    deleteClaim(key) {
+      const f = path.join(dir, 'claims', `${claimFileName(key)}.json`);
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {
+        // ignore
+      }
+    },
     lease(name, holder, ttlMs) {
       return withFileLock(dir, `lease-${claimFileName(name)}`, (book) => leaseBook(book, holder, ttlMs, Date.now()));
     },
@@ -111,6 +152,7 @@ export function createFileStore(dir, name = 'settlement.json') {
       });
     },
     putStatus(name, value) {
+      assertFileFence('status');
       return withFileLock(dir, `status-${claimFileName(name)}`, (book) => {
         for (const k of Object.keys(book)) delete book[k];
         Object.assign(book, { value: JSON.parse(JSON.stringify(value)) });
@@ -248,6 +290,23 @@ export function createMemoryStore(initial = null, { claims = createClaimTable() 
     peek(key) {
       return claims.has(key) ? JSON.parse(claims.get(key)) : null;
     },
+    listClaims(prefix = '') {
+      const out = [];
+      for (const [k, raw] of claims.entries()) {
+        if (k.startsWith('__capacity__:') || k.startsWith('__lease__:') || k.startsWith('__status__:')) continue;
+        if (prefix && !k.startsWith(prefix)) continue;
+        try {
+          out.push({ key: k, value: typeof raw === 'string' ? JSON.parse(raw) : raw });
+        } catch {
+          // ignore non-JSON internal entries
+        }
+      }
+      return out;
+    },
+    deleteClaim(key) {
+      if (key.startsWith('__')) return;
+      claims.delete(key);
+    },
     lease(name, holder, ttlMs) {
       const k = `__lease__:${name}`;
       const book = claims.has(k) ? JSON.parse(claims.get(k)) : {};
@@ -329,17 +388,20 @@ export function createRedisRestStore({ url, token, key, fetchImpl = globalThis.f
     }
     throw lastErr;
   };
+  const defaultRedisSave = async (doc) => {
+    await call(['SET', key, typeof doc === 'string' ? doc : JSON.stringify(doc)]);
+  };
   return {
     kind: 'redis',
     location: `${base.replace(/^https?:\/\//, '').split('/')[0]}#${key}`,
     durable: true,
+    acceptsJsonString: true,
+    _defaultSave: defaultRedisSave,
     async load() {
       const raw = await call(['GET', key]);
       return raw ? JSON.parse(raw) : null;
     },
-    async save(doc) {
-      await call(['SET', key, JSON.stringify(doc)]);
-    },
+    save: defaultRedisSave,
     async claim(claimKey, value) {
       const k = `${key}:claim:${claimKey}`;
       const ok = await call(['SET', k, JSON.stringify(value), 'NX']);
@@ -347,6 +409,9 @@ export function createRedisRestStore({ url, token, key, fetchImpl = globalThis.f
       const raw = await call(['GET', k]);
       if (!raw) throw new Error(`KV claim ${claimKey}: SET NX refused but no value stored`);
       return { claimed: false, value: JSON.parse(raw) };
+    },
+    async deleteClaim(claimKey) {
+      await call(['DEL', `${key}:claim:${claimKey}`]);
     },
     // Lua runs atomically in Redis: sum live reservations, add only if within the limit.
     async reserveCapacity(scope, rkey, micros, limitMicros, ttlMs = 30 * 60 * 1000) {
@@ -409,26 +474,63 @@ const PG_SCHEMA = [
   'CREATE TABLE IF NOT EXISTS poa_dice_leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)',
   'CREATE TABLE IF NOT EXISTS poa_dice_status (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())'
 ];
+const PG_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS poa_dice_reservations_scope_exp_idx ON poa_dice_reservations (scope, expires_at)'
+];
 
 /** Postgres "it already exists" races during CREATE ... IF NOT EXISTS: unique_violation (pg_type/pg_class), duplicate_table, duplicate_object. */
 export function isPgAlreadyExists(err) {
   return Boolean(err) && ['23505', '42P07', '42710'].includes(String(err.code || ''));
 }
 
+function parseLeaseExpiryMs(row, fallbackTtlMs = 0) {
+  if (!row) return 0;
+  if (row.remaining_ms !== undefined && row.remaining_ms !== null) {
+    const rem = Number(row.remaining_ms);
+    if (Number.isFinite(rem)) return Date.now() + rem;
+  }
+  if (row.expires_ms !== undefined && row.expires_ms !== null) {
+    const abs = Number(row.expires_ms);
+    if (Number.isFinite(abs)) return abs;
+  }
+  if (row.expires_at) {
+    const parsed = new Date(row.expires_at).getTime();
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallbackTtlMs > 0 ? Date.now() + fallbackTtlMs : 0;
+}
+
 export function createPostgresStore({ connectionString, key, query = null }) {
   if (!query && !connectionString) throw new Error('Postgres store needs a connection string');
   let pool = null;
+  let poolPromise = null;
   let ready = null;
   let fakeTx = Promise.resolve(); // serializes transactions when a custom query fn is injected (tests)
   const getPool = async () => {
-    if (!pool) {
-      const pg = await import('pg');
-      const Pool = pg.Pool || pg.default.Pool;
-      pool = new Pool({ connectionString, max: 3, ssl: /sslmode=disable|localhost|127\.0\.0\.1/.test(connectionString) ? false : { rejectUnauthorized: false } });
-      // An idle connection dropped by the server must not crash the process; the next query reconnects.
-      pool.on('error', () => {});
+    if (pool) return pool;
+    if (!poolPromise) {
+      poolPromise = (async () => {
+        const pg = await import('pg');
+        const Pool = pg.Pool || pg.default.Pool;
+        const localNoSsl = /sslmode=disable|localhost|127\.0\.0\.1/.test(connectionString);
+        const strictSsl = process.env.POA_DICE_PG_SSL_STRICT === '1' || /sslmode=verify-(ca|full)/.test(connectionString);
+        const created = new Pool({
+          connectionString,
+          max: 3,
+          connectionTimeoutMillis: 10000,
+          idleTimeoutMillis: 30000,
+          ssl: localNoSsl ? false : { rejectUnauthorized: strictSsl }
+        });
+        // An idle connection dropped by the server must not crash the process; the next query reconnects.
+        created.on('error', () => {});
+        pool = created;
+        return created;
+      })().catch((err) => {
+        poolPromise = null;
+        throw err;
+      });
     }
-    return pool;
+    return poolPromise;
   };
   const q = async (text, params) => {
     if (query) return query(text, params);
@@ -465,6 +567,9 @@ export function createPostgresStore({ connectionString, key, query = null }) {
           await tx(async (tq) => {
             await tq('SELECT pg_advisory_xact_lock($1)', [PG_SCHEMA_LOCK_KEY]);
             for (const sql of PG_SCHEMA) await tq(sql);
+            if (!query) {
+              for (const sql of PG_INDEXES) await tq(sql);
+            }
           });
         } catch (err) {
           if (!isPgAlreadyExists(err)) throw err;
@@ -480,13 +585,31 @@ export function createPostgresStore({ connectionString, key, query = null }) {
     return ready;
   };
   let fence = null; // {name, holder, token}: document writes only land while this lease is held
+  const defaultPgSave = async (doc) => {
+    await init();
+    const jsonStr = typeof doc === 'string' ? doc : JSON.stringify(doc);
+    if (!fence) {
+      await q('INSERT INTO poa_dice_docs (key, doc, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()', [key, jsonStr]);
+      return;
+    }
+    // Fenced write: lands only while our lease (same holder, same token) is still live.
+    const r = await q(
+      'INSERT INTO poa_dice_docs (key, doc, updated_at) SELECT $1, $2::jsonb, now() WHERE EXISTS (SELECT 1 FROM poa_dice_leases WHERE key = $3 AND holder = $4 AND token = $5 AND expires_at > now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now() RETURNING key',
+      [key, jsonStr, `${key}:${fence.name}`, fence.holder, String(fence.token)]
+    );
+    if (!r.rows || !r.rows.length) throw Object.assign(new Error('vault write fenced off: this instance no longer holds the bank writer lease'), { fenced: true });
+  };
   return {
     kind: 'postgres',
+    acceptsJsonString: true,
+    _defaultSave: defaultPgSave,
     async close() {
-      if (pool) {
-        const p = pool;
-        pool = null;
-        ready = null;
+      const pending = poolPromise;
+      poolPromise = null;
+      ready = null;
+      const p = pool || (pending ? await pending.catch(() => null) : null);
+      pool = null;
+      if (p) {
         await p.end().catch(() => {});
       }
     },
@@ -501,19 +624,7 @@ export function createPostgresStore({ connectionString, key, query = null }) {
       const r = await q('SELECT doc FROM poa_dice_docs WHERE key = $1', [key]);
       return r.rows[0] ? (typeof r.rows[0].doc === 'string' ? JSON.parse(r.rows[0].doc) : r.rows[0].doc) : null;
     },
-    async save(doc) {
-      await init();
-      if (!fence) {
-        await q('INSERT INTO poa_dice_docs (key, doc, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()', [key, JSON.stringify(doc)]);
-        return;
-      }
-      // Fenced write: lands only while our lease (same holder, same token) is still live.
-      const r = await q(
-        'INSERT INTO poa_dice_docs (key, doc, updated_at) SELECT $1, $2::jsonb, now() WHERE EXISTS (SELECT 1 FROM poa_dice_leases WHERE key = $3 AND holder = $4 AND token = $5 AND expires_at > now()) ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now() RETURNING key',
-        [key, JSON.stringify(doc), `${key}:${fence.name}`, fence.holder, String(fence.token)]
-      );
-      if (!r.rows || !r.rows.length) throw Object.assign(new Error('vault write fenced off: this instance no longer holds the bank writer lease'), { fenced: true });
-    },
+    save: defaultPgSave,
     async peek(claimKey) {
       await init();
       const r = await q('SELECT value FROM poa_dice_claims WHERE key = $1', [`${key}:${claimKey}`]);
@@ -521,10 +632,25 @@ export function createPostgresStore({ connectionString, key, query = null }) {
       const v = r.rows[0].value;
       return typeof v === 'string' ? JSON.parse(v) : v;
     },
+    async listClaims(prefix = '') {
+      await init();
+      const fullPrefix = `${key}:${prefix}`;
+      const r = await q('SELECT key, value FROM poa_dice_claims WHERE key LIKE $1 ORDER BY created_at ASC LIMIT 5000', [`${fullPrefix.replace(/[\\%_]/g, '\\$&')}%`]);
+      const stripLen = `${key}:`.length;
+      return (r.rows || []).map((row) => ({
+        key: String(row.key).slice(stripLen),
+        value: typeof row.value === 'string' ? JSON.parse(row.value) : row.value
+      }));
+    },
+    async deleteClaim(claimKey) {
+      await init();
+      await q('DELETE FROM poa_dice_claims WHERE key = $1', [`${key}:${claimKey}`]);
+    },
     async lease(name, holder, ttlMs) {
       await init();
       const lk = `${key}:${name}`;
       // Take it if free/expired (token + 1), renew if ours (same token), otherwise leave it.
+      // Return DB-relative remaining_ms so container/DB clock skew never causes premature/late expiry.
       const r = await q(
         `INSERT INTO poa_dice_leases (key, holder, token, expires_at) VALUES ($1, $2, 1, now() + ($3 || ' milliseconds')::interval)
          ON CONFLICT (key) DO UPDATE SET
@@ -532,13 +658,13 @@ export function createPostgresStore({ connectionString, key, query = null }) {
            holder = EXCLUDED.holder,
            expires_at = EXCLUDED.expires_at
          WHERE poa_dice_leases.holder = EXCLUDED.holder OR poa_dice_leases.expires_at <= now()
-         RETURNING holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
+         RETURNING holder, token::text AS token, (extract(epoch from (expires_at - now())) * 1000)::bigint::text AS remaining_ms, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
         [lk, holder, String(ttlMs)]
       );
-      if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: Number(r.rows[0].expires_ms) };
-      const cur = await q("SELECT holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
+      if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: parseLeaseExpiryMs(r.rows[0], ttlMs) };
+      const cur = await q("SELECT holder, token::text AS token, (extract(epoch from (expires_at - now())) * 1000)::bigint::text AS remaining_ms, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
       const row = cur.rows[0] || {};
-      return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: Number(row.expires_ms || 0) };
+      return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: parseLeaseExpiryMs(row, 0) };
     },
     /** Heartbeat: extend the lease only while this holder still holds it with this token (never re-takes it). */
     async renewLease(name, holder, token, ttlMs) {
@@ -547,13 +673,13 @@ export function createPostgresStore({ connectionString, key, query = null }) {
       const r = await q(
         `UPDATE poa_dice_leases SET expires_at = now() + ($4 || ' milliseconds')::interval
          WHERE key = $1 AND holder = $2 AND token = $3 AND expires_at > now()
-         RETURNING holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
+         RETURNING holder, token::text AS token, (extract(epoch from (expires_at - now())) * 1000)::bigint::text AS remaining_ms, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms`,
         [lk, holder, String(token), String(ttlMs)]
       );
-      if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: Number(r.rows[0].expires_ms) };
-      const cur = await q("SELECT holder, token::text AS token, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
+      if (r.rows && r.rows[0]) return { held: true, holder, token: Number(r.rows[0].token), expiresAt: parseLeaseExpiryMs(r.rows[0], ttlMs) };
+      const cur = await q("SELECT holder, token::text AS token, (extract(epoch from (expires_at - now())) * 1000)::bigint::text AS remaining_ms, (extract(epoch from expires_at) * 1000)::bigint::text AS expires_ms FROM poa_dice_leases WHERE key = $1", [lk]);
       const row = cur.rows[0] || {};
-      return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: Number(row.expires_ms || 0) };
+      return { held: false, holder: row.holder || null, token: Number(row.token || 0), expiresAt: parseLeaseExpiryMs(row, 0) };
     },
     /** Shared status row (the bank writer's heartbeat). Fenced like the vault document when a fence is set. */
     async putStatus(name, value) {
@@ -673,23 +799,27 @@ export class PersistQueue {
   }
 
   save(doc) {
-    const snapshot = JSON.stringify(doc);
     if (!this.async) {
-      this.store.save(JSON.parse(snapshot)); // sync stores: durable on return (throws on failure)
+      const resolved = typeof doc === 'function' ? doc() : doc;
+      const snapshot = JSON.stringify(resolved);
+      const passRaw = this.store.acceptsJsonString === true && this.store.save === this.store._defaultSave;
+      this.store.save(passRaw ? snapshot : JSON.parse(snapshot)); // sync stores: durable on return (throws on failure)
       this.writes += 1;
       return;
     }
-    this._pending = snapshot; // coalesce: only the newest full snapshot needs writing
+    this._pending = typeof doc === 'function' ? doc : JSON.stringify(doc); // coalesce: only the newest full snapshot needs writing
     this._schedule();
   }
 
   _schedule() {
     this._chain = this._chain.then(async () => {
       if (this._pending === null) return;
-      const next = this._pending;
+      const pending = this._pending;
       this._pending = null;
+      const next = typeof pending === 'function' ? JSON.stringify(pending()) : pending;
       try {
-        await this.store.save(JSON.parse(next));
+        const passRaw = this.store.acceptsJsonString === true && this.store.save === this.store._defaultSave;
+        await this.store.save(passRaw ? next : JSON.parse(next));
         this.writes += 1;
         this._error = null;
       } catch (err) {
@@ -715,6 +845,16 @@ export class PersistQueue {
   async claim(key, value) {
     if (typeof this.store.claim !== 'function') return { claimed: true, value, local: true };
     return this.store.claim(key, value);
+  }
+
+  async listClaims(prefix = '') {
+    if (typeof this.store.listClaims !== 'function') return [];
+    return this.store.listClaims(prefix);
+  }
+
+  async deleteClaim(key) {
+    if (typeof this.store.deleteClaim !== 'function') return;
+    return this.store.deleteClaim(key);
   }
 
   /** Atomic cross-instance capacity reservation (see adapter docs). */

@@ -24,12 +24,29 @@ import { toMicros } from './crypto-poa.mjs';
 export const MINEPOA_ADDRESS_CAP = 100;
 
 export function emptyBankHistory() {
-  return { v: 1, complete: false, completeAt: null, completeVia: null, txs: {} };
+  return {
+    v: 2,
+    complete: false,
+    completeAt: null,
+    completeVia: null,
+    checkpoint: { finalInMicros: '0', outAllMicros: '0', count: 0 },
+    recentCompactedIds: [],
+    txs: {}
+  };
 }
 
 /** The history record in a vault state document (created on first use). */
 export function bankHistoryOf(state) {
-  if (!state.bankHistory || typeof state.bankHistory !== 'object' || !state.bankHistory.txs) state.bankHistory = emptyBankHistory();
+  if (!state.bankHistory || typeof state.bankHistory !== 'object' || !state.bankHistory.txs) {
+    state.bankHistory = emptyBankHistory();
+  } else {
+    if (!state.bankHistory.checkpoint) {
+      state.bankHistory.checkpoint = { finalInMicros: '0', outAllMicros: '0', count: 0 };
+    }
+    if (!Array.isArray(state.bankHistory.recentCompactedIds)) {
+      state.bankHistory.recentCompactedIds = [];
+    }
+  }
   return state.bankHistory;
 }
 
@@ -50,6 +67,7 @@ export function mergeBankTxs(hist, txs, bankAddress, source) {
   let added = 0;
   let changed = 0;
   const conflicts = [];
+  const compactedSet = new Set(hist.recentCompactedIds || []);
   for (const t of txs || []) {
     if (!t || !t.id) continue;
     if (t.type && t.type !== 'transfer') continue;
@@ -60,6 +78,7 @@ export function mergeBankTxs(hist, txs, bankAddress, source) {
     if (!d) continue;
     const m = micros(t.amount);
     if (m === null) continue;
+    if (compactedSet.has(id)) continue;
     const prev = hist.txs[id];
     if (prev) {
       if (prev.d !== d || micros(prev.a) !== m) {
@@ -78,19 +97,64 @@ export function mergeBankTxs(hist, txs, bankAddress, source) {
   return { added, changed, conflicts };
 }
 
-/** Sums over the whole record: final inbound, all outbound, and the set of txids it holds. */
+/** Sums over the whole record (checkpoint + active window): final inbound, all outbound, and active txids. */
 export function bankHistoryTotals(hist) {
-  let finalIn = 0n;
-  let outAll = 0n;
-  const ids = new Set();
-  for (const [id, e] of Object.entries(hist.txs || {})) {
+  const cp = hist?.checkpoint || { finalInMicros: '0', outAllMicros: '0', count: 0 };
+  let finalIn = BigInt(cp.finalInMicros || '0');
+  let outAll = BigInt(cp.outAllMicros || '0');
+  const ids = new Set(hist?.recentCompactedIds || []);
+  let activeCount = 0;
+  for (const [id, e] of Object.entries(hist?.txs || {})) {
     ids.add(id);
+    activeCount += 1;
     const m = micros(e.a) ?? 0n;
     if (e.d === 'in') {
       if (e.f) finalIn += m;
     } else if (e.d === 'out') outAll += m;
   }
-  return { finalIn, outAll, ids, count: ids.size };
+  return { finalIn, outAll, ids, count: Number(cp.count || 0) + activeCount };
+}
+
+/**
+ * Fold finalized transfers beyond `keepRecent` into `hist.checkpoint` so the hot vault JSON remains O(1)
+ * in size while preserving exact lifetime `finalIn`, `outAll`, and `count`. Unfinalized entries are never compacted.
+ */
+export function compactBankHistory(hist, { keepRecent = 2000, guardWindow = 500 } = {}) {
+  if (!hist || !hist.txs) return 0;
+  const entries = Object.entries(hist.txs);
+  if (entries.length <= keepRecent) return 0;
+  // Sort oldest-first by timestamp (null timestamps stay newest so they aren't evicted prematurely)
+  entries.sort((a, b) => {
+    const ta = a[1].ts === null || a[1].ts === undefined ? Number.MAX_SAFE_INTEGER : Number(a[1].ts);
+    const tb = b[1].ts === null || b[1].ts === undefined ? Number.MAX_SAFE_INTEGER : Number(b[1].ts);
+    return ta - tb;
+  });
+  const targetFold = entries.length - keepRecent;
+  const cp = hist.checkpoint || (hist.checkpoint = { finalInMicros: '0', outAllMicros: '0', count: 0 });
+  let cpIn = BigInt(cp.finalInMicros || '0');
+  let cpOut = BigInt(cp.outAllMicros || '0');
+  let cpCount = Number(cp.count || 0);
+  const foldedIds = [];
+
+  for (const [id, e] of entries) {
+    if (foldedIds.length >= targetFold) break;
+    if (!e.f) continue; // never fold non-final entries
+    const m = micros(e.a) ?? 0n;
+    if (e.d === 'in') cpIn += m;
+    else if (e.d === 'out') cpOut += m;
+    cpCount += 1;
+    foldedIds.push(id);
+    delete hist.txs[id];
+  }
+
+  if (foldedIds.length > 0) {
+    cp.finalInMicros = cpIn.toString();
+    cp.outAllMicros = cpOut.toString();
+    cp.count = cpCount;
+    const guard = [...(hist.recentCompactedIds || []), ...foldedIds];
+    hist.recentCompactedIds = guard.slice(-guardWindow);
+  }
+  return foldedIds.length;
 }
 
 /**

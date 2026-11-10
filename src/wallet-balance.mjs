@@ -9,22 +9,20 @@
  *   spendable = current - pending outgoing   (pending incoming isn't counted until it's final)
  * No keys involved; GET requests only.
  */
-var B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+import { b58dec as b58decode, isValidPoaAddress } from './crypto-poa.mjs';
+
 var K = 5; // peer attestations for finality on minepoa
 
 function b58dec(s) {
   if (typeof s !== 'string' || !s.length) return null;
-  var n = 0n;
-  for (var i = 0; i < s.length; i++) { var v = B58.indexOf(s[i]); if (v < 0) return null; n = n * 58n + BigInt(v); }
-  var bytes = [];
-  while (n > 0n) { bytes.unshift(Number(n & 0xffn)); n >>= 8n; }
-  for (i = 0; i < s.length && s[i] === '1'; i++) bytes.unshift(0);
-  return new Uint8Array(bytes);
+  try {
+    return b58decode(s);
+  } catch {
+    return null;
+  }
 }
 function isAddress(s) {
-  if (typeof s !== 'string' || s.slice(0, 4) !== 'poa1') return false;
-  var raw = b58dec(s.slice(4));
-  return !!raw && raw.length === 32;
+  return isValidPoaAddress(s);
 }
 // A bare base58 string that decodes to 32 or 64 bytes is almost certainly a private key (seed).
 function looksLikePrivkey(s) {
@@ -130,13 +128,16 @@ function makeChecker(opts) {
   opts = opts || {};
   var fetchFn = opts.fetch, node = String(opts.node || 'https://minepoa.com').replace(/\/+$/, '');
   var maxDetails = opts.maxDetails || 60, conc = opts.concurrency || 4, timeoutMs = opts.timeoutMs || 12000;
-  var covered = {}; // txid -> detail; checkpoint coverage is permanent, so these are never refetched
+  var covered = new Map(); // txid -> detail; checkpoint coverage is permanent (bounded LRU)
 
   async function detailFor(id) {
-    if (covered[id]) return covered[id];
+    if (covered.has(id)) return covered.get(id);
     var r = await getJson(fetchFn, node + '/api/explorer/tx/' + encodeURIComponent(id), timeoutMs);
     if (r.ok && r.body && !r.body.error) {
-      if (r.body.checkpointed || (r.body.finality && r.body.finality.via === 'checkpoint')) covered[id] = r.body;
+      if (r.body.checkpointed || (r.body.finality && r.body.finality.via === 'checkpoint')) {
+        if (covered.size >= 2000) covered.delete(covered.keys().next().value);
+        covered.set(id, r.body);
+      }
       return r.body;
     }
     return { error: (r.body && r.body.error) || ('HTTP ' + r.status) };

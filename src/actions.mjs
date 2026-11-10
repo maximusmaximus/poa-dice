@@ -88,12 +88,17 @@ export function quoteClaimYield(engine, { address = '', chain = null } = {}) {
   const pos = engine.lpPositions.get(address);
   if (!pos || pos.shares <= 0n) return bad('no_position', 'Address holds no active LP shares in the bank', base);
   const value = engine.microsForShares(pos.shares);
-  const principalLeft = pos.principalDepositedMicros - pos.principalWithdrawnMicros;
-  const gain = value - (principalLeft > 0n ? principalLeft : 0n);
+  const principalLeft = pos.principalDepositedMicros > pos.principalWithdrawnMicros
+    ? pos.principalDepositedMicros - pos.principalWithdrawnMicros
+    : 0n;
+  const gain = value - principalLeft;
   if (gain <= 0n) return bad('no_yield', 'No yield to claim yet (position value is at or below principal)', base);
-  let shares = (gain * engine.effectiveTotalShares) / engine.effectiveBankMicros;
+  let shares = engine.totalShares > 0n && engine.bankNavMicros > 0n
+    ? (gain * engine.totalShares) / engine.bankNavMicros
+    : (gain * engine.effectiveTotalShares) / engine.effectiveBankMicros;
   if (shares > pos.shares) shares = pos.shares;
-  if (shares <= 0n) return bad('no_yield', 'Yield rounds to 0 shares', base);
+  while (shares > 0n && engine.microsForShares(shares) > gain) shares -= 1n;
+  if (shares <= 0n || engine.microsForShares(shares) <= 0n) return bad('no_yield', 'Yield rounds to 0 shares', base);
   const q = engine.quoteWithdraw({ address, sharesToRedeem: shares.toString() });
   if (!q.valid) return bad('withdraw_rejected', q.error, { ...base, quote: q });
   const gate = chainGate(chain, toMicros(WITHDRAW_TRIGGER_POA));

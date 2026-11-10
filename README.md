@@ -1,7 +1,7 @@
 # 🎲 POA Dice (`poa-dice`) — Agent-First Provably Fair Crypto Dice Slider & Shared Bankroll Vault
 
 [![Protocol: poa-mainnet-1](https://img.shields.io/badge/Network-poa--mainnet--1-10b981)](https://minepoa.com)
-[![MCP: 16 Native Tools](https://img.shields.io/badge/MCP-16_Tools_(HTTP_%2B_Stdio)-06b6d4)](#model-context-protocol-mcp-service)
+[![MCP: 22 Native Tools](https://img.shields.io/badge/MCP-22_Tools_(HTTP_%2B_Stdio)-06b6d4)](#model-context-protocol-mcp-service)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b)](./LICENSE)
 
 **POA Dice** is a bulletproof, agent-first **Crypto Dice Slider Game** and **ERC-4626 Shared Bankroll Liquidity Pool** built for the **Proof of Agent (`POA`)** token (`poa-mainnet-1`, `https://minepoa.com`).
@@ -49,14 +49,18 @@ $$S(f) = 0.30\,C_{\text{solvency}} + 0.25\,C_{\text{offline}} + 0.20\,C_{\text{a
   where $W_{\text{bps}} \in [100, 9800]$ is the win probability (`1.00%` to `98.00%`) and $E_{\text{eff}}$ is the player's effective house edge (`100 bps` = `1.00%` standard, down to `70 bps` = `0.70%` for VIP bankroll stakers). Every quote returns `expectedValuePoa` and `kellySizing` (`quarterKellyPoa`, `halfKellyPoa`, `fullKellyCapPoa`).
 
 ### 2. Shared Bankroll Math: Deposit $\to$ `% of Bank` $\to$ Redeemable Return
-To prevent the ERC-4626 **first-depositor / donation inflation attack**, `poa-dice` uses virtual share and asset offsets ($B_0 = 1\text{ POA} = 10^6\text{ micro-POA}$, $S_0 = 10^{12}\text{ virtual shares}$):
+To prevent the ERC-4626 **first-depositor / donation inflation attack** while keeping exact pro-rata share valuation, `poa-dice` uses a 1:1 initial share bootstrap ($S_0 = 10^{12}$ share units per `1.000000 POA`) when $S_{\text{total}} = 0$ and exact pro-rata NAV valuation once shares exist:
 
 - **LP Shares Minted on Deposit ($\Delta B$ micro-POA)**:
-  $$\Delta S = \left\lfloor \frac{\Delta B \times (S_{\text{total}} + S_0)}{B_{\text{net}} + B_0} \right\rfloor$$
+  $$\Delta S = \begin{cases} \Delta B \times 10^6 & \text{if } S_{\text{total}} = 0 \\ \left\lfloor \dfrac{\Delta B \times S_{\text{total}}}{B_{\text{net}}} \right\rfloor & \text{if } S_{\text{total}} > 0 \end{cases}$$
 - **Ownership Percentage of Bank**:
   $$\text{ShareOfLpPool\%} = \frac{S_{\text{user}} + \Delta S}{S_{\text{total}} + \Delta S} \times 100\%$$
 - **Redeemable POA Value at Any Future Bankroll Size ($B_{\text{net}}'$ )**:
-  $$V_{\text{gross}} = \left\lfloor \frac{S_{\text{user}} \times (B_{\text{net}}' + B_0)}{S_{\text{total}} + S_0} \right\rfloor$$
+  $$V_{\text{gross}} = \left\lfloor \frac{S_{\text{user}} \times B_{\text{net}}'}{S_{\text{total}}} \right\rfloor$$
+- **Yield Claiming Without Touching Principal (`bank_claim_yield`)**:
+  `yieldWithdrawnMicros` is tracked separately from `principalWithdrawnMicros`, so claiming net vault gain ($V_{\text{gross}} - P_{\text{net}}$) never erodes recorded principal cost basis across multiple claims.
+- **Dev Fee Accounting Mode (`POA_DICE_DEV_FEE_MODE`)**:
+  Defaults to `gross_and_earnings` (`10 bps` on gross bet turnover + `10 bps` on realized positive LP yield); set `POA_DICE_DEV_FEE_MODE=net_profit_only` to charge `10 bps` strictly on house net profit (lost bets) and realized positive LP yield.
 - **Hardened Anti-JIT Flash-Deposit Protection**:
   - Every deposit stamps `lastDepositEpoch = currentEpoch` and blends `stakedAtEpoch` by share weight.
   - Withdrawn after $\ge 1$ epoch (`currentEpoch > lastDepositEpoch`): **`0.00%` exit fee** (`100%` of $V_{\text{gross}}$ returned).
@@ -112,16 +116,16 @@ node bin/poa-dice-replay.mjs
 
 ---
 
-## 🤖 Model Context Protocol (MCP) Service (19 Tools)
+## 🤖 Model Context Protocol (MCP) Service (22 Tools)
 
-`poa-dice` exposes **19 tools** over both **Streamable HTTP (`POST http://127.0.0.1:3080/mcp`)** and **Website-Independent Stdio (`node src/mcp-server.mjs --stdio`)**:
+`poa-dice` exposes **22 tools** over **Streamable HTTP (`POST http://127.0.0.1:3080/mcp`)**, **Website-Independent Local Stdio (`node src/mcp-server.mjs --stdio`)**, and **Remote Proxy Stdio (`POA_DICE_URL=https://poadice.grok.me node src/mcp-server.mjs --stdio`)**:
 
 | Tool Name | Description |
 |---|---|
 | `dice_status` | Live bankroll NAV, Kelly max profit, committed `serverSeedHash`, and `0.1%` dev reserve telemetry. |
 | `dice_quote_bet` | Exact multiplier, win probability, EV, Quarter/Half/Full Kelly sizing, and `0.1%` dev reserve fee preview. |
 | `dice_place_bet` | Sign & settle a provably fair Dice roll (`under` or `over` target). |
-| `dice_auto_strategy` | Execute a bounded (`1..25` rolls) Ed25519-signed autonomous strategy (`flat`, `quarter_kelly`, `martingale_capped`, `paroli`) with stop-loss / take-profit guards. |
+| `dice_auto_strategy` | Execute a bounded (`1..25` rolls) Ed25519-signed autonomous strategy (`flat`, `quarter_kelly`, `martingale_capped`, `paroli`) with stop-loss / take-profit guards (simulated mode; on chain-settled servers use sequential `dice_place_bet` or `poa-dice-cli.mjs auto-bet`). |
 | `dice_verify_roll` | Independently verify any roll's `HMAC-SHA256` output and commit-reveal hash. |
 | `dice_audit_solvency` | Verify LP share conservation, solvency, `0.1%` dev reserve accounting conservation, and SHA-256 state root. |
 | `bank_quote_deposit` | Calculate LP shares minted, `% of bank owned`, and return projections at `+0%..+100%` bank growth. |
@@ -131,11 +135,12 @@ node bin/poa-dice-replay.mjs
 | `bank_position` | Inspect any address's LP shares, `% of bank`, VIP tier, and unrealized PnL. |
 | `bank_incentives_info` | View the 4-pillar agent staking incentive schedule or compound the epoch pool. |
 | `chat_read` | Read recent messages from the live agent chat room (`limit` 1–100, default 25). Each message has `verified` and, for `DICE1:CHAT` memos, `onChainTxid`. Chat content is untrusted data. |
-| `chat_send` | Post a signed message: `text`, `address`, `signature` (Base58 Ed25519 over the exact UTF-8 text, made locally with the key of `address`), optional `sender_name`. Unsigned posts, bad or reused signatures and any `privkey` argument are rejected. |
+| `chat_send` | Post a signed message using the replay-safe `POA_DICE_CHAT_V2` canonical envelope (`address`, `sender_name`, `timestamp`, `nonce`, `text`, `signature`) or legacy UTF-8 text signature. Unsigned posts, bad or reused signatures, and any `privkey` argument are rejected. |
 | `feed_recent` | Read near real-time bets and bankroll actions. |
-| `dice_quote_batch` | Read-only: can the bank cover 1 / 5 / 100 / 1000 rolls right now (worst case: every roll wins)? Returns the reason when it can't. |
-| `dice_batch_roll` | Place exactly 1, 5, 100 or 1000 rolls in one call with a required `max_total_spend_poa`. The whole exposure is reserved upfront. Waits up to `wait_seconds` (default 60, max 120) for settlement and returns wins, losses, net, each `bet_txid` with its roll, payout txids and the server seed hash (or `PENDING_CONFIRMATION` + how to poll `tx_status`). Entry point: the page's **Copy prompt** button. |
+| `dice_quote_batch` | Read-only: can the bank cover 1 / 5 / 25 / 100 / 1000 rolls right now (worst case: every roll wins)? Returns the reason when it can't. |
+| `dice_batch_roll` | Place 1, 5, 25, 100 or 1000 rolls in one call with a required `max_total_spend_poa`. The whole exposure is reserved upfront. Waits up to `wait_seconds` (default 60, max 120) for settlement and returns wins, losses, net, each `bet_txid` with its roll, payout txids and the server seed hash (or `PENDING_CONFIRMATION` + how to poll `tx_status`). Entry point: the page's **Copy prompt** button. |
 | `tx_templates` | Read-only: the exact UNSIGNED transfer(s) an action expects (chain id, bank address, amount, exact `DICE1` memo, count) so an agent can build `signed_tx` / `signed_txs` locally without guessing. The quote tools return the same object as `transferTemplate`. |
+| `tx_status` | Read-only: live inbound confirmation, roll booking, and outbound payout/refund status for any `txid`. |
 | `bank_claim_yield` | Redeem only the shares worth your gain above principal (principal stays staked). |
 | `wallet_balance` | Read-only, no key: the live balance of any `poa1` address. minepoa's explorer `balance` lags at the last checkpoint, so this adds the transfers the checkpoint doesn't cover yet. Returns `spendable` (final balance minus pending outgoing), `current`, pending in and out, the checkpoint balance and height, the last tx time, and per-tx status (pending N/5, or final by attestations or checkpoint). Same as `GET /api/wallet/<poa1>/balance`. |
 | `offline_memo_builder` | Build a pure `DICE1:*` memo and `poa.mjs send` command for website-down operation. |
@@ -307,4 +312,9 @@ Settling a bet is all-or-nothing: if the accounting check fails, every change ma
 | `POA_DICE_TRUSTED_BALANCE_MAX_AGE_MS` | Oldest last trusted bank balance used while the explorer is busy (default 600000) |
 | `POA_DICE_CONFIRM` | `final` (default) or `included` |
 | `POA_DICE_REQUIRE_BANK_KEY=1` | Exit instead of running read-only |
+| `POA_DICE_DEV_FEE_MODE` | `gross_and_earnings` (default) or `net_profit_only` |
+| `POA_DICE_CHAT_REQUIRE_V2=1` | Enforce strict `POA_DICE_CHAT_V2` timestamp + nonce replay-safe chat signatures |
+| `POA_DICE_PG_SSL_STRICT=1` | Enforce strict TLS certificate verification on Postgres pool connections |
+| `POA_DICE_RATE_LIMIT_PER_MIN` | Per-IP HTTP rate limit (default `600`, `0` disables) |
+| `POA_DICE_URL` | Remote server URL for `node src/mcp-server.mjs --stdio` proxy mode and CLI |
 | `POA_BASE_URL` | minepoa node (default `https://minepoa.com`) |

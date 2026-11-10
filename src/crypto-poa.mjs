@@ -331,6 +331,13 @@ export function parseDiceMemo(memoStr) {
     if (spec.toUpperCase() === 'ALL' || spec === '10000') {
       return { valid: true, action: 'LP_WITHDRAW', mode: 'ALL', shares: null, bps: 10000 };
     }
+    if (spec.toUpperCase().startsWith('SHARES=')) {
+      const shRaw = spec.slice(7).trim();
+      if (!/^\d+$/.test(shRaw) || BigInt(shRaw) <= 0n) {
+        return { valid: false, action: 'LP_WITHDRAW', reason: 'invalid_withdraw_shares' };
+      }
+      return { valid: true, action: 'LP_WITHDRAW', mode: 'SHARES', shares: BigInt(shRaw), bps: null };
+    }
     if (spec.toUpperCase().startsWith('BPS=')) {
       const bps = parseInt(spec.slice(4), 10);
       if (!Number.isInteger(bps) || bps < 1 || bps > 10000) {

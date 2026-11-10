@@ -17,7 +17,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createDiceServer } from '../src/server.mjs';
 import { genKeypair, signRaw, verifyRaw } from '../src/crypto-poa.mjs';
-import { validateSignedChat } from '../src/chat.mjs';
+import { validateSignedChat, formatChatEnvelope } from '../src/chat.mjs';
 import { MCP_TOOLS } from '../src/mcp-server.mjs';
 import { buildChatJoinPrompt, CHAT_SIGNER_SCRIPT } from '../public/chat/chat-join-prompt.js';
 import { createChatFeed } from '../public/chat/chat-feed.js';
@@ -155,8 +155,7 @@ test('MCP chat tools: schema documents signed posts; read works; signed accepted
     assert.equal(read1.data.messages[0].verified, true);
     assert.ok(verifyRaw(read1.data.messages[0].text, read1.data.messages[0].signature, read1.data.messages[0].address), 'stored signature verifies against the stored text');
   } finally {
-    await info.close?.();
-    app.server.close();
+    await app.close();
   }
 });
 
@@ -179,8 +178,7 @@ test('POST /api/chat: unsigned web-form posts are refused (400); signed posts wo
     const list = await fetch(`${info.url}/api/chat?limit=10`).then((r) => r.json());
     assert.deepEqual(list.messages.map((m) => m.text), ['did i win']);
   } finally {
-    await info.close?.();
-    app.server.close();
+    await app.close();
   }
 });
 
@@ -210,15 +208,67 @@ test('join prompt: real MCP URL, tool names and args; its local signer makes sig
   assert.equal(sig, signRaw(text, k.privRaw), 'same Base58 signature as the server-side reference');
   assert.ok(!sig.includes(k.privkey), 'signer prints only the signature');
 
+  // Also verify --v2 envelope mode in the embedded signer
+  const nowSec = Math.floor(Date.now() / 1000);
+  const nonce = 'nonce-v2-001';
+  const sigV2 = execFileSync(process.execPath, [script, wallet, text, '--v2', k.address, 'PromptV2', String(nowSec), nonce], { encoding: 'utf8' }).trim();
+  const expectedEnvelope = formatChatEnvelope({ address: k.address, senderName: 'PromptV2', timestamp: nowSec, nonce, text });
+  assert.equal(sigV2, signRaw(expectedEnvelope, k.privRaw), 'v2 signer matches formatChatEnvelope');
+
   const app = createDiceServer({ dataDir: tmp('signer-srv'), initialBootstrapPoa: '1000.000000' });
   const info = await app.listen(0, '127.0.0.1');
   try {
     const r = await mcp(info.url, 'chat_send', { text, address: k.address, signature: sig, sender_name: 'Prompt' });
     assert.equal(r.isError, false, JSON.stringify(r.data));
     assert.equal(r.data.verified, true);
+
+    const rV2 = await mcp(info.url, 'chat_send', {
+      text,
+      address: k.address,
+      signature: sigV2,
+      sender_name: 'PromptV2',
+      timestamp: nowSec,
+      nonce,
+    });
+    assert.equal(rV2.isError, false, JSON.stringify(rV2.data));
+    assert.equal(rV2.data.envelopeVersion, 2);
+    assert.equal(rV2.data.verified, true);
+
+    // Replaying exact same v2 signature is rejected even if chatMessages were cleared
+    const rReplay = await mcp(info.url, 'chat_send', {
+      text,
+      address: k.address,
+      signature: sigV2,
+      sender_name: 'PromptV2',
+      timestamp: nowSec,
+      nonce,
+    });
+    assert.equal(rReplay.isError, true);
+    assert.equal(rReplay.data.code, 'replayed_signature');
+
+    // Stale timestamp outside ±300s skew is rejected
+    const staleTs = nowSec - 600;
+    const staleSig = signRaw(formatChatEnvelope({ address: k.address, senderName: 'PromptV2', timestamp: staleTs, nonce: 'stale-1', text }), k.privRaw);
+    const rStale = await mcp(info.url, 'chat_send', {
+      text,
+      address: k.address,
+      signature: staleSig,
+      sender_name: 'PromptV2',
+      timestamp: staleTs,
+      nonce: 'stale-1',
+    });
+    assert.equal(rStale.isError, true);
+    assert.equal(rStale.data.code, 'stale_timestamp');
+
+    // Strict requireV2 mode rejects v1 raw-text signatures
+    const strictRes = validateSignedChat(
+      { text: 'v1 raw msg', address: k.address, signature: signRaw('v1 raw msg', k.privRaw) },
+      { requireV2: true, nowSeconds: nowSec }
+    );
+    assert.equal(strictRes.valid, false);
+    assert.equal(strictRes.code, 'missing_envelope');
   } finally {
-    await info.close?.();
-    app.server.close();
+    await app.close();
   }
 });
 

@@ -450,6 +450,11 @@ export class LedgerWatcher {
           final: true,
           ts: signedTx.body.ts
         });
+        while (this.localLedgerTxs.size > 2000) {
+          const oldest = this.localLedgerTxs.keys().next().value;
+          if (oldest === undefined) break;
+          this.localLedgerTxs.delete(oldest);
+        }
         this.recentParentTxids.push(signedTx.id);
         if (this.recentParentTxids.length > 10) this.recentParentTxids.shift();
 
@@ -467,70 +472,6 @@ export class LedgerWatcher {
       this._dispatchLock = false;
     }
     return dispatched;
-  }
-
-  /**
-   * Poll keyless explorer on minepoa.com for new incoming DICE1:* transfers to bankAddress.
-   */
-  async pollExplorerOnce(fetchImpl = globalThis.fetch) {
-    if (this.settlement) {
-      await this.settlement.tick();
-      return { polled: true, processed: [], via: 'settlement' };
-    }
-    if (!fetchImpl || this.mode === 'simulated') return { polled: false, processed: [] };
-    const url = `${this.nodeUrl}/api/explorer/address/${this.engine.bankAddress}?sort=new`;
-    try {
-      const resp = await fetchImpl(url, {
-        headers: { Accept: 'application/json', 'User-Agent': 'poa-dice-watcher/1.0' },
-        signal: AbortSignal.timeout(15000)
-      });
-      if (!resp.ok) return { polled: false, status: resp.status, processed: [] };
-      const data = await resp.json();
-      const txs = Array.isArray(data?.txs) ? data.txs.map((t) => ({
-        id: t.id || t.txid,
-        type: t.type || '',
-        from: t.from || t.from_addr || '',
-        to: t.to || t.to_addr || '',
-        amount: t.amount || '0',
-        memo: t.memo || '',
-        ts: t.ts || Math.floor(Date.now() / 1000)
-      })).reverse() : [];
-      const processed = [];
-      for (const t of txs) {
-        const txid = t.id || t.txid;
-        if (!txid || this.engine.processedTxids.has(txid)) continue;
-        let memo = String(t.memo || '');
-        if (!memo && t.type === 'transfer' && t.to === this.engine.bankAddress) {
-          // minepoa address pages omit memos: read it from the tx itself.
-          const r = await fetchImpl(`${this.nodeUrl}/api/explorer/tx/${txid}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000) }).catch(() => null);
-          const j = r && r.ok ? await r.json().catch(() => null) : null;
-          memo = String(j?.memo ?? j?.body?.memo ?? '');
-          t.memo = memo;
-        }
-        if (t.type === 'transfer' && t.to === this.engine.bankAddress && memo.startsWith('DICE1:')) {
-          const res = this.executeMemoAction({
-            txid,
-            from: t.from,
-            to: t.to,
-            amountPoa: t.amount,
-            memo: t.memo,
-            ts: t.ts || Math.floor(Date.now() / 1000)
-          });
-          processed.push({ txid, result: res });
-        }
-      }
-      return { polled: true, processed };
-    } catch (err) {
-      return { polled: false, error: redactSecrets(err.message), processed: [] };
-    }
-  }
-
-  startPolling(intervalMs = 10000) {
-    if (this._pollTimer) clearInterval(this._pollTimer);
-    this._pollTimer = setInterval(() => {
-      this.pollExplorerOnce().catch(() => {});
-    }, intervalMs);
-    if (this._pollTimer.unref) this._pollTimer.unref();
   }
 
   stopPolling() {

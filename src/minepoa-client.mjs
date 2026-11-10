@@ -198,6 +198,17 @@ export class MinepoaClient {
     };
   }
 
+  _cacheMemo(txid, memo) {
+    if (!txid || typeof memo !== 'string') return;
+    if (this._memoCache.has(txid)) this._memoCache.delete(txid);
+    this._memoCache.set(txid, memo);
+    while (this._memoCache.size > 2000) {
+      const oldest = this._memoCache.keys().next().value;
+      if (oldest === undefined) break;
+      this._memoCache.delete(oldest);
+    }
+  }
+
   /** Recent transfers with memo and height ({id -> row}); used to see what a checkpoint does not cover yet. */
   async getRecentTransfers(limit = 200) {
     const j = await this._get(`/api/explorer/txs?type=transfer&limit=${limit}`);
@@ -206,7 +217,7 @@ export class MinepoaClient {
     for (const t of list) {
       if (!t || !t.id || (t.type && t.type !== 'transfer')) continue;
       const row = { ...normalizeExplorerTx(t), height: t.height == null ? null : Number(t.height), atts: Number(t.atts || 0), final: t.final === true || t.final === 1 || t.final === '1' };
-      if (typeof t.memo === 'string') this._memoCache.set(t.id, t.memo);
+      if (typeof t.memo === 'string') this._cacheMemo(t.id, t.memo);
       out.set(t.id, row);
     }
     return out;
@@ -214,7 +225,12 @@ export class MinepoaClient {
 
   /** Memo of a ledger tx (cached). undefined when the node could not be asked. */
   async getMemo(txid) {
-    if (this._memoCache.has(txid)) return this._memoCache.get(txid);
+    if (this._memoCache.has(txid)) {
+      const hit = this._memoCache.get(txid);
+      this._memoCache.delete(txid);
+      this._memoCache.set(txid, hit);
+      return hit;
+    }
     const tx = await this.getTx(txid);
     if (!tx) return null;
     return String(tx.memo || '');
@@ -250,7 +266,7 @@ export class MinepoaClient {
       ts: body.ts || j.ts,
       height: j.height == null ? null : Number(j.height)
     };
-    if (typeof out.memo === 'string') this._memoCache.set(out.id, out.memo);
+    if (typeof out.memo === 'string') this._cacheMemo(out.id, out.memo);
     return out;
   }
 
@@ -313,6 +329,33 @@ export class MinepoaClient {
     const tx = await this.getTx(sent[0].id).catch(() => null);
     if (tx && Number.isInteger(Number(tx.body?.nonce))) return Number(tx.body.nonce) + 1;
     throw new Error(`Could not determine next nonce for ${address}`);
+  }
+
+  /**
+   * Non-broadcast preflight check (`POST /api/submit?dry=1`) using probe UA so the node validates
+   * spendable balance (including vested mining rewards) without recording or broadcasting the tx.
+   * Never throws on network/busy errors — returns `{ ok: true, unknown: true }` when unreachable.
+   */
+  async dryCheckTx(body) {
+    if (this.busy('submit')) return { ok: true, unknown: true };
+    let resp;
+    try {
+      resp = await this.fetch(`${this.nodeUrl}/api/submit?dry=1`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': 'poa-dice-probe/1.0'
+        },
+        body: JSON.stringify({ kind: 'tx', body }),
+        signal: AbortSignal.timeout(Math.min(this.timeoutMs, 5000))
+      });
+    } catch {
+      return { ok: true, unknown: true };
+    }
+    const j = await resp.json().catch(() => ({}));
+    if (resp.ok) return { ok: true, body: j };
+    return { ok: false, status: resp.status, error: String(j?.error || `HTTP ${resp.status}`) };
   }
 
   /** Broadcast. Throws SubmitError; .definitive=true for a 4xx rejection (except 408/409 dup/429). */

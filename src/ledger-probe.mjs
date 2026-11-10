@@ -147,8 +147,11 @@ export class LedgerProbe {
   /** Another instance saw minepoa healthy at `ts` (shared through the writer status). */
   noteRemoteOk(ts) {
     const t = Number(ts);
-    if (!Number.isFinite(t) || t <= 0 || t > this.now()) return;
-    if (this.lastOkAt === null || t > this.lastOkAt) this.lastOkAt = t;
+    const nowMs = this.now();
+    // Allow up to 5s clock skew between containers; clamp to local nowMs.
+    if (!Number.isFinite(t) || t <= 0 || t > nowMs + 5000) return;
+    const clamped = t > nowMs ? nowMs : t;
+    if (this.lastOkAt === null || clamped > this.lastOkAt) this.lastOkAt = clamped;
   }
 
   /**
@@ -191,17 +194,17 @@ export class LedgerProbe {
   }
 
   _fail(message, immediate) {
-    if (this.status === 'DEGRADED') {
-      this.status = 'OK';
-      this.degradedSince = null;
-    }
     this.lastError = message;
     this.lastErrorAt = this.now();
     this.consecutiveOks = 0;
     this.consecutiveFails += 1;
-    if (this.status === 'OK' && (immediate || this.consecutiveFails >= this.failThreshold)) {
+    if (
+      (this.status === 'OK' || this.status === 'DEGRADED') &&
+      (immediate || this.consecutiveFails >= this.failThreshold || this.now() - (this.lastOkAt ?? this.bootAt) >= this.outageHoldMs)
+    ) {
       this.status = 'UNAVAILABLE';
       this.since = this.now();
+      this.degradedSince = null;
       this._changed({});
     }
   }

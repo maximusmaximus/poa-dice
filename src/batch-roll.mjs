@@ -346,6 +346,9 @@ async function executeChainBatch({ engine, watcher, args, quote, wallet, address
     throw Object.assign(new Error('stop_on_loss_poa / stop_on_profit_poa need each roll settled first; they are not supported on a chain-settled server (all rolls are broadcast up front)'), { status: 400 });
   }
   const settlement = watcher.settlement;
+  if (Array.isArray(args.signed_txs) && args.signed_txs[0]) {
+    await settlement._assertSenderCanCoverBet?.(args.signed_txs[0]?.body || args.signed_txs[0]);
+  }
   // Combined worst case of the whole batch must fit the bank's real free funds (atomic, cross-instance).
   const worstPerRoll = toMicros(quote.payoutOnWinPoa);
   await settlement.reserveBetCoverage(batchId, worstPerRoll * BigInt(count));
@@ -353,6 +356,7 @@ async function executeChainBatch({ engine, watcher, args, quote, wallet, address
   settlement.openGroup(batchId, { count, address });
   engine._emit('batch.started', { batchId, address, count, wagerPoa: quote.wagerPoa, targetBps: quote.targetBps, direction: quote.direction, maxBankExposurePoa: quote.maxBankExposurePoa, settlement: 'chain' });
   const submitted = [];
+  let releasedOnThrow = 0;
   let error = null;
   for (let i = 0; i < count; i++) {
     try {
@@ -360,12 +364,16 @@ async function executeChainBatch({ engine, watcher, args, quote, wallet, address
       const view = await settlement.submitInbound(tx, { reserve: { key: batchId, micros: lockPerRoll.toString() }, groupId: batchId, coverage: { key: batchId, micros: worstPerRoll.toString() } });
       submitted.push(view.txid);
     } catch (err) {
+      if (err && err.coverageReleased) releasedOnThrow += 1;
       error = String(err.message || err);
       break;
     }
   }
   if (submitted.length < count) {
-    settlement.releaseBetCoverage(batchId, worstPerRoll * BigInt(count - submitted.length));
+    const unsubmittedSlices = count - submitted.length - releasedOnThrow;
+    if (unsubmittedSlices > 0) {
+      await settlement.releaseBetCoverage(batchId, worstPerRoll * BigInt(unsubmittedSlices));
+    }
     // Keep exactly one slice per roll still waiting for the ledger; release the rest.
     const recs = Object.values(settlement.state.inbound).filter((r) => r.groupId === batchId);
     const stillHeld = BigInt(recs.filter((r) => r.reserve).length) * lockPerRoll;

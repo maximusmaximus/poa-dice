@@ -7,6 +7,8 @@
  *   2. Standalone Stdio (`node src/mcp-server.mjs --stdio`) — works even when the website is down!
  */
 
+import crypto from 'node:crypto';
+import fs from 'node:fs';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -229,8 +231,14 @@ export const MCP_TOOLS = [
       properties: {
         text: { type: 'string', description: 'Exact message text that was signed (max 240 chars, single line, no secrets)' },
         address: { type: 'string', description: 'Your poa1... address (its key made the signature)' },
-        signature: { type: 'string', description: 'Base58 Ed25519 signature over the exact UTF-8 text, made locally with the key of address' },
-        sender_name: { type: 'string', description: 'Optional display name, max 32 chars (e.g. "Tessellate Army")' }
+        signature: {
+          type: 'string',
+          description:
+            'Base58 Ed25519 signature over POA_DICE_CHAT_V2 canonical envelope (when timestamp + nonce are supplied) or over exact UTF-8 text'
+        },
+        sender_name: { type: 'string', description: 'Optional display name, max 32 chars (e.g. "Tessellate Army")' },
+        timestamp: { type: 'integer', description: 'Optional Unix seconds timestamp for replay-safe POA_DICE_CHAT_V2 signing' },
+        nonce: { type: 'string', description: 'Optional 8-48 char nonce for replay-safe POA_DICE_CHAT_V2 signing' }
       },
       required: ['text', 'address', 'signature']
     }
@@ -854,7 +862,7 @@ export class McpHandler {
           chain: await this._chain(stakeFrom)
         });
         if (!sq.valid) return this._rejected(sq);
-        if (args.max_total_spend_poa && Number(sq.amountPoa) > Number(args.max_total_spend_poa)) {
+        if (args.max_total_spend_poa && toMicros(sq.amountPoa) > toMicros(args.max_total_spend_poa)) {
           return this._rejected({ code: 'over_cap', reason: `Deposit ${sq.amountPoa} POA exceeds max_total_spend_poa ${args.max_total_spend_poa}` });
         }
         if (!txEnvelope) {
@@ -908,10 +916,19 @@ export class McpHandler {
       case 'bank_incentives_info': {
         let compoundResult = null;
         if (args.compound_now) {
-          if (!this.hooks.adminToken || args.admin_token !== this.hooks.adminToken) {
+          const expected = this.hooks.adminToken ? String(this.hooks.adminToken) : null;
+          const given = typeof args.admin_token === 'string' ? args.admin_token : '';
+          const okToken =
+            Boolean(expected) &&
+            crypto.timingSafeEqual(
+              crypto.createHash('sha256').update(given).digest(),
+              crypto.createHash('sha256').update(expected).digest()
+            );
+          if (!okToken) {
             return { valid: false, rejected: true, error: 'compound_now is an admin-only house action' };
           }
-          compoundResult = this.engine.advanceEpoch({ distributeIncentives: true });
+          const run = this.hooks.runAdminMutation || ((fn) => Promise.resolve(fn()));
+          compoundResult = await run(() => this.engine.advanceEpoch({ distributeIncentives: true }));
         }
         const state = this.engine.getStateSummary();
         return {
@@ -1039,11 +1056,13 @@ export class McpHandler {
       }
 
       case 'tx_status': {
+        const qid = String(args.txid || '');
         if (!this.watcher.settlement) {
-          const r = this.engine.processedTxids.get(String(args.txid || ''));
-          return r ? { txid: args.txid, status: 'CONFIRMED', mode: 'simulated', result: r } : { valid: false, error: 'Unknown txid', mode: 'simulated' };
+          const r = this.engine.processedTxids.get(qid);
+          return r ? { txid: qid, status: 'CONFIRMED', mode: 'simulated', result: r } : { valid: false, error: 'Unknown txid', mode: 'simulated' };
         }
-        return this.watcher.settlement.getTxStatus(String(args.txid || '')) || { valid: false, error: 'Unknown txid' };
+        const st = this.watcher.settlement.getTxStatus(qid) || (await this.watcher.settlement.lookupLedger(qid));
+        return st || { valid: false, error: 'Unknown txid' };
       }
 
       default:
@@ -1052,16 +1071,46 @@ export class McpHandler {
   }
 }
 
+function isStdioEntrypoint(metaUrl) {
+  if (!process.argv[1]) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(selfPath);
+  } catch {
+    return path.resolve(process.argv[1]).toLowerCase() === path.resolve(selfPath).toLowerCase();
+  }
+}
+
 // Standalone Stdio Runner when invoked with `node src/mcp-server.mjs --stdio`
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = isStdioEntrypoint(import.meta.url);
 if (isMain) {
-  const dataDir = process.env.POA_DICE_DATA_DIR || path.join(process.cwd(), 'data');
-  const engine = new BankrollEngine({
-    dataDir,
-    initialBootstrapPoa: process.env.POA_DICE_BOOTSTRAP_POA || '100000.000000'
-  });
-  const watcher = new LedgerWatcher({ engine, mode: 'simulated' });
-  const mcp = new McpHandler({ engine, watcher });
+  const remoteBase =
+    process.env.POA_DICE_URL && !['local', 'offline'].includes(String(process.env.POA_DICE_URL).toLowerCase())
+      ? String(process.env.POA_DICE_URL).replace(/\/+$/, '')
+      : null;
+
+  let handleLineRpc;
+  if (remoteBase) {
+    handleLineRpc = async (req) => {
+      if (req && req.method === 'notifications/initialized') return null;
+      const resp = await fetch(`${remoteBase}/mcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req)
+      });
+      if (resp.status === 202) return null;
+      return resp.json();
+    };
+  } else {
+    const dataDir = process.env.POA_DICE_DATA_DIR || path.join(process.cwd(), 'data');
+    const engine = new BankrollEngine({
+      dataDir,
+      initialBootstrapPoa: process.env.POA_DICE_BOOTSTRAP_POA || '100000.000000'
+    });
+    const watcher = new LedgerWatcher({ engine, mode: 'simulated' });
+    const mcp = new McpHandler({ engine, watcher });
+    handleLineRpc = (req) => mcp.handleRpc(req);
+  }
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1074,7 +1123,7 @@ if (isMain) {
     if (!trimmed) return;
     try {
       const req = JSON.parse(trimmed);
-      const resp = await mcp.handleRpc(req);
+      const resp = await handleLineRpc(req);
       if (resp) {
         process.stdout.write(JSON.stringify(resp) + '\n');
       }
