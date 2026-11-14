@@ -634,6 +634,7 @@ export const reconcilerAndRepayMethods = {
       const solvency = () => {
         let pendingOut = 0n;
         for (const o of Object.values(this.state.outbound)) {
+          if (o.repayment?.status === 'HELD') continue;
           if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
         }
         for (const item of this.engine.outboundQueue) {
@@ -721,6 +722,7 @@ export const reconcilerAndRepayMethods = {
       onChainBankBalancePoa: bal?.onChainBankBalancePoa ?? this.lastBankBalance?.balance ?? (fromWriter ? fromWriter.onChainBankBalancePoa : null) ?? null,
       bankBalance: this.lastBankBalance ? { ...this.lastBankBalance, ...(bal ? { ...bal, balance: bal.onChainBankBalancePoa } : {}) } : null,
       stuckPayouts: this.stuckPayouts(),
+      repaymentQueue: this.repaymentQueueView(),
       writer: this.writer.view(),
       leader: this.leaderView(),
       foreignOutflows: fromWriter ? fromWriter.foreignOutflows || [] : this.foreign,
@@ -764,6 +766,7 @@ export const reconcilerAndRepayMethods = {
     const unconfirmedIn = 0n;
     let pendingOut = 0n;
     for (const o of Object.values(this.state.outbound)) {
+      if (o.repayment?.status === 'HELD') continue;
       if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
     }
     for (const item of this.engine.outboundQueue) {

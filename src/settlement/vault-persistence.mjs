@@ -5,6 +5,7 @@
  */
 import { computePlayTimes } from '../play-time.mjs';
 import { bankHistoryOf, compactBankHistory } from '../bank-history.mjs';
+import { pushLoadPhase } from '../settlement-store.mjs';
 import { OPEN_IN, TERMINAL_OUT, now } from './constants.mjs';
 
 export const vaultPersistenceMethods = {
@@ -14,16 +15,33 @@ export const vaultPersistenceMethods = {
     if (this.onLoadStateChange) this.onLoadStateChange(this.vaultLoad);
   },
 
+  /** Copy the store's last connect / schema_init / vault_load attempt, or time this load when the store did not. */
+  _captureLoadPhases(startedAt, err) {
+    const fromStore = this.store && Array.isArray(this.store.lastLoadPhases) ? this.store.lastLoadPhases : null;
+    const phases =
+      fromStore && fromStore.length
+        ? fromStore.map((phase) => ({
+            phase: String(phase.phase),
+            durationMs: Number(phase.durationMs) || 0,
+            ...(phase.code ? { code: String(phase.code) } : {}),
+            ...(phase.message ? { message: String(phase.message) } : {})
+          }))
+        : [pushLoadPhase([], 'vault_load', startedAt, err)];
+    this.vaultLoad = { ...this.vaultLoad, phases };
+  },
+
   /** One load attempt: applies the document on success; records the error and the next retry on failure. */
-  _trackLoad(promise) {
+  _trackLoad(promise, startedAt = Date.now()) {
     this.vaultLoad.attempts += 1;
     this.vaultLoad.status = 'LOADING';
     const p = Promise.resolve(promise).then(
       (doc) => {
+        this._captureLoadPhases(startedAt);
         this._applyDoc(doc); // bank mismatch throws here and sets fatalError (never retried)
         this._markLoaded();
       },
       (err) => {
+        this._captureLoadPhases(startedAt, err);
         const msg = `Could not load vault state from ${this.store.kind}: ${err && err.message ? err.message : err}`;
         this.vaultLoad.failures += 1;
         const delay = Math.min(this.loadRetryMaxMs, this.loadRetryBaseMs * 2 ** Math.min(10, this.vaultLoad.failures - 1));
@@ -47,12 +65,13 @@ export const vaultPersistenceMethods = {
   /** Retry a failed load (called from tick() once the backoff has passed). */
   _retryLoad() {
     let loaded;
+    const startedAt = Date.now();
     try {
       loaded = this.store.load();
     } catch (err) {
       loaded = Promise.reject(err);
     }
-    this._loadPromise = this._trackLoad(loaded);
+    this._loadPromise = this._trackLoad(loaded, startedAt);
     return this._loadPromise;
   },
 

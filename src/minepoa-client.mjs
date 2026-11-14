@@ -311,12 +311,35 @@ export class MinepoaClient {
     return { state: 'unavailable', error: `minepoa /api/receipt -> HTTP ${resp.status}${errText ? `: ${errText.slice(0, 80)}` : ''}` };
   }
 
-  /** Two most recent valid txids, oldest first (what poa.mjs buildTx uses as parents). */
   async getTipParents() {
-    const j = await this._get('/api/txs');
-    const list = Array.isArray(j?.valid) ? j.valid : Array.isArray(j) ? j : [];
-    const sorted = list.filter((t) => t && t.id).sort((a, b) => (a.ts || 0) - (b.ts || 0));
-    return sorted.slice(-2).map((t) => t.id);
+    let firstErr = null;
+    try {
+      const j = await this._get('/api/txs');
+      const list = Array.isArray(j?.valid) ? j.valid : Array.isArray(j) ? j : [];
+      const sorted = list.filter((t) => t && t.id).sort((a, b) => (a.ts || 0) - (b.ts || 0));
+      if (sorted.length >= 2) return sorted.slice(-2).map((t) => t.id);
+    } catch (err) {
+      firstErr = err;
+    }
+    try {
+      const tips = await this.getExplorerTips();
+      if (tips.length >= 2) return tips;
+      if (!firstErr) firstErr = new Error('minepoa: no tip parents (/api/txs and /api/explorer/txs both empty)');
+    } catch (err) {
+      if (!firstErr) firstErr = err;
+      else firstErr.message = `${firstErr.message}; fallback ${err?.message || err}`;
+    }
+    throw firstErr;
+  }
+
+  /** Two newest valid txids from the explorer feed, oldest first. */
+  async getExplorerTips(limit = 20) {
+    const j = await this._get(`/api/explorer/txs?limit=${limit}`);
+    const list = Array.isArray(j) ? j : Array.isArray(j?.txs) ? j.txs : [];
+    const rows = list
+      .filter((t) => t && typeof t.id === 'string' && t.id && t.invalid !== true && !/^(invalid|rejected)$/i.test(String(t.status || '')))
+      .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0) || Number(a.height ?? 0) - Number(b.height ?? 0));
+    return rows.slice(-2).map((t) => t.id);
   }
 
   /** Next nonce for an address: receipt.next_nonce of its newest sent tx, else 1. */

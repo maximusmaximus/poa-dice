@@ -38,6 +38,7 @@ export const coverageManagerMethods = {
     }
     let pendingOut = 0n;
     for (const o of Object.values(this.state.outbound)) {
+      if (o.repayment?.status === 'HELD') continue;
       if (!TERMINAL_OUT.has(o.status) && o.status !== 'SENT' && o.status !== 'SIGNED') pendingOut += toMicros(o.amountPoa);
     }
     for (const item of this.engine.outboundQueue) {

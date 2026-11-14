@@ -192,20 +192,28 @@ export class ChainSettlement {
       lastError: null,
       lastErrorAt: null,
       nextRetryAt: null,
-      loadedAt: null
+      loadedAt: null,
+      phases: []
     };
     let loaded;
+    const startedAt = Date.now();
     try {
       loaded = store.load();
     } catch (err) {
       loaded = Promise.reject(err);
     }
     if (loaded && typeof loaded.then === 'function') {
-      this._loadPromise = this._trackLoad(loaded);
+      this._loadPromise = this._trackLoad(loaded, startedAt);
     } else {
       this.vaultLoad.attempts = 1;
-      this._applyDoc(loaded);
-      this._markLoaded();
+      try {
+        this._applyDoc(loaded);
+        this._captureLoadPhases(startedAt);
+        this._markLoaded();
+      } catch (err) {
+        this._captureLoadPhases(startedAt, err);
+        throw err;
+      }
       this._loadPromise = Promise.resolve();
     }
   }
