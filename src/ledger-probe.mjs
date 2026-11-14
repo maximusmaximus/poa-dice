@@ -246,7 +246,16 @@ export class LedgerProbe {
     const r = await this._req('/api/txs', { headers: { Accept: 'application/json', 'User-Agent': 'poa-dice-probe/1.0' } });
     const list = Array.isArray(r.json) ? r.json : Array.isArray(r.json?.valid) ? r.json.valid : null;
     const ok = r.status === 200 && list !== null;
-    return { name: '/api/txs', ok, busy: !ok && !HARD_STATUS(r.status), hard: !ok && HARD_STATUS(r.status), status: r.status, ms: r.ms, detail: ok ? 'ok' : r.error || `HTTP ${r.status}${r.json?.error ? ` ${String(r.json.error).slice(0, 80)}` : r.status === 200 ? ' (unexpected body)' : ''}` };
+    const primary = { name: '/api/txs', ok, busy: !ok && !HARD_STATUS(r.status), hard: !ok && HARD_STATUS(r.status), status: r.status, ms: r.ms, detail: ok ? 'ok' : r.error || `HTTP ${r.status}${r.json?.error ? ` ${String(r.json.error).slice(0, 80)}` : r.status === 200 ? ' (unexpected body)' : ''}` };
+    if (ok) return primary;
+    // Parents also come from the explorer feed (MinepoaClient.getTipParents fallback), so that route counts too.
+    const f = await this._req('/api/explorer/txs?limit=2', { headers: { Accept: 'application/json', 'User-Agent': 'poa-dice-probe/1.0' } });
+    const flist = Array.isArray(f.json) ? f.json : Array.isArray(f.json?.txs) ? f.json.txs : null;
+    const fok = f.status === 200 && flist !== null && flist.some((t) => t && t.id);
+    if (fok) return { name: '/api/explorer/txs', ok: true, busy: false, hard: false, status: f.status, ms: f.ms, detail: `ok (/api/txs ${primary.detail})` };
+    const fdetail = f.error || `HTTP ${f.status}${f.json?.error ? ` ${String(f.json.error).slice(0, 80)}` : f.status === 200 ? ' (unexpected body)' : ''}`;
+    const hard = primary.hard;
+    return { name: '/api/txs', ok: false, busy: !hard, hard, status: r.status, ms: r.ms, detail: `${primary.detail} (explorer/txs ${fdetail})` };
   }
 
   async _checkSubmit() {

@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { ledgerUiState } from '../src/ledger-ui.mjs';
 /**
  * POA Dice — browser controller (public/app.js)
  *
@@ -32,6 +33,7 @@ const state = {
   withdrawBps: 10000,
   playerAddress: '',
   summary: null,
+  ledgerUi: null,
   ledgerPaused: false,
   chainDownRolls: null, // reason text from a batch quote with code chain_down, or null
   chainDownActions: null, // same, from the action quotes (stake / withdraw / claim / auto-bet)
@@ -420,13 +422,14 @@ function setReason(id, text) {
   }
 }
 
-/** Site-wide notice row under the header: CHAIN DOWN shows there whenever a quote reports chain_down. */
+/** Site-wide notice row under the header. CHAIN DOWN follows the shared ledger state, not a lone quote. */
 function renderSiteNotices() {
   const text = state.chainDownRolls || state.chainDownActions;
   const el = document.getElementById('chainDownNotice');
   if (!el) return;
+  const down = state.ledgerUi ? state.ledgerUi.chainDown : Boolean(text);
   if (text) $('chainDownText').textContent = text;
-  el.classList.toggle('hidden', !text);
+  el.classList.toggle('hidden', !down);
 }
 
 function renderRollAvailability() {
@@ -630,16 +633,21 @@ function renderAvgPlayTime(pt) {
 
 function applyStateSnapshot(data) {
   state.summary = data;
-  const paused = data?.settlement ? data.settlement.trading === 'PAUSED_LEDGER_UNAVAILABLE' : state.ledgerPaused;
-  if (paused !== state.ledgerPaused) {
-    state.ledgerPaused = paused;
-    $('ledgerPausedBanner').classList.toggle('hidden', !paused);
-    renderRollAvailability();
-    renderActionAvailability();
-  }
+  const navPoa = data?.bankroll?.bankNavPoa ?? data?.ledgerUi?.navPoa ?? null;
+  state.ledgerUi = data?.ledgerUi || ledgerUiState({
+    probeStatus: data?.settlement?.ledger?.status ?? null,
+    trading: data?.settlement?.trading ?? null,
+    chainOk: data?.chain ? data.chain.ok : null,
+    navPoa
+  });
+  state.ledgerPaused = state.ledgerUi.bettingPaused;
+  const banner = document.getElementById('ledgerPausedBanner');
+  if (banner) banner.classList.toggle('hidden', !state.ledgerUi.bettingPaused);
+  renderRollAvailability();
+  renderActionAvailability();
   const b = data.bankroll;
   if (b) {
-    $('topBankNav').textContent = `${formatNum(b.bankNavPoa, 4)} POA`;
+    $('topBankNav').textContent = `${formatNum(state.ledgerUi.navPoa ?? b.bankNavPoa, 4)} POA`;
     $('topBankAvail').textContent = `${formatNum(b.availableBankrollPoa, 4)} POA`;
     $('topKellyMax').textContent = `Kelly cap ${formatNum(b.kellyMaxProfitPoa, 2)} POA profit / roll`;
   }
@@ -661,9 +669,7 @@ function applyStateSnapshot(data) {
   } else {
     $('chainBalanceText').textContent = 'Add it to check your balance and LP position.';
   }
-  if (data.settlement?.readOnly) setStatus(String(data.settlement.status || 'READ ONLY').replace(/_/g, ' '), 'down');
-  else if (chain && !chain.ok) setStatus('CHAIN DOWN', 'down');
-  else if (state.sseConnected) setStatus(chain ? 'CHAIN LIVE' : 'LIVE', 'live');
+  setStatus(state.ledgerUi.header, state.ledgerUi.chainDown ? 'down' : 'live');
 
   if (data.devReserve) {
     $('topDevAddrShort').textContent = shortAddr(data.devReserve.address);
@@ -1191,7 +1197,7 @@ function connectRealtimeStream(alive) {
   eventSource.onopen = () => {
     state.sseConnected = true;
     reconnectDelay = 1000;
-    setStatus(state.summary?.chain ? (state.summary.chain.ok ? 'CHAIN LIVE' : 'CHAIN DOWN') : 'LIVE', state.summary?.chain && !state.summary.chain.ok ? 'down' : 'live');
+    if (state.ledgerUi) setStatus(state.ledgerUi.header, state.ledgerUi.chainDown ? 'down' : 'live');
   };
   eventSource.onmessage = (ev) => {
     if (!alive()) return;
@@ -1203,7 +1209,7 @@ function connectRealtimeStream(alive) {
   };
   eventSource.onerror = () => {
     state.sseConnected = false;
-    setStatus('RECONNECTING', 'down');
+    if (!state.ledgerUi) setStatus('RECONNECTING', 'down');
     if (eventSource && eventSource.readyState === 2) {
       eventSource.close();
       eventSource = null;

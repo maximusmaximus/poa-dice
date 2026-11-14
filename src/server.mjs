@@ -32,6 +32,7 @@ import { loadBankWallet } from './bank-key.mjs';
 import { ChainSettlement } from './chain-settlement.mjs';
 import { BankWriter } from './bank-writer.mjs';
 import { LedgerProbe, LEDGER_HOLD } from './ledger-probe.mjs';
+import { ledgerUiState } from './ledger-ui.mjs';
 import { DEFAULT_CHAIN_ID, MinepoaClient } from './minepoa-client.mjs';
 import { PoaScanClient } from './poascan-client.mjs';
 import { resolveStore } from './settlement-store.mjs';
@@ -48,6 +49,11 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
+const SRC_DIR = path.resolve(__dirname);
+// Browser-safe modules the UI may import. Never add server modules (keys, handlers) here.
+const PUBLIC_SRC_MODULES = new Map([
+  ['/src/ledger-ui.mjs', path.join(SRC_DIR, 'ledger-ui.mjs')]
+]);
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -401,6 +407,11 @@ export function createDiceServer(options = {}) {
       }
       return ctx;
     } catch {
+      const probe = settlement?.ledgerProbe;
+      if (probe && !probe.hold() && probe.status !== 'UNAVAILABLE') {
+        const bal = settlement?.lastBankBalance?.balance;
+        return { required: true, ok: true, degraded: true, bankMicros: bal ? toMicros(bal) : 0n };
+      }
       return { required: true, ok: false };
     }
   }
@@ -554,6 +565,13 @@ export function createDiceServer(options = {}) {
       inbound: sum.inbound,
       outbound: sum.outbound,
       stuckPayouts: sum.stuckPayouts,
+      repaymentQueue: sum.repaymentQueue,
+      ledgerUi: ledgerUiState({
+        probeStatus: sum.ledger?.status ?? null,
+        trading: sum.trading,
+        chainOk: null,
+        navPoa: fromMicros(engine.bankNavMicros)
+      }),
       writer: sum.writer,
       leader: sum.leader,
       foreignOutflows: sum.foreignOutflows,
@@ -768,6 +786,13 @@ export function createDiceServer(options = {}) {
             };
           }
         }
+        summary.ledgerUi = ledgerUiState({
+          probeStatus: summary.settlement?.ledger?.status ?? null,
+          trading: summary.settlement?.trading ?? null,
+          chainOk: summary.chain ? summary.chain.ok : null,
+          navPoa: summary.bankroll?.bankNavPoa ?? null
+        });
+        if (summary.settlement) summary.settlement.ledgerUi = summary.ledgerUi;
         return sendJson(res, 200, summary);
       }
 
@@ -1144,6 +1169,25 @@ export function createDiceServer(options = {}) {
         });
         fs.createReadStream(filePath).pipe(res);
         return;
+      }
+
+      const allowedSrc = PUBLIC_SRC_MODULES.get(pathname);
+      if (allowedSrc) {
+        const resolved = path.resolve(allowedSrc);
+        if (
+          resolved === path.join(SRC_DIR, 'ledger-ui.mjs') &&
+          fs.existsSync(resolved) &&
+          fs.statSync(resolved).isFile()
+        ) {
+          const ext = path.extname(resolved).toLowerCase();
+          const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+          res.writeHead(200, {
+            'Content-Type': contentType,
+            'Cache-Control': 'no-cache'
+          });
+          fs.createReadStream(resolved).pipe(res);
+          return;
+        }
       }
 
       return sendJson(res, 404, { error: `Route not found: ${pathname}` });

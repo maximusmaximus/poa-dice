@@ -404,7 +404,7 @@ test('refuses on a stale or degraded ledger (explorer busy => only the last trus
     assert.equal(r.status, 409);
     c.mock.setReadBusy(0);
     c.a.s.client._busyUntil.read = 0;
-    c.mock.setOutage(503, ['/api/txs']);
+    c.mock.setOutage(503, ['/api/txs', '/api/explorer/txs']);
     r = await c.a.repay({ orderId: rec.orderId, confirm: true });
     assert.equal(r.status, 409);
     assert.match(r.body.error, /DEGRADED|UNAVAILABLE/);

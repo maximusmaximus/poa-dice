@@ -232,13 +232,15 @@ test('concurrent payouts get distinct nonces: across instances (shared nonce cla
   const a = await boot({ mock, bank, tag: 'ca', store: createMemoryStore(null, { claims }) });
   const b = await boot({ mock, bank, tag: 'cb', store: createMemoryStore(null, { claims }) });
   try {
-    // Two instances choose nonces for six different orders at the same moment.
+    // Two instances ask at the same moment. The chain has one next nonce: the first claim wins it,
+    // and the other waits. It must not take 2, 3, … and burn nonces the chain has not issued.
     const recs = Array.from({ length: 6 }, (_, i) => ({ orderId: `order${i}`.padEnd(24, '0'), resigns: 0 }));
-    const picks = await Promise.all(recs.map((r, i) => (i % 2 ? b : a).app.settlement._chooseBankNonce(r)));
-    assert.equal(new Set(picks).size, picks.length, `distinct nonces: ${picks}`);
-    assert.deepEqual([...picks].sort((x, y) => x - y), [1, 2, 3, 4, 5, 6]);
-    // Re-asking for the same order returns its own nonce (same order + same nonce can never double-pay).
-    assert.equal(await b.app.settlement._chooseBankNonce(recs[0]), picks[0]);
+    const settled = await Promise.allSettled(recs.map((r, i) => (i % 2 ? b : a).app.settlement._chooseBankNonce(r)));
+    const won = settled.flatMap((r, i) => (r.status === 'fulfilled' ? [{ order: recs[i], nonce: r.value }] : []));
+    assert.equal(won.length, 1, `only the chain next nonce is claimed, got ${JSON.stringify(settled.map((r) => (r.status === 'fulfilled' ? r.value : r.reason?.message)))}`);
+    assert.equal(won[0].nonce, 1);
+    const again = recs.indexOf(won[0].order) % 2 ? b : a;
+    assert.equal(await again.app.settlement._chooseBankNonce(won[0].order), 1);
   } finally {
     await a.close();
     await b.close();

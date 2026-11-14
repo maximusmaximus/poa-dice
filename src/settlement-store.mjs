@@ -478,6 +478,43 @@ const PG_INDEXES = [
   'CREATE INDEX IF NOT EXISTS poa_dice_reservations_scope_exp_idx ON poa_dice_reservations (scope, expires_at)'
 ];
 
+/** Log and keep one vault-load phase. Message is scrubbed of URLs, hosts, and secrets. */
+export function sanitizePhaseError(err) {
+  const rawCode = err && err.code != null ? String(err.code) : '';
+  const code = /^[A-Za-z0-9_]{1,32}$/.test(rawCode) ? rawCode : '';
+  let message = err && err.message != null ? String(err.message) : err ? String(err) : '';
+  message = message
+    .replace(/[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+/g, '[redacted]')
+    .replace(/\b[\w.+-]{1,64}@[\w.-]+/g, '[redacted]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g, '[redacted]')
+    .replace(/\[[0-9a-fA-F:]{2,}\](?::\d{1,5})?/g, '[redacted]')
+    .replace(/\b(?:[a-z0-9-]+\.)+[a-z]{2,24}(?::\d{1,5})?\b/gi, '[redacted]')
+    .replace(/\b(?:password|passwd|secret|token|apikey|api_key|credential|privkey)\s*[:=]\s*\S+/gi, '[redacted]')
+    .replace(/\b(user|role)\s+(?:"[^"]+"|\S+)/gi, '$1 [redacted]')
+    .replace(/\b[A-Za-z0-9+/_=-]{24,}\b/g, '[redacted]')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+  return { code, message };
+}
+
+export function pushLoadPhase(list, phase, startedAt, err) {
+  const durationMs = Math.max(0, Date.now() - startedAt);
+  const entry = { phase, durationMs };
+  if (err) {
+    const sanitized = sanitizePhaseError(err);
+    if (sanitized.code) entry.code = sanitized.code;
+    entry.message = sanitized.message || 'error';
+  }
+  list.push(entry);
+  const parts = [`[poa-dice] phase=${entry.phase}`, `durationMs=${entry.durationMs}`];
+  if (entry.code) parts.push(`code=${entry.code}`);
+  if (entry.message) parts.push(`message=${entry.message}`);
+  console.log(parts.join(' '));
+  return entry;
+}
+
 /** Postgres "it already exists" races during CREATE ... IF NOT EXISTS: unique_violation (pg_type/pg_class), duplicate_table, duplicate_object. */
 export function isPgAlreadyExists(err) {
   return Boolean(err) && ['23505', '42P07', '42710'].includes(String(err.code || ''));
@@ -519,6 +556,7 @@ export function createPostgresStore({ connectionString, key, query = null }) {
           max: 3,
           connectionTimeoutMillis: 10000,
           idleTimeoutMillis: 30000,
+          query_timeout: 15000,
           ssl: localNoSsl ? false : { rejectUnauthorized: strictSsl }
         });
         // An idle connection dropped by the server must not crash the process; the next query reconnects.
@@ -546,6 +584,9 @@ export function createPostgresStore({ connectionString, key, query = null }) {
     const client = await (await getPool()).connect();
     try {
       await client.query('BEGIN');
+      await client.query("SET LOCAL statement_timeout = '15s'");
+      await client.query("SET LOCAL lock_timeout = '10s'");
+      await client.query("SET LOCAL idle_in_transaction_session_timeout = '30s'");
       const out = await fn((t, p) => client.query(t, p));
       await client.query('COMMIT');
       return out;
@@ -585,6 +626,7 @@ export function createPostgresStore({ connectionString, key, query = null }) {
     return ready;
   };
   let fence = null; // {name, holder, token}: document writes only land while this lease is held
+  let lastLoadPhases = [];
   const defaultPgSave = async (doc) => {
     await init();
     const jsonStr = typeof doc === 'string' ? doc : JSON.stringify(doc);
@@ -619,10 +661,40 @@ export function createPostgresStore({ connectionString, key, query = null }) {
     async: true,
     location: `postgres#${key}`,
     durable: true,
+    get lastLoadPhases() {
+      return lastLoadPhases.map((phase) => ({ ...phase }));
+    },
     async load() {
-      await init();
-      const r = await q('SELECT doc FROM poa_dice_docs WHERE key = $1', [key]);
-      return r.rows[0] ? (typeof r.rows[0].doc === 'string' ? JSON.parse(r.rows[0].doc) : r.rows[0].doc) : null;
+      lastLoadPhases = [];
+      if (!query) {
+        const connectAt = Date.now();
+        try {
+          const connected = await getPool();
+          const client = await connected.connect();
+          client.release();
+          pushLoadPhase(lastLoadPhases, 'connect', connectAt);
+        } catch (err) {
+          pushLoadPhase(lastLoadPhases, 'connect', connectAt, err);
+          throw err;
+        }
+      }
+      const schemaAt = Date.now();
+      try {
+        await init();
+        pushLoadPhase(lastLoadPhases, 'schema_init', schemaAt);
+      } catch (err) {
+        pushLoadPhase(lastLoadPhases, 'schema_init', schemaAt, err);
+        throw err;
+      }
+      const loadAt = Date.now();
+      try {
+        const r = await q('SELECT doc FROM poa_dice_docs WHERE key = $1', [key]);
+        pushLoadPhase(lastLoadPhases, 'vault_load', loadAt);
+        return r.rows[0] ? (typeof r.rows[0].doc === 'string' ? JSON.parse(r.rows[0].doc) : r.rows[0].doc) : null;
+      } catch (err) {
+        pushLoadPhase(lastLoadPhases, 'vault_load', loadAt, err);
+        throw err;
+      }
     },
     save: defaultPgSave,
     async peek(claimKey) {
