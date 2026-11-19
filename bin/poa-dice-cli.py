@@ -147,75 +147,87 @@ def main() -> int:
     )
     parser.add_argument("--server", default=None, help="POA Dice server URL")
     parser.add_argument("--node", default=None, help="Minepoa node URL")
+    parser.add_argument("--wallet", default=None, help="Wallet key file or directory path")
+    parser.add_argument("--dataDir", dest="data_dir", default=None, help="Local offline data directory")
+    parser.add_argument("--admin-token", dest="admin_token", default=None, help="Admin Bearer token")
     parser.add_argument("--to", default=None, help="Bank vault address for offline-tx")
     parser.add_argument("--address", default=None, help="Target POA address")
     parser.add_argument("--txid", default=None, help="Transaction ID (64 hex)")
     parser.add_argument("--tool", default=None, help="Tool name for tx-templates")
-    parser.add_argument("--amount", default="10.000000", help="Amount in POA")
-    parser.add_argument("--under", type=float, default=49.50, help="Roll Under target")
+    parser.add_argument("--action", default=None, help="Memo action for offline-tx (BET, LP_ADD, LP_WITHDRAW, CLAIM, CHAT)")
+    parser.add_argument("--amount", default=None, help="Amount in POA")
+    parser.add_argument("--under", type=float, default=None, help="Roll Under target")
     parser.add_argument("--over", type=float, default=None, help="Roll Over target")
-    parser.add_argument("--epochs", type=int, default=4, help="Conviction lock epochs")
-    parser.add_argument("--bps", type=int, default=10000, help="Withdraw share basis points (1..10000)")
+    parser.add_argument("--epochs", type=int, default=None, help="Conviction lock epochs")
+    parser.add_argument("--ref", default=None, help="Referrer poa1 address for LP stake")
+    parser.add_argument("--bps", type=int, default=None, help="Withdraw share basis points (1..10000)")
     parser.add_argument("--shares", default=None, help="Exact share units to withdraw")
     parser.add_argument("--count", type=int, default=None, help="Batch roll count")
-    parser.add_argument("--seed", default="py-agent-seed-01", help="Client seed")
+    parser.add_argument("--wait", type=int, default=None, help="Wait timeout seconds for chain confirmation")
+    parser.add_argument("--limit", type=int, default=None, help="Max items returned (chat-read / feed)")
+    parser.add_argument("--name", default=None, help="Sender display name for signed chat")
+    parser.add_argument("--seed", default=None, help="Client seed")
     parser.add_argument("--server-seed", dest="server_seed", default=None, help="Revealed server seed")
     parser.add_argument("--seed-hash", dest="seed_hash", default=None, help="Expected server seed SHA-256")
     parser.add_argument("--nonce", type=int, default=None, help="Nonce")
-    parser.add_argument("--strategy", default="quarter_kelly", help="Auto-bet strategy")
-    parser.add_argument("--rolls", type=int, default=5, help="Auto-bet roll count")
+    parser.add_argument("--parents", default=None, help="Comma-separated parent txids for offline-tx")
+    parser.add_argument("--strategy", default=None, help="Auto-bet strategy")
+    parser.add_argument("--rolls", type=int, default=None, help="Auto-bet roll count")
     parser.add_argument("--stop-on-profit", dest="stop_on_profit", default=None, help="Take-profit in POA")
     parser.add_argument("--stop-on-loss", dest="stop_on_loss", default=None, help="Stop-loss in POA")
     parser.add_argument("--max-spend", dest="max_spend", default=None, help="Max total spend in POA")
     parser.add_argument("--sequential", action="store_true", help="Confirm-per-roll sequential batch")
+    parser.add_argument("--compound", action="store_true", help="Trigger epoch incentive compounding (admin)")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Dry run (claim-yield)")
-    parser.add_argument("--message", default="GM from Python agent", help="Chat message")
+    parser.add_argument("--message", default=None, help="Chat message")
     parser.add_argument("--offline", action="store_true", help="Force website-independent offline execution")
 
     args = parser.parse_args()
     if args.self_test:
         return run_self_test()
 
-    node_args = [args.command, "--amount", str(args.amount)]
-    if args.over is not None:
-        node_args += ["--over", str(args.over)]
-    else:
-        node_args += ["--under", str(args.under)]
-    node_args += [
-        "--epochs",
-        str(args.epochs),
-        "--bps",
-        str(args.bps),
-        "--seed",
-        str(args.seed),
-        "--strategy",
-        str(args.strategy),
-        "--rolls",
-        str(args.rolls),
-        "--message",
-        str(args.message),
-    ]
+    node_args = [args.command]
     optional_pairs = [
         ("--server", args.server),
         ("--node", args.node),
+        ("--wallet", args.wallet),
+        ("--dataDir", args.data_dir),
+        ("--admin-token", args.admin_token),
         ("--to", args.to),
         ("--address", args.address),
         ("--txid", args.txid),
         ("--tool", args.tool),
+        ("--action", args.action),
+        ("--amount", args.amount),
+        ("--over", args.over),
+        ("--under", args.under if args.over is None else None),
+        ("--epochs", args.epochs),
+        ("--ref", args.ref),
+        ("--bps", args.bps),
         ("--shares", args.shares),
         ("--count", args.count),
+        ("--wait", args.wait),
+        ("--limit", args.limit),
+        ("--name", args.name),
+        ("--seed", args.seed),
         ("--server-seed", args.server_seed),
         ("--seed-hash", args.seed_hash),
         ("--nonce", args.nonce),
+        ("--parents", args.parents),
+        ("--strategy", args.strategy),
+        ("--rolls", args.rolls),
         ("--stop-on-profit", args.stop_on_profit),
         ("--stop-on-loss", args.stop_on_loss),
         ("--max-spend", args.max_spend),
+        ("--message", args.message),
     ]
     for flag, val in optional_pairs:
         if val is not None:
             node_args += [flag, str(val)]
     if args.sequential:
         node_args.append("--sequential")
+    if args.compound:
+        node_args.append("--compound")
     if args.dry_run:
         node_args.append("--dry-run")
     if args.offline:

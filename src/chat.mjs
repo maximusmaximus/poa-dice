@@ -125,3 +125,33 @@ export function postSignedChat(engine, args = {}) {
   });
   return { ok: true, envelopeVersion: v.version, ...message };
 }
+
+/**
+ * Durable multi-instance signed chat post: validates and posts locally, and in chain mode
+ * persists the verified message into the shared claim table (`chat:<ts>:<id>`) so posts
+ * made on standby instances survive reloads and propagate across all instances.
+ */
+export async function postSignedChatDurable(engine, args = {}, { settlement = null } = {}) {
+  const out = postSignedChat(engine, args);
+  if (!out.ok) return out;
+  const store = settlement?.store;
+  if (store && typeof store.claim === 'function') {
+    const key = `chat:${String(out.ts || Math.floor(Date.now() / 1000)).padStart(12, '0')}:${out.id}`;
+    try {
+      await store.claim(key, {
+        id: out.id,
+        ts: out.ts,
+        address: out.address,
+        senderName: out.senderName,
+        text: out.text,
+        isAgent: Boolean(out.isAgent),
+        signature: out.signature,
+        verified: true,
+        envelopeVersion: out.envelopeVersion
+      });
+    } catch {
+      // non-fatal: local message already posted; next tick retries or remains in local memory
+    }
+  }
+  return out;
+}

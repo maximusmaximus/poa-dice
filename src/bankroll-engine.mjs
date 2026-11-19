@@ -1388,6 +1388,7 @@ export class BankrollEngine {
     };
     this.processedTxids.set(sweepTxid, receipt);
     this.bankHistory.unshift(receipt);
+    if (this.bankHistory.length > 200) this.bankHistory.pop();
     this._saveToDisk();
     this._emit('dev.swept', receipt);
     return receipt;
@@ -1515,6 +1516,7 @@ export class BankrollEngine {
       ts
     };
     this.bankHistory.unshift(summary);
+    if (this.bankHistory.length > 200) this.bankHistory.pop();
     this._saveToDisk();
     this._emit('incentives.distributed', summary);
     return summary;

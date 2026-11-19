@@ -508,10 +508,17 @@ export function pushLoadPhase(list, phase, startedAt, err) {
     entry.message = sanitized.message || 'error';
   }
   list.push(entry);
-  const parts = [`[poa-dice] phase=${entry.phase}`, `durationMs=${entry.durationMs}`];
-  if (entry.code) parts.push(`code=${entry.code}`);
-  if (entry.message) parts.push(`message=${entry.message}`);
-  console.log(parts.join(' '));
+  const shouldLog =
+    Boolean(err) ||
+    entry.durationMs >= 500 ||
+    entry.phase !== 'vault_load' ||
+    process.env.POA_DICE_LOG_LOAD_PHASES === '1';
+  if (shouldLog) {
+    const parts = [`[poa-dice] phase=${entry.phase}`, `durationMs=${entry.durationMs}`];
+    if (entry.code) parts.push(`code=${entry.code}`);
+    if (entry.message) parts.push(`message=${entry.message}`);
+    console.log(parts.join(' '));
+  }
   return entry;
 }
 

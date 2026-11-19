@@ -23,7 +23,7 @@ import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
 import { MCP_INSTRUCTIONS, MCP_TOOLS, McpHandler, ROLL_FORMULA } from './mcp-server.mjs';
 import { executeBatch, quoteAllCounts, quoteBatch } from './batch-roll.mjs';
-import { postSignedChat } from './chat.mjs';
+import { postSignedChatDurable } from './chat.mjs';
 import { quoteAutoBet, quoteClaimYield, quoteStake, quoteUnstake } from './actions.mjs';
 import { transferTemplates } from './tx-templates.mjs';
 import { isAddress as isPoaAddress, looksLikePrivkey, walletBalance } from './wallet-balance.mjs';
@@ -49,11 +49,6 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
-const SRC_DIR = path.resolve(__dirname);
-// Browser-safe modules the UI may import. Never add server modules (keys, handlers) here.
-const PUBLIC_SRC_MODULES = new Map([
-  ['/src/ledger-ui.mjs', path.join(SRC_DIR, 'ledger-ui.mjs')]
-]);
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -67,27 +62,56 @@ const MIME_TYPES = {
 /** POST paths that move POA; refused (503) while chain mode is read-only. */
 const WRITE_PATHS = new Set(['/api/tx/submit', '/api/action/sign-and-submit', '/api/action/auto-bet', '/api/action/batch-roll', '/api/dev/sweep', '/api/epoch/advance']);
 
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
+};
+
+const HTML_CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://minepoa.com; frame-ancestors 'none'; base-uri 'self'; object-src 'none'";
+
 function sendJson(res, status, data) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
+    ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    ...(status === 413 || status === 408 ? { Connection: 'close' } : {})
   });
   res.end(body);
 }
 
-function readJsonBody(req, maxBytes = 262144) {
+function readJsonBody(req, maxBytes = 262144, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false;
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(val);
+    };
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            const err = Object.assign(new Error('Request body timeout'), { status: 408 });
+            finish(err);
+          }, timeoutMs)
+        : null;
+    if (timer?.unref) timer.unref();
     req.on('data', (chunk) => {
+      if (settled) return;
       size += chunk.length;
       if (size > maxBytes) {
-        reject(new Error('Request body too large'));
-        req.destroy();
+        req.pause();
+        finish(Object.assign(new Error('Request body too large'), { status: 413 }));
         return;
       }
       chunks.push(chunk);
@@ -95,12 +119,12 @@ function readJsonBody(req, maxBytes = 262144) {
     req.on('end', () => {
       try {
         const raw = Buffer.concat(chunks).toString('utf8').trim();
-        resolve(raw ? JSON.parse(raw) : {});
+        finish(null, raw ? JSON.parse(raw) : {});
       } catch {
-        reject(new Error('Invalid JSON payload'));
+        finish(Object.assign(new Error('Invalid JSON payload'), { status: 400 }));
       }
     });
-    req.on('error', reject);
+    req.on('error', (err) => finish(err));
   });
 }
 
@@ -339,14 +363,30 @@ export function createDiceServer(options = {}) {
   const tickBudgetMs = options.tickBudgetMs ?? 25000;
   const readPassBudgetMs = options.readPassBudgetMs ?? 4000;
   const chainCache = new Map();
+  const explorerInflight = new Map();
   const pendingSpend = new Map(); // address -> micros reserved by in-flight batches
   let chainDebits = dataDir ? loadDebits(dataDir) : [];
   const rateLimitMax = options.rateLimitMax ?? Number(process.env.POA_DICE_RATE_LIMIT_PER_MIN ?? 600);
+  const trustProxy = options.trustProxy !== undefined ? Boolean(options.trustProxy) : process.env.POA_DICE_TRUST_PROXY === '1';
+  const internalProxySecret = options.internalProxySecret ? String(options.internalProxySecret) : null;
+  const disallowCustodialPrivkey =
+    options.disallowCustodialPrivkey !== undefined
+      ? Boolean(options.disallowCustodialPrivkey)
+      : process.env.POA_DICE_DISALLOW_CUSTODIAL_PRIVKEY === '1';
   const ipBuckets = new Map();
 
   function clientIpOf(req) {
-    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-    return xff || req.socket?.remoteAddress || 'unknown';
+    if (internalProxySecret && req.headers['x-poa-internal-proxy'] === internalProxySecret) {
+      const proxied = String(req.headers['x-poa-client-ip'] || '').split(',')[0].trim();
+      if (proxied) return proxied;
+    }
+    const vercelIp = String(req.headers['x-vercel-forwarded-for'] || '').split(',')[0].trim();
+    if (vercelIp) return vercelIp;
+    if (trustProxy) {
+      const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+      if (xff) return xff;
+    }
+    return req.socket?.remoteAddress || 'unknown';
   }
 
   function checkRateLimit(req) {
@@ -371,12 +411,24 @@ export function createDiceServer(options = {}) {
     let row;
     if (hit && Date.now() - hit.at < chainCacheMs) row = hit.row;
     else {
-      row = await chainFetch(address);
-      if (!chainCache.has(address) && chainCache.size >= 1000) {
-        const oldest = chainCache.keys().next().value;
-        if (oldest !== undefined) chainCache.delete(oldest);
+      let pending = explorerInflight.get(address);
+      if (!pending) {
+        pending = Promise.resolve()
+          .then(() => chainFetch(address))
+          .then((fetched) => {
+            if (!chainCache.has(address) && chainCache.size >= 1000) {
+              const oldest = chainCache.keys().next().value;
+              if (oldest !== undefined) chainCache.delete(oldest);
+            }
+            chainCache.set(address, { at: Date.now(), row: fetched });
+            return fetched;
+          })
+          .finally(() => {
+            if (explorerInflight.get(address) === pending) explorerInflight.delete(address);
+          });
+        explorerInflight.set(address, pending);
       }
-      chainCache.set(address, { at: Date.now(), row });
+      row = await pending;
     }
     if (withTxDetails && !row.txDetails) {
       row.txDetails = (row.txs || []).length ? await loadTxDetails(row, chainTxFetch, { cache: coveredTxCache }) : {};
@@ -449,6 +501,7 @@ export function createDiceServer(options = {}) {
     chainRequired: requireChain,
     chainContext,
     adminToken,
+    disallowCustodialPrivkey,
     bankAddress: () => publicBankAddress(),
     chainId: () => chainIdValue(),
     waitPollMs: options.mcpWaitPollMs,
@@ -570,7 +623,10 @@ export function createDiceServer(options = {}) {
         probeStatus: sum.ledger?.status ?? null,
         trading: sum.trading,
         chainOk: null,
-        navPoa: fromMicros(engine.bankNavMicros)
+        navPoa: fromMicros(engine.bankNavMicros),
+        hasChain: requireChain,
+        readOnly: Boolean(readOnlyState),
+        reconcileStatus: sum.reconcile?.status ?? null
       }),
       writer: sum.writer,
       leader: sum.leader,
@@ -612,8 +668,13 @@ export function createDiceServer(options = {}) {
         await settlement.maybePass({ budgetMs: readPassBudgetMs }).catch(() => {});
       }
 
+      const isExplorerAddressGet =
+        req.method === 'GET' &&
+        requireChain &&
+        Boolean(urlObj.searchParams.get('address')) &&
+        (pathname === '/api/state' || pathname === '/api/status' || pathname === '/api/quote/batch' || pathname === '/api/quote/actions');
       if (
-        (req.method === 'POST' || pathname === '/api/audit/chain' || pathname.startsWith('/api/wallet/')) &&
+        (req.method === 'POST' || pathname === '/api/audit/chain' || pathname.startsWith('/api/wallet/') || isExplorerAddressGet) &&
         pathname !== '/api/settlement/tick' &&
         !checkRateLimit(req)
       ) {
@@ -726,7 +787,8 @@ export function createDiceServer(options = {}) {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
           Connection: 'keep-alive',
-          'Access-Control-Allow-Origin': '*'
+          'Access-Control-Allow-Origin': '*',
+          'X-Content-Type-Options': 'nosniff'
         });
         res.write(
           `data: ${JSON.stringify({
@@ -790,7 +852,10 @@ export function createDiceServer(options = {}) {
           probeStatus: summary.settlement?.ledger?.status ?? null,
           trading: summary.settlement?.trading ?? null,
           chainOk: summary.chain ? summary.chain.ok : null,
-          navPoa: summary.bankroll?.bankNavPoa ?? null
+          navPoa: summary.bankroll?.bankNavPoa ?? null,
+          hasChain: requireChain,
+          readOnly: Boolean(readOnlyState),
+          reconcileStatus: summary.settlement?.reconcile?.status ?? null
         });
         if (summary.settlement) summary.settlement.ledgerUi = summary.ledgerUi;
         return sendJson(res, 200, summary);
@@ -937,6 +1002,16 @@ export function createDiceServer(options = {}) {
 
       if (pathname === '/api/action/sign-and-submit' && req.method === 'POST') {
         const body = await readJsonBody(req);
+        if (disallowCustodialPrivkey && body.privkey) {
+          return sendJson(res, 400, {
+            ok: false,
+            code: 'custodial_privkey_disabled',
+            error: 'Server-side privkey signing is disabled on this instance; sign locally and submit signed_tx via /api/tx/submit.'
+          });
+        }
+        if (settlement && !body.privkey) {
+          return sendJson(res, 400, { ok: false, error: 'Chain-settled server: sign with your own wallet' });
+        }
         const wallet = body.privkey ? walletFromPrivkey(body.privkey) : genKeypair();
         const action = String(body.action || 'BET').toUpperCase();
         const memo = formatDiceMemo({
@@ -957,7 +1032,6 @@ export function createDiceServer(options = {}) {
         if (action === 'BET' || action === 'LP_ADD') {
           await assertChainSpendable(wallet.address, amount);
         }
-        if (settlement && !body.privkey) return sendJson(res, 400, { ok: false, error: 'Chain-settled server: sign with your own wallet' });
         const signedTx = await watcher.buildPlayerTransfer(wallet, { amount, memo, nonce: body.nonce ? Number(body.nonce) : null });
         const receipt = await watcher.submitSignedTransaction(signedTx);
         if ((action === 'BET' || action === 'LP_ADD') && (receipt?.action === 'BET_SETTLED' || receipt?.action === 'LP_DEPOSIT')) {
@@ -973,6 +1047,13 @@ export function createDiceServer(options = {}) {
 
       if (pathname === '/api/action/batch-roll' && req.method === 'POST') {
         const body = await readJsonBody(req, 4 * 1024 * 1024);
+        if (disallowCustodialPrivkey && body.privkey) {
+          return sendJson(res, 400, {
+            ok: false,
+            code: 'custodial_privkey_disabled',
+            error: 'Server-side privkey signing is disabled on this instance; sign locally and pass signed_txs.'
+          });
+        }
         if (requireChain && !body.privkey && !Array.isArray(body.signed_txs)) {
           return sendJson(res, 400, { ok: false, error: 'This server is chain-backed: pass signed_txs or privkey.' });
         }
@@ -980,26 +1061,62 @@ export function createDiceServer(options = {}) {
           const out = await executeBatch({ engine, watcher, hooks: mcpHooks, args: body });
           return sendJson(res, 200, out);
         } catch (err) {
-          return sendJson(res, err.status || 400, { ok: false, error: redactSecrets(err.message), quote: err.quote || null });
+          return sendJson(res, err.status || 400, {
+            ok: false,
+            ...(err.code ? { code: err.code } : {}),
+            error: redactSecrets(err.message),
+            quote: err.quote || null
+          });
         }
       }
 
       if (pathname === '/api/action/auto-bet' && req.method === 'POST') {
         const body = await readJsonBody(req);
+        if (settlement) {
+          return sendJson(res, 400, {
+            ok: false,
+            code: 'chain_mode_sequential_required',
+            error:
+              'Auto-bet strategies require sequential roll settlement and are not supported on a chain-settled server; use /api/action/batch-roll with signed_txs or submit rolls sequentially.'
+          });
+        }
+        if (disallowCustodialPrivkey && body.privkey) {
+          return sendJson(res, 400, {
+            ok: false,
+            code: 'custodial_privkey_disabled',
+            error: 'Server-side privkey signing is disabled on this instance.'
+          });
+        }
         const wallet = body.privkey ? walletFromPrivkey(body.privkey) : genKeypair();
         const rolls = Math.max(1, Math.min(25, Number(body.rolls ?? 5)));
         const each = String(body.baseWagerPoa || body.amountPoa || '10.000000');
-        await assertChainSpendable(wallet.address, fromMicros(toMicros(each) * BigInt(rolls)));
+        const strategy = body.strategy || 'quarter_kelly';
+        const aq = quoteAutoBet(engine, {
+          address: wallet.address,
+          strategy,
+          baseWagerPoa: each,
+          targetBps: Number(body.targetBps ?? 4950),
+          direction: body.direction || 'under',
+          rolls,
+          clientSeed: body.clientSeed || 'web-auto-strategy',
+          maxTotalSpendPoa: body.maxTotalSpendPoa || null,
+          chain: await chainContext(wallet.address)
+        });
+        if (!aq.valid) {
+          return sendJson(res, 400, { ok: false, code: aq.code || 'invalid_auto_bet', error: aq.reason || 'Auto-bet parameters outside allowed limits', quote: aq });
+        }
+        await assertChainSpendable(wallet.address, aq.worstCaseSpendPoa || fromMicros(toMicros(each) * BigInt(rolls)));
         const result = watcher.executeAutoStrategy({
           wallet,
-          strategy: body.strategy || 'quarter_kelly',
+          strategy,
           baseWagerPoa: each,
           targetBps: Number(body.targetBps ?? 4950),
           direction: body.direction || 'under',
           rolls,
           clientSeed: body.clientSeed || 'web-auto-strategy',
           stopOnProfitPoa: body.stopOnProfitPoa || null,
-          stopOnLossPoa: body.stopOnLossPoa || null
+          stopOnLossPoa: body.stopOnLossPoa || null,
+          maxTotalSpendPoa: aq.maxTotalSpendPoa
         });
         for (const receipt of result.receipts || []) {
           if (receipt?.betTxid && receipt.wagerPoa) noteChainDebit(wallet.address, receipt.betTxid, receipt.wagerPoa);
@@ -1066,6 +1183,29 @@ export function createDiceServer(options = {}) {
         }
       }
 
+      // Inspect, approve, or dismiss a HELD rejected repayment. Admin only; dry-run by default.
+      if (pathname === '/api/admin/repayments/resolve' && req.method === 'POST') {
+        if (!isAdmin(req)) return denyAdmin(res);
+        if (!settlement) return sendJson(res, 503, { ok: false, error: 'chain settlement is not running on this instance' });
+        const body = await readJsonBody(req);
+        const extra = Object.keys(body || {}).filter((k) => !['orderId', 'action', 'confirm', 'note'].includes(k));
+        if (extra.length) return sendJson(res, 400, { ok: false, error: `unexpected fields: ${extra.join(', ')}` });
+        if (body.confirm !== undefined && typeof body.confirm !== 'boolean') return sendJson(res, 400, { ok: false, error: 'confirm must be true or false' });
+        try {
+          return sendJson(res, 200, {
+            ok: true,
+            ...(await settlement.resolveHeldRepayment({
+              orderId: String(body.orderId || ''),
+              action: String(body.action || ''),
+              confirm: body.confirm === true,
+              note: typeof body.note === 'string' ? body.note : ''
+            }))
+          });
+        } catch (err) {
+          return sendJson(res, err.status || 409, { ok: false, error: redactSecrets(err.message), ...(err.details ? err.details : {}) });
+        }
+      }
+
       if (pathname === '/api/seed/rotate' && req.method === 'POST') {
         if (!isAdmin(req)) return denyAdmin(res);
         if (readOnlyState) return sendJson(res, 503, { ok: false, status: readOnlyState.status, error: readOnlyState.error });
@@ -1119,7 +1259,7 @@ export function createDiceServer(options = {}) {
       // over the exact text. No unsigned posts and no private keys.
       if (pathname === '/api/chat' && req.method === 'POST') {
         const body = await readJsonBody(req);
-        const out = postSignedChat(engine, body || {});
+        const out = await postSignedChatDurable(engine, body || {}, { settlement });
         if (!out.ok) return sendJson(res, 400, out);
         return sendJson(res, 200, { ok: true, message: out });
       }
@@ -1164,30 +1304,13 @@ export function createDiceServer(options = {}) {
         const ext = path.extname(filePath).toLowerCase();
         const contentType = MIME_TYPES[ext] || 'application/octet-stream';
         res.writeHead(200, {
+          ...SECURITY_HEADERS,
+          ...(ext === '.html' ? { 'Content-Security-Policy': HTML_CSP } : {}),
           'Content-Type': contentType,
           'Cache-Control': 'no-cache'
         });
         fs.createReadStream(filePath).pipe(res);
         return;
-      }
-
-      const allowedSrc = PUBLIC_SRC_MODULES.get(pathname);
-      if (allowedSrc) {
-        const resolved = path.resolve(allowedSrc);
-        if (
-          resolved === path.join(SRC_DIR, 'ledger-ui.mjs') &&
-          fs.existsSync(resolved) &&
-          fs.statSync(resolved).isFile()
-        ) {
-          const ext = path.extname(resolved).toLowerCase();
-          const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-          res.writeHead(200, {
-            'Content-Type': contentType,
-            'Cache-Control': 'no-cache'
-          });
-          fs.createReadStream(resolved).pipe(res);
-          return;
-        }
       }
 
       return sendJson(res, 404, { error: `Route not found: ${pathname}` });

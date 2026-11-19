@@ -1,17 +1,6 @@
 // @ts-nocheck
 /**
- * One ledger decision for the header, the CHAIN DOWN banner, the betting-paused banner, and NAV.
- * A live probe (anything but UNAVAILABLE) wins over a failed explorer read, so those four cannot disagree.
+ * Re-export browser-safe ledger UI state helper from public/ledger-ui.js
+ * so server, tests, and browser share one exact module inside public/.
  */
-export function ledgerUiState({ probeStatus = null, trading = null, chainOk = null, navPoa = null } = {}) {
-  const probeDown = probeStatus === 'UNAVAILABLE' || trading === 'PAUSED_LEDGER_UNAVAILABLE';
-  const chainDown = probeStatus == null && chainOk === false;
-  const down = Boolean(probeDown || chainDown);
-  return {
-    up: !down,
-    header: down ? 'CHAIN DOWN' : 'CHAIN LIVE',
-    chainDown: down,
-    bettingPaused: down,
-    navPoa
-  };
-}
+export { ledgerUiState } from '../public/ledger-ui.js';

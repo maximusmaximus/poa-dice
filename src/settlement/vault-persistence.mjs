@@ -306,8 +306,13 @@ export const vaultPersistenceMethods = {
       }
     }
 
-    // 2. Fold bankHistory beyond maxBankHistoryRecent into exact checkpoints
+    // 2. Capture ledgerTs on inbound records before folding bankHistory, then fold bankHistory into exact checkpoints
     const hist = bankHistoryOf(this.state);
+    for (const r of Object.values(this.state.inbound)) {
+      if (!r.ledgerTs && hist.txs?.[r.txid]?.ts) {
+        r.ledgerTs = Number(hist.txs[r.txid].ts);
+      }
+    }
     const folded = compactBankHistory(hist, {
       keepRecent: this.maxBankHistoryRecent,
       guardWindow: Math.max(500, this.addressListCap * 2)
@@ -348,12 +353,21 @@ export const vaultPersistenceMethods = {
       const toRemoveIn = prunableIn.slice(0, Math.max(0, excessIn));
       if (toRemoveIn.length > 0) {
         this.state.compacted = this.state.compacted || { inbound: 0, outbound: 0 };
+        if (!Array.isArray(this.state.compacted.recentInboundIds)) this.state.compacted.recentInboundIds = [];
         for (const r of toRemoveIn) {
           if (r.acceptedBy === 'standby' && !r.acceptedClaimCleaned) {
             await this._persist.deleteClaim(`accepted:${r.txid}`).catch(() => {});
           }
+          const lts = Number(r.ledgerTs || 0);
+          if (lts > 0) {
+            this.state.compacted.inboundThroughTs = Math.max(Number(this.state.compacted.inboundThroughTs || 0), lts);
+          }
+          if (r.txid) this.state.compacted.recentInboundIds.push(r.txid);
           delete this.state.inbound[r.txid];
           this.state.compacted.inbound += 1;
+        }
+        if (this.state.compacted.recentInboundIds.length > 2000) {
+          this.state.compacted.recentInboundIds = this.state.compacted.recentInboundIds.slice(-2000);
         }
         this._invalidatePlayTime();
         dirty = true;
@@ -369,7 +383,7 @@ export const vaultPersistenceMethods = {
             o.status === 'CONFIRMED' &&
             !o.repay &&
             !o.repayBlocked &&
-            (o.confirmedVia !== 'receipt' || this._listedFinal(o.txid)) &&
+            this._listedFinal(o.txid) &&
             !this.state.inbound[o.sourceTxid] &&
             (outEntries.length > this.maxHotOutbound * 1.1 || Number(o.confirmedAt || 0) <= cutoff)
         )
@@ -421,6 +435,42 @@ export const vaultPersistenceMethods = {
         await this._persist.deleteClaim(`group:${id}`).catch(() => {});
         dirty = true;
       }
+    }
+
+    // 8. Prune confirmed / rejected `bank-nonce:<n>` claims below the confirmed nonce floor so poa_dice_claims stays bounded
+    const confirmedFloor = typeof this._confirmedNonceFloor === 'function' ? this._confirmedNonceFloor() : 0;
+    if (confirmedFloor > 0) {
+      try {
+        const nonceClaims = await this._persist.listClaims('bank-nonce:');
+        let deleted = 0;
+        for (const c of nonceClaims || []) {
+          const m = /^bank-nonce:(\d+)$/.exec(String(c?.key || ''));
+          if (!m) continue;
+          const n = Number(m[1]);
+          const ord = c.value?.orderId ? this.state.outbound[c.value.orderId] : null;
+          const active = ord && (ord.status === 'SIGNED' || (ord.status === 'SENT' && !ord.receipt));
+          if (!active && (n < confirmedFloor || this._nonceReservedByRejected?.(c.value?.orderId))) {
+            await this._persist.deleteClaim(c.key).catch(() => {});
+            deleted += 1;
+            if (deleted >= 200) break;
+          }
+        }
+      } catch {
+        // retry on next compaction pass
+      }
+    }
+
+    // 9. Prune old `chat:` claims beyond the latest 150 so shared chat claims stay bounded
+    try {
+      const chatClaims = await this._persist.listClaims('chat:');
+      if (chatClaims && chatClaims.length > 150) {
+        const ordered = [...chatClaims].sort((a, b) => String(a.key || '').localeCompare(String(b.key || '')));
+        for (const c of ordered.slice(0, ordered.length - 150)) {
+          await this._persist.deleteClaim(c.key).catch(() => {});
+        }
+      }
+    } catch {
+      // retry on next compaction pass
     }
 
     if (dirty) this._save();

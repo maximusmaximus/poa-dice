@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { ledgerUiState } from '../src/ledger-ui.mjs';
+import { ledgerUiState } from './ledger-ui.js';
 /**
  * POA Dice — browser controller (public/app.js)
  *
@@ -43,6 +43,7 @@ const state = {
   recentBets: [],
   stakers: [],
   sseConnected: false,
+  sseEverOpened: false,
   batch: null,
 };
 
@@ -290,7 +291,9 @@ function actionTemplate(kind) {
 function actionPrompt(kind) {
   const addr = state.playerAddress;
   if (kind === 'stake') {
-    const amount = Number($('depositAmountInput').value || 0).toFixed(6);
+    const rawAmt = String($('depositAmountInput').value || '').trim();
+    const parsedAmt = parsePoaMicros(rawAmt);
+    const amount = parsedAmt !== null ? formatPoaMicros(parsedAmt) : Number(rawAmt || 0).toFixed(6);
     const lock = Number($('lockEpochsInput').value || 0);
     const ref = String($('referrerInput').value || '').trim();
     const args = { amount_poa: amount, lock_epochs: lock, max_total_spend_poa: amount };
@@ -422,14 +425,55 @@ function setReason(id, text) {
   }
 }
 
-/** Site-wide notice row under the header. CHAIN DOWN follows the shared ledger state, not a lone quote. */
+function effectiveChainDown() {
+  const text = state.chainDownRolls || state.chainDownActions;
+  if (state.ledgerUi?.ledgerPaused) return true;
+  if (state.ledgerUi?.probeLive) return false;
+  if (state.batchQuotes || state.actionQuotes) return Boolean(text);
+  return Boolean(state.ledgerUi?.chainDown);
+}
+
+function syncHeaderStatus() {
+  const down = effectiveChainDown();
+  if (!state.sseConnected && state.sseEverOpened) {
+    setStatus('RECONNECTING', 'down');
+    return;
+  }
+  if (down) {
+    setStatus('CHAIN DOWN', 'down');
+    return;
+  }
+  if (state.ledgerUi?.vaultHold) {
+    setStatus(state.ledgerUi.header || 'VAULT HOLD', 'down');
+    return;
+  }
+  if (state.ledgerUi) {
+    setStatus(state.ledgerUi.header, 'live');
+  }
+}
+
+/** Site-wide notice row under the header. CHAIN DOWN follows the shared ledger state; live probe wins over explorer lag. */
 function renderSiteNotices() {
   const text = state.chainDownRolls || state.chainDownActions;
   const el = document.getElementById('chainDownNotice');
-  if (!el) return;
-  const down = state.ledgerUi ? state.ledgerUi.chainDown : Boolean(text);
-  if (text) $('chainDownText').textContent = text;
-  el.classList.toggle('hidden', !down);
+  const down = effectiveChainDown();
+  if (el) {
+    if (text) $('chainDownText').textContent = text;
+    el.classList.toggle('hidden', !down);
+  }
+  const holdEl = document.getElementById('vaultHoldNotice');
+  if (holdEl) {
+    const showHold = !down && Boolean(state.ledgerUi?.vaultHold);
+    if (showHold) {
+      const reason =
+        state.summary?.settlement?.reconcile?.reason ||
+        state.summary?.settlement?.writer?.reason ||
+        `Vault is in ${state.ledgerUi?.holdCode || 'HOLD'} state; bets and withdrawals are temporarily paused.`;
+      $('vaultHoldText').textContent = reason;
+    }
+    holdEl.classList.toggle('hidden', !showHold);
+  }
+  syncHeaderStatus();
 }
 
 function renderRollAvailability() {
@@ -638,11 +682,13 @@ function applyStateSnapshot(data) {
     probeStatus: data?.settlement?.ledger?.status ?? null,
     trading: data?.settlement?.trading ?? null,
     chainOk: data?.chain ? data.chain.ok : null,
-    navPoa
+    navPoa,
+    hasChain: Boolean(data?.chain || data?.settlement),
+    reconcileStatus: data?.settlement?.reconcile?.status ?? null
   });
-  state.ledgerPaused = state.ledgerUi.bettingPaused;
+  state.ledgerPaused = Boolean(state.ledgerUi.ledgerPaused);
   const banner = document.getElementById('ledgerPausedBanner');
-  if (banner) banner.classList.toggle('hidden', !state.ledgerUi.bettingPaused);
+  if (banner) banner.classList.toggle('hidden', !state.ledgerUi.ledgerPaused);
   renderRollAvailability();
   renderActionAvailability();
   const b = data.bankroll;
@@ -654,7 +700,10 @@ function applyStateSnapshot(data) {
   renderAvgPlayTime(data.playTime);
   if (data.stats) {
     $('statTotalBets').textContent = String(data.stats.totalBetsCount);
-    $('statHouseNet').textContent = `House net ${formatNum(data.stats.netHouseProfitPoa, 4)} POA`;
+    const pendingIn = Array.isArray(data.settlement?.openInbound) ? data.settlement.openInbound.length : 0;
+    $('statHouseNet').textContent = pendingIn > 0
+      ? `House net ${formatNum(data.stats.netHouseProfitPoa, 4)} POA · ${pendingIn} pending`
+      : `House net ${formatNum(data.stats.netHouseProfitPoa, 4)} POA`;
   }
   const chain = data.chain;
   $('topBankChain').textContent = chain ? (chain.bank?.balance ? `Chain ${chain.bank.balance} POA` : 'Chain unavailable') : 'Local ledger';
@@ -669,7 +718,7 @@ function applyStateSnapshot(data) {
   } else {
     $('chainBalanceText').textContent = 'Add it to check your balance and LP position.';
   }
-  setStatus(state.ledgerUi.header, state.ledgerUi.chainDown ? 'down' : 'live');
+  syncHeaderStatus();
 
   if (data.devReserve) {
     $('topDevAddrShort').textContent = shortAddr(data.devReserve.address);
@@ -892,6 +941,48 @@ function renderChatJoin() {
   $('chatJoinPreview').textContent = chatJoinPrompt();
 }
 
+async function verifyRollLocally({ serverSeed, serverSeedHash, clientSeed, nonce, betTxid, targetBps, direction }) {
+  const enc = new TextEncoder();
+  const toHex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+  const seed = String(serverSeed || '').trim();
+  const seedHashBuf = await window.crypto.subtle.digest('SHA-256', enc.encode(seed));
+  const computedServerSeedHash = toHex(seedHashBuf);
+  const hashMatches = serverSeedHash ? computedServerSeedHash === String(serverSeedHash).trim().toLowerCase() : null;
+  const message = `${clientSeed}:${Number(nonce)}:${betTxid}`;
+  const key = await window.crypto.subtle.importKey('raw', enc.encode(seed), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await window.crypto.subtle.sign('HMAC', key, enc.encode(message)));
+  const view = new DataView(sig.buffer, sig.byteOffset, sig.byteLength);
+  const UNBIASED_MAX = 18446744073709550000n;
+  let chosen = view.getBigUint64(0, false);
+  for (let off = 0; off <= 24; off += 8) {
+    const w = view.getBigUint64(off, false);
+    if (w < UNBIASED_MAX) {
+      chosen = w;
+      break;
+    }
+  }
+  const rollBps = Number(chosen % 10000n);
+  const rollDisplay = `${String(Math.floor(rollBps / 100)).padStart(2, '0')}.${String(rollBps % 100).padStart(2, '0')}`;
+  const dir = String(direction || 'under').toLowerCase();
+  const t = Number(targetBps);
+  const won = dir === 'under' ? rollBps < t : rollBps > t;
+  return {
+    verified: hashMatches !== false,
+    verifiedLocally: true,
+    note: 'Verified locally in browser via WebCrypto (server unreachable).',
+    computedServerSeedHash,
+    expectedServerSeedHash: serverSeedHash || null,
+    hashMatches,
+    message,
+    hmacHex: toHex(sig),
+    rollBps,
+    rollDisplay,
+    targetBps: t,
+    direction: dir,
+    won
+  };
+}
+
 async function runVerifyRoll() {
   const payload = {
     serverSeed: $('verifyServerSeed').value.trim(),
@@ -906,8 +997,18 @@ async function runVerifyRoll() {
     $('verifyResultPre').textContent = 'Paste the revealed server_seed first. Seeds are revealed when the house rotates them.';
     return;
   }
-  const res = await fetch(api('/api/verify'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  $('verifyResultPre').textContent = JSON.stringify(await res.json(), null, 2);
+  try {
+    const res = await fetch(api('/api/verify'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    $('verifyResultPre').textContent = JSON.stringify(await res.json(), null, 2);
+  } catch {
+    try {
+      const local = await verifyRollLocally(payload);
+      $('verifyResultPre').textContent = JSON.stringify(local, null, 2);
+    } catch (err) {
+      $('verifyResultPre').textContent = `Verification failed: ${err?.message || err}`;
+    }
+  }
 }
 
 // ─── Live updates: SSE with reconnect + polling fallback ────────────────────
@@ -1196,8 +1297,9 @@ function connectRealtimeStream(alive) {
   }
   eventSource.onopen = () => {
     state.sseConnected = true;
+    state.sseEverOpened = true;
     reconnectDelay = 1000;
-    if (state.ledgerUi) setStatus(state.ledgerUi.header, state.ledgerUi.chainDown ? 'down' : 'live');
+    syncHeaderStatus();
   };
   eventSource.onmessage = (ev) => {
     if (!alive()) return;
@@ -1209,7 +1311,7 @@ function connectRealtimeStream(alive) {
   };
   eventSource.onerror = () => {
     state.sseConnected = false;
-    if (!state.ledgerUi) setStatus('RECONNECTING', 'down');
+    setStatus('RECONNECTING', 'down');
     if (eventSource && eventSource.readyState === 2) {
       eventSource.close();
       eventSource = null;
@@ -1393,6 +1495,23 @@ function bindEvents() {
   document.querySelectorAll('[data-feed-tab]').forEach((btn) =>
     btn.addEventListener('click', () => switchTab('data-feed-tab', 'feedTab', ['chat', 'bets', 'verify'], btn.getAttribute('data-feed-tab')))
   );
+  document.querySelectorAll('[role="tablist"]').forEach((tablist) => {
+    tablist.addEventListener('keydown', (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+      if (!tabs.length) return;
+      const idx = tabs.indexOf(document.activeElement);
+      if (idx < 0) return;
+      e.preventDefault();
+      let next = idx;
+      if (e.key === 'ArrowRight') next = (idx + 1) % tabs.length;
+      else if (e.key === 'ArrowLeft') next = (idx - 1 + tabs.length) % tabs.length;
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = tabs.length - 1;
+      tabs[next].focus();
+      tabs[next].click();
+    });
+  });
   $('liveBetsTableBody').addEventListener('click', (e) => {
     const row = e.target.closest('tr[data-bet-txid]');
     const bet = row && state.recentBets.find((x) => x.betTxid === row.getAttribute('data-bet-txid'));

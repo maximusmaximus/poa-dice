@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit, Integration, Browser E2E, Smoke & Python CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run full Node test suite (with headless Chrome E2E)
+        env:
+          REQUIRE_BROWSER: '1'
+        run: node --test tests/*.test.mjs
+
+      - name: Run full E2E smoke & offline replay auditor
+        run: node tests/smoke-e2e.mjs
+
+      - name: Run Python CLI zero-leak self-test
+        run: python3 bin/poa-dice-cli.py --self-test

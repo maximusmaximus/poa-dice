@@ -68,14 +68,14 @@ test('C-02: bank_claim_yield preserves principal across multiple profit cycles a
     assert.equal(earlyClaim.isError, true);
     assert.equal(earlyClaim.data.code, 'no_yield');
 
-    // Helper: force house profit via Kelly-compliant bets (2.000000 POA at 25% win chance -> ~6 POA max profit <= 10 POA Kelly cap)
+    // Helper: force house profit via Kelly-compliant bets (2.000000 POA at 50% win chance -> ~1.96 POA max profit <= 10 POA Kelly cap)
     const generateHouseProfit = async (cycleTag) => {
       const navStart = app.engine.bankNavMicros;
-      for (let i = 0; i < 20 && app.engine.bankNavMicros <= navStart; i++) {
+      for (let i = 0; i < 80 && app.engine.bankNavMicros <= navStart; i++) {
         const r = await mcpCall(info.url, 'dice_batch_roll', {
           count: 1,
           amount_poa: '2.000000',
-          target_bps: 2500,
+          target_bps: 5000,
           direction: 'under',
           client_seed: `${cycleTag}-${i}`,
           max_total_spend_poa: '2.000000',

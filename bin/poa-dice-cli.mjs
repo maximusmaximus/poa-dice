@@ -776,12 +776,18 @@ async function main() {
     }
     const nodeUrl = args.node || process.env.POA_MINEPOA_NODE || 'https://minepoa.com';
     let nonce = args.nonce !== undefined ? Number(args.nonce) : 1;
-    let parents = [];
-    if (!forceOffline && args.nonce === undefined) {
+    let parents =
+      typeof args.parents === 'string' && args.parents.trim()
+        ? args.parents
+            .split(',')
+            .map((p) => p.trim())
+            .filter(Boolean)
+        : [];
+    if (!forceOffline && (args.nonce === undefined || parents.length === 0)) {
       const client = new MinepoaClient({ nodeUrl });
       const [liveNonce, liveParents] = await Promise.all([
-        client.nextNonce(wallet.address).catch(() => 1),
-        client.getTipParents().catch(() => [])
+        args.nonce === undefined ? client.nextNonce(wallet.address).catch(() => 1) : Promise.resolve(nonce),
+        parents.length === 0 ? client.getTipParents().catch(() => []) : Promise.resolve(parents)
       ]);
       nonce = liveNonce;
       parents = liveParents;

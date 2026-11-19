@@ -53,30 +53,60 @@ export const inboundProcessorMethods = {
   },
 
   /**
-   * Reject 0-POA / unfunded spam keypairs BEFORE reserving `poa_dice_reservations` house coverage or writing
-   * to the vault. Uses minepoa's non-broadcast `POST /api/submit?dry=1` preflight (which knows vested mining
-   * rewards as well as transfer balances) and falls through cleanly when the node is busy or unreachable.
+   * Strictly read-only pre-check (`GET /api/explorer/address/<from>`) to reject 0-POA / unfunded
+   * spam keypairs BEFORE reserving `poa_dice_reservations` house coverage or writing to the vault.
+   * Never posts the signed transaction to `POST /api/submit` (not even with `?dry=1`), and fails
+   * open on transient explorer errors, truncated windows (>=100 txs), or non-transfer credit types
+   * (e.g. mining/reward claims) so real players are never falsely rejected.
    */
   async _assertSenderCanCoverBet(body) {
-    if (typeof this.client?.dryCheckTx !== 'function') return;
-    const dry = await this.client.dryCheckTx(body).catch(() => ({ ok: true, unknown: true }));
-    if (!dry || dry.ok || dry.unknown) return;
-    if (dry.status === 400 || dry.status === 422) {
-      const errText = String(dry.error || '');
-      if (/insufficient balance|not enough|unvested/i.test(errText)) {
+    if (!body || !isValidPoaAddress(body.from) || typeof this.client?.getAddress !== 'function') return;
+    let need;
+    try {
+      need = toMicros(body.amount);
+    } catch {
+      return;
+    }
+    if (need <= 0n) return;
+    const row = await this.client.getAddress(body.from).catch(() => null);
+    if (!row) return;
+    const cp = BigInt(row.balanceMicros || '0');
+    const txs = Array.isArray(row.txs) ? row.txs : [];
+    const cap = Number(this.addressListCap || 100);
+    if (cp >= need) {
+      if (txs.length === 0 && Number.isInteger(Number(body.nonce)) && Number(body.nonce) !== 1) {
         throw Object.assign(
-          new Error(
-            `On-chain insufficient balance (${errText}) for ${body.amount} POA bet; nothing was reserved or broadcast.`
-          ),
-          { status: 400, code: 'INSUFFICIENT_FUNDS' }
-        );
-      }
-      if (/bad nonce.*expected 1\b/i.test(errText)) {
-        throw Object.assign(
-          new Error(`Invalid fresh-account nonce (${errText}); nothing was reserved or broadcast.`),
+          new Error(`Invalid fresh-account nonce ${body.nonce} (expected 1); nothing was reserved or broadcast.`),
           { status: 400, code: 'INVALID_NONCE' }
         );
       }
+      return;
+    }
+    if (txs.length >= cap) return;
+    if (txs.some((t) => t && t.type && t.type !== 'transfer')) return;
+    let upperBound = cp;
+    for (const t of txs) {
+      if (!t || t.to !== body.from) continue;
+      try {
+        const amt = toMicros(t.amount);
+        if (amt > 0n) upperBound += amt;
+      } catch {
+        return;
+      }
+    }
+    if (upperBound < need) {
+      throw Object.assign(
+        new Error(
+          `On-chain insufficient balance (${fromMicros(upperBound)} POA upper bound) for ${body.amount} POA bet; nothing was reserved or broadcast.`
+        ),
+        { status: 400, code: 'INSUFFICIENT_FUNDS' }
+      );
+    }
+    if (txs.length === 0 && Number.isInteger(Number(body.nonce)) && Number(body.nonce) !== 1) {
+      throw Object.assign(
+        new Error(`Invalid fresh-account nonce ${body.nonce} (expected 1); nothing was reserved or broadcast.`),
+        { status: 400, code: 'INVALID_NONCE' }
+      );
     }
   },
 
@@ -839,6 +869,7 @@ export const inboundProcessorMethods = {
     this._releaseReserve(rec);
     rec.status = 'BOOKED';
     rec.bookedAt = now();
+    if (!rec.ledgerTs && Number(b.ts || tx?.ts || 0) > 0) rec.ledgerTs = Number(b.ts || tx.ts);
     rec.ledger = { atts: tx.atts, final: tx.final };
     const pf = result?.provablyFair;
     rec.result = result

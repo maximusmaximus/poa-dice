@@ -161,6 +161,47 @@ export const leaderCoordinatorMethods = {
     }
   },
 
+  async _drainChatClaims() {
+    if (typeof this._persist?.listClaims !== 'function') return 0;
+    let claims = [];
+    try {
+      claims = await this._persist.listClaims('chat:');
+    } catch {
+      return 0;
+    }
+    if (!claims || !claims.length) return 0;
+    const haveIds = new Set(this.engine.chatMessages.map((m) => m && m.id).filter(Boolean));
+    const haveSigs = new Set(this.engine.chatMessages.map((m) => m && m.signature).filter(Boolean));
+    const sorted = [...claims].sort((a, b) => Number(a.value?.ts || 0) - Number(b.value?.ts || 0));
+    let added = 0;
+    for (const entry of sorted) {
+      const m = entry?.value;
+      if (!m || !m.id || !m.text || !m.address || !m.signature) continue;
+      if (haveIds.has(m.id) || haveSigs.has(m.signature)) continue;
+      const msg = {
+        id: m.id,
+        ts: Number(m.ts) || Math.floor(now() / 1000),
+        address: m.address,
+        senderName: m.senderName || `Agent-${String(m.address).slice(4, 10)}`,
+        text: m.text,
+        isAgent: m.isAgent !== false,
+        signature: m.signature,
+        verified: Boolean(m.verified)
+      };
+      this.engine.chatMessages.unshift(msg);
+      haveIds.add(msg.id);
+      haveSigs.add(msg.signature);
+      this.engine._emit('chat.message', msg);
+      added += 1;
+    }
+    if (added > 0) {
+      this.engine.chatMessages.sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+      if (this.engine.chatMessages.length > 200) this.engine.chatMessages.length = 200;
+      if (this.writer.canWrite()) this._save();
+    }
+    return added;
+  },
+
   async _standbyTick() {
     const s = await this._readShared();
     const due = !this._replicaAt || now() - this._replicaAt > REPLICA_RELOAD_MS;
@@ -182,6 +223,7 @@ export const leaderCoordinatorMethods = {
         this._tickErrors.push(`standby reload: ${err.message}`);
       }
     }
+    await this._drainChatClaims().catch(() => {});
     if (this._sharedFresh()) this.foreign = this.shared.foreignOutflows || [];
     this.lastTick = now();
     this.lastError = this._tickErrors.length ? this._tickErrors.join('; ') : null;
@@ -719,6 +761,7 @@ export const leaderCoordinatorMethods = {
         this.writer.tokenAtTickStart = this.writer.lease.token;
         await this._syncSeed();
         await this._drainStandbyAcceptedClaims();
+        await this._drainChatClaims();
         const row = await this._scanBank();
         await this._confirmInbound();
         await this._matchLedgerPayouts().catch((err) => this._tickErrors.push(`ord match: ${err.message}`));

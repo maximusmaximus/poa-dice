@@ -58,6 +58,15 @@ export const outboundDispatcherMethods = {
     return s;
   },
 
+  _heldRepaymentMicros() {
+    let s = 0n;
+    for (const o of Object.values(this.state.outbound)) {
+      if (o.repayment?.status !== 'HELD') continue;
+      s += toMicros(o.amountPoa);
+    }
+    return s;
+  },
+
   _bankBalanceView(row = this._balanceRow) {
     if (!row || typeof row.effectiveMicros !== 'bigint') return null;
     const notListed = this._inFlightOutMicros(row.listedIds || new Set());
@@ -104,6 +113,7 @@ export const outboundDispatcherMethods = {
       const receipt = await this._receipt(rec.txid);
       if (isRejectedReceipt(receipt)) {
         this._markRejected(rec, String(receipt.error || 'rejected'), 'receipt');
+        await this._releaseNonceClaim(rec.nonce, rec.orderId);
         return false;
       }
     }
@@ -119,6 +129,7 @@ export const outboundDispatcherMethods = {
         const again = await this.client.getTx(rec.txid).catch(() => undefined);
         if (again) return this._markSent(rec, {});
         this._markRejected(rec, String(err.body?.error || err.message || 'rejected'), 'submit');
+        await this._releaseNonceClaim(rec.nonce, rec.orderId);
         return false;
       }
       rec.nextAttemptAt = this._payoutRetryAt(rec.attempts, err);
@@ -207,11 +218,26 @@ export const outboundDispatcherMethods = {
         this._emit('settlement.updated', this._outboundView(rec));
       } else if (!(tx && tx.invalid)) {
         const receipt = await this._receiptConfirms(rec);
-        if (receipt && !rec.receipt) {
-          rec.receipt = { status: receipt.status, height: receipt.height ?? null, ts: receipt.ts ?? null, at: now() };
+        const receiptUpdated =
+          receipt &&
+          (!rec.receipt ||
+            (receipt.height != null && rec.receipt.height == null) ||
+            (receipt.ts != null && rec.receipt.ts == null) ||
+            rec.receipt.status !== receipt.status);
+        if (receiptUpdated) {
+          const isFirst = !rec.receipt;
+          rec.receipt = {
+            status: receipt.status,
+            height: receipt.height ?? rec.receipt?.height ?? null,
+            ts: receipt.ts ?? rec.receipt?.ts ?? null,
+            next_nonce: Number.isInteger(Number(receipt.next_nonce))
+              ? Number(receipt.next_nonce)
+              : (rec.receipt?.next_nonce ?? null),
+            at: now()
+          };
           this._save();
           this._emit('settlement.updated', this._outboundView(rec));
-          if (this.logger) {
+          if (isFirst && this.logger) {
             this.logger(
               `payout ${rec.orderId} has an ${receipt.status} receipt (height ${receipt.height ?? '?'}); waiting for the ledger history to show it before confirming`
             );
@@ -249,6 +275,8 @@ export const outboundDispatcherMethods = {
         .flatMap((o) => [o.txid, ...(o.superseded || []).map((x) => x.txid)])
         .filter(Boolean)
     );
+    const maxPerPass = Number(this.maxPayoutsPerTick) > 0 ? Number(this.maxPayoutsPerTick) : 5;
+    let sentThisPass = 0;
     for (const rec of recs) {
       if (rec.status !== 'QUEUED' && rec.status !== 'WAITING_FUNDS') continue;
       const paid = tagged.get(rec.orderId.slice(0, 12));
@@ -299,7 +327,7 @@ export const outboundDispatcherMethods = {
       const waitingOnReceipt = recs.find((r) => r !== rec && r.status === 'SENT' && !r.receipt && !r.recoveredFromLedger && r.repayment?.status !== 'HELD');
       if (waitingOnReceipt) return;
       const amount = toMicros(rec.amountPoa);
-      const spendable = balanceMicros - this._inFlightOutMicros(listed);
+      const spendable = balanceMicros - this._inFlightOutMicros(listed) - this._heldRepaymentMicros();
       if (spendable < amount) {
         if (rec.status !== 'WAITING_FUNDS') {
           rec.status = 'WAITING_FUNDS';
@@ -414,7 +442,19 @@ export const outboundDispatcherMethods = {
         await this._releaseNonceClaim(rec.nonce, rec.orderId);
         return;
       }
-      if (receipt && /^(included|final|confirmed)$/i.test(String(receipt.status || ''))) return;
+      if (receipt && /^(included|final|confirmed)$/i.test(String(receipt.status || ''))) {
+        rec.receipt = {
+          status: receipt.status,
+          height: receipt.height ?? null,
+          ts: receipt.ts ?? null,
+          next_nonce: Number.isInteger(Number(receipt.next_nonce)) ? Number(receipt.next_nonce) : null,
+          at: now()
+        };
+        this._save();
+        sentThisPass += 1;
+        if (sentThisPass >= maxPerPass) return;
+        continue;
+      }
       return;
     }
   },
@@ -739,27 +779,10 @@ export const outboundDispatcherMethods = {
     return max + 1;
   },
 
-  _localNonceFloor() {
-    let floor = 0;
-    for (const o of Object.values(this.state.outbound)) {
-      if (o.repayment?.status === 'HELD') continue;
-      if (Number.isInteger(o.claimedNonce)) floor = Math.max(floor, o.claimedNonce + 1);
-      if (!Number.isInteger(o.nonce)) continue;
-      if (o.repayment?.status === 'HELD' || o.status === 'REJECTED') continue;
-      if (o.status === 'SIGNED' || o.status === 'SENT' || o.status === 'CONFIRMED') {
-        floor = Math.max(floor, o.nonce + 1);
-      }
-    }
-    for (const n of this._txNonce.values()) {
-      if (Number.isInteger(n)) floor = Math.max(floor, n + 1);
-    }
-    return floor;
-  },
-
   _nonceReservedByRejected(orderId) {
     if (!orderId) return false;
     const o = this.state.outbound[orderId];
-    return Boolean(o && (o.status === 'REJECTED' || o.repayment?.status === 'HELD'));
+    return Boolean(o && (o.status === 'REJECTED' || o.status === 'DISMISSED' || o.repayment?.status === 'HELD'));
   },
 
   /** Drop bank-nonce claims held by REJECTED or HELD repayments. Does not change those payout records. */
@@ -779,10 +802,16 @@ export const outboundDispatcherMethods = {
     if (!Number.isInteger(Number(nonce))) return;
     const key = `bank-nonce:${Number(nonce)}`;
     try {
-      const claims = await this._persist.listClaims(key);
-      const hit = (claims || []).find((c) => c.key === key);
-      if (hit && orderId && hit.value?.orderId && hit.value.orderId !== orderId) return;
-      if (hit) await this._persist.deleteClaim(key);
+      let hit = null;
+      if (typeof this.store?.peek === 'function') {
+        hit = await this.store.peek(key);
+      } else {
+        const claims = await this._persist.listClaims(key);
+        hit = (claims || []).find((c) => c.key === key)?.value || null;
+      }
+      if (!hit) return;
+      if (orderId && hit.orderId && hit.orderId !== orderId) return;
+      await this._persist.deleteClaim(key);
     } catch {
       // a busy store retries on the next tick; the nonce is not advanced
     }
@@ -803,8 +832,17 @@ export const outboundDispatcherMethods = {
   _confirmedNonceFloor() {
     let floor = 0;
     for (const o of Object.values(this.state.outbound)) {
-      if (o.repayment?.status === 'HELD' || o.status === 'REJECTED') continue;
+      if (o.repayment?.status === 'HELD' || o.status === 'REJECTED' || o.status === 'DISMISSED') continue;
       if (o.status === 'CONFIRMED' && Number.isInteger(o.nonce)) floor = Math.max(floor, o.nonce + 1);
+      if (
+        o.status === 'SENT' &&
+        o.receipt &&
+        /^(included|final|confirmed)$/i.test(String(o.receipt.status || ''))
+      ) {
+        if (Number.isInteger(o.nonce)) floor = Math.max(floor, o.nonce + 1);
+        const rn = Number(o.receipt.next_nonce);
+        if (Number.isInteger(rn) && rn > 0) floor = Math.max(floor, rn);
+      }
     }
     return floor;
   },
@@ -902,6 +940,7 @@ export const outboundDispatcherMethods = {
         if (isRejectedReceipt(receipt)) {
           const stale = now() - (rec.sentAt || 0) > this.stuckAfterMs;
           this._markRejected(rec, String(receipt.error || receipt.status || 'rejected'), 'receipt');
+          await this._releaseNonceClaim(rec.nonce, rec.orderId);
           if (stale) this._holdRepayment(rec, receipt);
           continue;
         }
@@ -1077,13 +1116,24 @@ export const outboundDispatcherMethods = {
 
   repaymentQueueView() {
     let total = 0n;
-    let count = 0;
+    const items = [];
     for (const o of Object.values(this.state.outbound)) {
       if (o.repayment?.status !== 'HELD') continue;
-      count += 1;
       total += toMicros(o.amountPoa);
+      items.push({
+        orderId: o.orderId,
+        kind: o.kind || null,
+        to: o.to || null,
+        amountPoa: o.amountPoa,
+        txid: o.txid || null,
+        nonce: o.nonce ?? null,
+        sourceTxid: o.sourceTxid || null,
+        reason: o.repayment.reason || null,
+        code: o.repayment.code || null,
+        heldAt: o.repayment.heldAt ? new Date(o.repayment.heldAt).toISOString() : null
+      });
     }
-    return { status: 'HELD', count, totalPoa: fromMicros(total), awaitingApproval: true };
+    return { status: 'HELD', count: items.length, totalPoa: fromMicros(total), awaitingApproval: true, items };
   },
 
   stuckPayouts() {
@@ -1102,7 +1152,10 @@ export const outboundDispatcherMethods = {
         error: o.rejection?.error || o.lastError || null,
         kind: o.rejection?.kind || null,
         rejectionChecks: o.rejection?.checks ?? null,
-        since: new Date(o.rejection?.firstAt || o.sentAt).toISOString(),
+        since: (() => {
+          const ts = o.rejection?.firstAt || o.sentAt || o.repayment?.heldAt || o.createdAt;
+          return ts ? new Date(ts).toISOString() : null;
+        })(),
         superseded: o.superseded || []
       });
     }

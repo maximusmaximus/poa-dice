@@ -26,7 +26,7 @@ import { verifyRoll } from './provably-fair.mjs';
 import { BankrollEngine, DEV_RESERVE_ADDRESS } from './bankroll-engine.mjs';
 import { LedgerWatcher } from './ledger-watcher.mjs';
 import { BATCH_COUNTS, executeBatch, quoteAllCounts, quoteBatch, VIP_NOTE } from './batch-roll.mjs';
-import { postSignedChat } from './chat.mjs';
+import { postSignedChatDurable } from './chat.mjs';
 import { quoteAutoBet, quoteClaimYield, quoteStake, quoteUnstake, WITHDRAW_TRIGGER_POA } from './actions.mjs';
 import { looksLikePrivkey, walletBalance } from './wallet-balance.mjs';
 import { clampWaitSeconds, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS, TEMPLATE_TOOLS, transferTemplates } from './tx-templates.mjs';
@@ -434,6 +434,12 @@ export class McpHandler {
 
   _resolveWallet(args = {}, { needOwnKey = false } = {}) {
     if (args.privkey) {
+      if (this.hooks.disallowCustodialPrivkey) {
+        throw Object.assign(
+          new Error('Server-side privkey signing is disabled on this instance; sign transactions locally and pass signed_tx / signed_txs.'),
+          { code: 'custodial_privkey_disabled' }
+        );
+      }
       return walletFromPrivkey(args.privkey);
     }
     if (needOwnKey && this.hooks.chainRequired) {
@@ -955,7 +961,7 @@ export class McpHandler {
       }
 
       case 'chat_send':
-        return postSignedChat(this.engine, args);
+        return postSignedChatDurable(this.engine, args, { settlement: this.watcher?.settlement || null });
 
       case 'feed_recent': {
         const limit = Math.max(1, Math.min(50, Number(args.limit || 15)));
@@ -997,6 +1003,15 @@ export class McpHandler {
       }
 
       case 'dice_auto_strategy': {
+        if (this.watcher.settlement) {
+          return {
+            valid: false,
+            rejected: true,
+            code: 'chain_mode_sequential_required',
+            error:
+              'dice_auto_strategy requires sequential per-roll settlement and cannot run on a chain-settled server. Use dice_batch_roll with signed_txs or submit rolls sequentially via dice_place_bet.'
+          };
+        }
         const wallet = this._resolveWallet(args, { needOwnKey: true });
         const aq = quoteAutoBet(this.engine, {
           address: wallet.address,

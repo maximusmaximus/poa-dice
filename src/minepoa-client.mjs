@@ -342,43 +342,34 @@ export class MinepoaClient {
     return rows.slice(-2).map((t) => t.id);
   }
 
-  /** Next nonce for an address: receipt.next_nonce of its newest sent tx, else 1. */
+  /** Next nonce for an address: max receipt.next_nonce / (tx.body.nonce + 1) across its newest sent txs, else 1. */
   async nextNonce(address) {
     const row = await this.getAddress(address);
-    const sent = (row.txs || []).filter((t) => t && t.from === address && t.id).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    const sent = (row.txs || [])
+      .filter((t) => t && t.from === address && t.id)
+      .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0) || Number(b.height ?? 0) - Number(a.height ?? 0));
     if (sent.length === 0) return 1;
-    const receipt = await this.getReceipt(sent[0].id).catch(() => null);
-    if (receipt && Number.isInteger(Number(receipt.next_nonce)) && Number(receipt.next_nonce) > 0) return Number(receipt.next_nonce);
-    const tx = await this.getTx(sent[0].id).catch(() => null);
-    if (tx && Number.isInteger(Number(tx.body?.nonce))) return Number(tx.body.nonce) + 1;
-    throw new Error(`Could not determine next nonce for ${address}`);
-  }
-
-  /**
-   * Non-broadcast preflight check (`POST /api/submit?dry=1`) using probe UA so the node validates
-   * spendable balance (including vested mining rewards) without recording or broadcasting the tx.
-   * Never throws on network/busy errors — returns `{ ok: true, unknown: true }` when unreachable.
-   */
-  async dryCheckTx(body) {
-    if (this.busy('submit')) return { ok: true, unknown: true };
-    let resp;
-    try {
-      resp = await this.fetch(`${this.nodeUrl}/api/submit?dry=1`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'User-Agent': 'poa-dice-probe/1.0'
-        },
-        body: JSON.stringify({ kind: 'tx', body }),
-        signal: AbortSignal.timeout(Math.min(this.timeoutMs, 5000))
-      });
-    } catch {
-      return { ok: true, unknown: true };
+    // Check up to 5 top same-second txs (minepoa timestamps have 1-second granularity) so burst sends never pick an older nonce.
+    const topTs = Number(sent[0].ts || 0);
+    const candidates = [sent[0]];
+    for (let i = 1; i < sent.length && candidates.length < 5; i++) {
+      if (Number(sent[i].ts || 0) === topTs) candidates.push(sent[i]);
+      else break;
     }
-    const j = await resp.json().catch(() => ({}));
-    if (resp.ok) return { ok: true, body: j };
-    return { ok: false, status: resp.status, error: String(j?.error || `HTTP ${resp.status}`) };
+    let best = 0;
+    for (const c of candidates) {
+      const receipt = await this.getReceipt(c.id).catch(() => null);
+      if (receipt && Number.isInteger(Number(receipt.next_nonce)) && Number(receipt.next_nonce) > best) {
+        best = Number(receipt.next_nonce);
+        continue;
+      }
+      const tx = await this.getTx(c.id).catch(() => null);
+      if (tx && Number.isInteger(Number(tx.body?.nonce)) && Number(tx.body.nonce) + 1 > best) {
+        best = Number(tx.body.nonce) + 1;
+      }
+    }
+    if (best > 0) return best;
+    throw new Error(`Could not determine next nonce for ${address}`);
   }
 
   /** Broadcast. Throws SubmitError; .definitive=true for a 4xx rejection (except 408/409 dup/429). */

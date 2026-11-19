@@ -78,8 +78,10 @@ test('legal notice: blocked storage never throws (hidden for this view only)', (
 
 test('index.html: the notice has a close button and the head script uses the same storage key', () => {
   const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  const initJs = fs.readFileSync(new URL('../public/notice-init.js', import.meta.url), 'utf8');
   assert.match(html, /id="legalNotice"[\s\S]*Governance token utility only[\s\S]*id="legalNoticeClose"/);
-  assert.ok(html.includes(`localStorage.getItem('${LEGAL_NOTICE_KEY}') === '1'`));
+  assert.ok(html.includes('<script src="/notice-init.js"></script>'), 'external CSP-safe head init script');
+  assert.ok(initJs.includes(`localStorage.getItem('${LEGAL_NOTICE_KEY}') === '1'`));
   for (const id of ['chatForm', 'chatTextInput', 'chatSenderInput', 'chatIsAgentCheck', 'btnCopyChatPrompt']) {
     assert.ok(!html.includes(`id="${id}"`), `${id} removed`);
   }

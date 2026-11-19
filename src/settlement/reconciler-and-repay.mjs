@@ -287,6 +287,203 @@ export const reconcilerAndRepayMethods = {
     };
   },
 
+  async _verifyHeldRepayment(rec) {
+    const checks = [];
+    const add = (name, ok, detail) => checks.push({ name, ok: Boolean(ok), detail });
+    const done = (refusal) => ({ ok: !refusal, refusal: refusal || null, checks });
+    const tag = String(rec.orderId).slice(0, 12);
+
+    if (this.ledgerProbe) {
+      await this.ledgerProbe.probe().catch(() => {});
+      const st = this.ledgerProbe.view().status;
+      add('minepoa ledger healthy', st === 'OK', `ledger probe: ${st}`);
+      if (st !== 'OK') return done(`minepoa ledger is ${st}; approval requires a healthy ledger read`);
+    }
+
+    const row = await this._scanBankReadOnly().catch(() => null);
+    const fresh = Boolean(row && !row.fromTrusted && typeof row.effectiveMicros === 'bigint' && this.ledgerIndexComplete);
+    add('fresh bank history read', fresh, fresh ? `${(row.listedIds || new Set()).size} bank transfers listed` : 'bank history could not be freshly read');
+    if (!fresh) return done('could not read fresh bank history');
+
+    const inBank = Boolean(rec.txid && (row.listedIds?.has(rec.txid) || this.state.ledgerOut?.[rec.txid]));
+    add('original txid absent from bank history', !inBank, inBank ? `${String(rec.txid).slice(0, 16)} IS in bank history` : 'not listed');
+    if (inBank) return done('original payout txid is already on the ledger (bank history)');
+
+    const tagged = Object.entries(this.state.ledgerOut || {}).filter(
+      ([, o]) => o.ord === tag || (o.to === rec.to && toMicros(String(o.amountPoa)) === toMicros(rec.amountPoa) && String(o.memo || '').includes(`:ord=${tag}`))
+    );
+    add(`no bank transfer tagged ord=${tag}`, !tagged.length, tagged.length ? `found ${tagged.map(([id]) => id.slice(0, 16)).join(', ')}` : 'none');
+    if (tagged.length) return done(`ledger already has bank transfer ${tagged[0][0].slice(0, 16)} tagged for this order`);
+
+    const dup = this._ledgerPaidFor(rec);
+    add('no other payout or refund for this source', !dup, dup ? `${dup.txid.slice(0, 16)}: ${dup.why}` : 'none');
+    if (dup) return done(`ledger already has ${dup.txid.slice(0, 16)} for this source (${dup.why})`);
+
+    if (rec.txid) {
+      let txOnChain;
+      try {
+        txOnChain = await this.client.getTx(rec.txid);
+      } catch (err) {
+        add('minepoa explorer check for original txid', false, `unreadable (${String(err.message || err).slice(0, 120)})`);
+        return done('minepoa explorer could not answer for original txid');
+      }
+      if (txOnChain && !txOnChain.invalid) {
+        add('minepoa explorer check for original txid', false, `found valid tx ${rec.txid.slice(0, 16)}`);
+        return done('original payout txid exists on minepoa explorer');
+      }
+      add('minepoa explorer check for original txid', true, 'not found or invalid');
+
+      if (this.indexer) {
+        let look;
+        try {
+          look = await this.indexer.lookupTx(rec.txid);
+        } catch (err) {
+          add(`${this.indexer.name || 'POAScan'} check for original txid`, false, `unreadable (${String(err.message || err).slice(0, 100)})`);
+          return done(`${this.indexer.name || 'POAScan'} could not verify original txid`);
+        }
+        if (look?.found) {
+          add(`${this.indexer.name || 'POAScan'} check for original txid`, false, `found ${rec.txid.slice(0, 16)}`);
+          return done(`${this.indexer.name || 'POAScan'} already has the original payout txid`);
+        }
+        add(`${this.indexer.name || 'POAScan'} check for original txid`, true, 'not found (404)');
+      }
+    }
+
+    let rrow;
+    try {
+      rrow = await this.client.getAddress(rec.to);
+    } catch (err) {
+      add('recipient history check', false, `unreadable (${String(err.message || err).slice(0, 120)})`);
+      return done('could not read recipient history from minepoa');
+    }
+    const rtxs = (rrow.txs || []).filter((t) => t && t.id);
+    if (rec.txid && rtxs.some((t) => t.id === rec.txid)) {
+      add('recipient history check', false, `${rec.txid.slice(0, 16)} listed for ${rec.to}`);
+      return done('original payout txid is in recipient history');
+    }
+    const same = rtxs.filter((t) => t.from === this.bankAddress && t.to === rec.to && toMicros(String(t.amount || '0')) === toMicros(rec.amountPoa));
+    for (const t of same) {
+      let memo = t.memoKnown ? String(t.memo || '') : undefined;
+      if (memo === undefined) {
+        try {
+          memo = await this.client.getMemo(t.id);
+        } catch (err) {
+          add('recipient matching transfer memos', false, `memo of ${t.id.slice(0, 16)} unreadable`);
+          return done('could not read every matching transfer memo in recipient history');
+        }
+      }
+      if (memo === null || memo === undefined || String(memo).includes(`:ord=${tag}`)) {
+        add('recipient matching transfer memos', false, `${t.id.slice(0, 16)} matches ord=${tag} or memo unreadable`);
+        return done(`recipient already received ${t.id.slice(0, 16)} for this order`);
+      }
+    }
+    add('recipient history check', true, `${rtxs.length} transfers checked for ${rec.to}, none paying this order`);
+    return done(null);
+  },
+
+  /**
+   * Operator resolution for a HELD repayment (`action: 'approve' | 'dismiss'`).
+   * Dry-run by default (`confirm: false`). Approving re-queues the payout with `:repay=1`
+   * only after verifying on-chain non-payment; dismissing marks the held order terminal.
+   */
+  async resolveHeldRepayment({ orderId, action, confirm = false, note = '' }) {
+    const id = String(orderId || '').trim();
+    if (!id || id.length > 64) throw bad('orderId is required');
+    if (action !== 'approve' && action !== 'dismiss') throw bad('action must be "approve" or "dismiss"');
+    await this.ready();
+    if (!this.writer.canWrite()) await this._observe().catch(() => {});
+    const rec = this.state.outbound[id];
+    if (!rec) throw bad(`unknown order ${id}`, 404);
+    if (rec.repayment?.status !== 'HELD') {
+      throw bad(`order ${id} is not in HELD repayment state (status: ${rec.repayment?.status || rec.status})`, 409);
+    }
+    const v = action === 'approve' ? await this._verifyHeldRepayment(rec) : { ok: true, refusal: null, checks: [{ name: 'order is HELD', ok: true, detail: `held ${rec.amountPoa} POA to ${rec.to}` }] };
+    const cleanNote = String(note || '').trim().slice(0, 200) || null;
+    if (!confirm) {
+      return {
+        mode: 'preview',
+        action,
+        orderId: id,
+        eligible: Boolean(v.ok),
+        refusal: v.refusal,
+        checks: v.checks,
+        order: this._outboundView(rec),
+        wouldDo:
+          action === 'approve' && v.ok
+            ? `Re-queue ${rec.amountPoa} POA payout to ${rec.to} with memo "${repayMemo(rec.memo)}" and a fresh bank nonce`
+            : action === 'dismiss'
+              ? `Mark held order ${id} (${rec.amountPoa} POA) as DISMISSED (will not be repaid)`
+              : null
+      };
+    }
+    if (!this.writer.canWrite()) {
+      throw bad('This instance is not the active bank writer; run repayment resolution on the leader.', 503);
+    }
+    await this.writer.assertLeader();
+    if (action === 'approve') {
+      if (!v.ok) throw Object.assign(bad(`repayment approval refused: ${v.refusal}`, 409), { details: { checks: v.checks, order: this._outboundView(rec) } });
+      const oldTxid = rec.txid;
+      const oldNonce = rec.nonce;
+      rec.superseded = rec.superseded || [];
+      if (oldTxid) {
+        rec.superseded.push({
+          txid: oldTxid,
+          nonce: oldNonce ?? null,
+          error: rec.repayment?.reason || rec.lastError || 'rejected',
+          reason: 'HELD_REPAYMENT_APPROVED',
+          at: now()
+        });
+      }
+      rec.repayment = {
+        ...rec.repayment,
+        status: 'APPROVED',
+        approved: true,
+        approvedAt: now(),
+        note: cleanNote
+      };
+      rec.memo = repayMemo(rec.memo);
+      rec.txid = null;
+      rec.body = null;
+      rec.nonce = null;
+      rec.claimedNonce = null;
+      rec.rejection = null;
+      rec.nonceRule = null;
+      rec.forceRebroadcast = false;
+      rec.status = 'QUEUED';
+      rec.nextAttemptAt = 0;
+      rec.lastError = null;
+      rec.resigns = (rec.resigns || 0) + 1;
+      await this._releaseNonceClaim(oldNonce, rec.orderId);
+      const engItem = this.engine.outboundQueue.find((x) => x.orderId === rec.orderId);
+      if (engItem && engItem.status !== 'IN_SETTLEMENT') {
+        engItem.status = 'IN_SETTLEMENT';
+        this.engine._saveToDisk();
+      }
+      this._save();
+      await this.flush();
+      this._emit('settlement.updated', this._outboundView(rec));
+      if (this.logger) this.logger(`admin approved HELD repayment ${id} (${rec.amountPoa} POA to ${rec.to}); re-queued for payout`);
+      return { mode: 'confirm', action: 'approve', orderId: id, checks: v.checks, order: this._outboundView(rec) };
+    }
+    const oldNonce = rec.nonce;
+    rec.repayment = {
+      ...rec.repayment,
+      status: 'DISMISSED',
+      approved: false,
+      dismissedAt: now(),
+      note: cleanNote
+    };
+    rec.status = 'DISMISSED';
+    rec.lastError = cleanNote ? `repayment dismissed by operator: ${cleanNote}` : 'repayment dismissed by operator';
+    await this._releaseNonceClaim(oldNonce, rec.orderId);
+    this._failEngine(rec);
+    this._save();
+    await this.flush();
+    this._emit('settlement.updated', this._outboundView(rec));
+    if (this.logger) this.logger(`admin dismissed HELD repayment ${id} (${rec.amountPoa} POA to ${rec.to})`);
+    return { mode: 'confirm', action: 'dismiss', orderId: id, checks: v.checks, order: this._outboundView(rec) };
+  },
+
   async _applyRepays() {
     if (!this.writer.canWrite()) return 0;
     let applied = 0;
@@ -797,6 +994,8 @@ export const reconcilerAndRepayMethods = {
             }));
     let rejectedMicros = 0n;
     for (const o of Object.values(this.state.outbound)) if (o.status === 'REJECTED') rejectedMicros += toMicros(o.amountPoa);
+    const heldRepaymentsMicros = typeof this._heldRepaymentMicros === 'function' ? this._heldRepaymentMicros() : 0n;
+    const deltaAfterHeld = delta - heldRepaymentsMicros;
     const historyComplete = row.historyComplete !== false;
     const foreign = this._foreignOutflows();
     return {
@@ -816,12 +1015,16 @@ export const reconcilerAndRepayMethods = {
         incentivePoolPoa: fromMicros(this.engine.incentivePoolMicros),
         outboundNotYetSentPoa: fromMicros(pendingOut),
         outboundRejectedPoa: fromMicros(rejectedMicros),
+        heldRepaymentsPoa: fromMicros(heldRepaymentsMicros),
         outboundSentUnconfirmedPoa: fromMicros(sentUnconfirmed),
         lockedCollateralPoa: fromMicros(this.engine.lockedCollateralMicros),
         lockedCollateralHeal: this.engine.lockHeal || null
       },
       payoutsOk: stuck.length === 0,
       stuckPayouts: stuck,
+      repaymentQueue: this.repaymentQueueView(),
+      heldRepaymentsPoa: fromMicros(heldRepaymentsMicros),
+      deltaAfterHeldRepaymentsPoa: (deltaAfterHeld < 0n ? '-' : '') + fromMicros(deltaAfterHeld < 0n ? -deltaAfterHeld : deltaAfterHeld),
       confirmedNotOnLedger,
       repaidPayouts: Object.values(this.state.outbound)
         .filter((o) => o.repay)

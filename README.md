@@ -60,7 +60,7 @@ To prevent the ERC-4626 **first-depositor / donation inflation attack** while ke
 - **Yield Claiming Without Touching Principal (`bank_claim_yield`)**:
   `yieldWithdrawnMicros` is tracked separately from `principalWithdrawnMicros`, so claiming net vault gain ($V_{\text{gross}} - P_{\text{net}}$) never erodes recorded principal cost basis across multiple claims.
 - **Dev Fee Accounting Mode (`POA_DICE_DEV_FEE_MODE`)**:
-  Defaults to `gross_and_earnings` (`10 bps` on gross bet turnover + `10 bps` on realized positive LP yield); set `POA_DICE_DEV_FEE_MODE=net_profit_only` to charge `10 bps` strictly on house net profit (lost bets) and realized positive LP yield.
+  Defaults to `gross_and_earnings` (`10 bps` on gross bet turnover; LP withdrawals carry `0 bps` dev fee); set `POA_DICE_DEV_FEE_MODE=net_profit_only` to charge `10 bps` strictly on house net profit (lost bets).
 - **Hardened Anti-JIT Flash-Deposit Protection**:
   - Every deposit stamps `lastDepositEpoch = currentEpoch` and blends `stakedAtEpoch` by share weight.
   - Withdrawn after $\ge 1$ epoch (`currentEpoch > lastDepositEpoch`): **`0.00%` exit fee** (`100%` of $V_{\text{gross}}$ returned).
@@ -256,6 +256,8 @@ On Vercel, requests are spread over many instances, and only one of them holds t
 - **Cron tick.** `GET`/`POST /api/settlement/tick` with `Authorization: Bearer <CRON_SECRET>` (or the admin token) runs one pass, then returns. A pass is idempotent, and work it leaves is finished by the next pass on any instance. The response returns after at most 25 s, even if the pass is still running. `vercel.json` calls it every minute (Vercel Cron sends the `CRON_SECRET` bearer). Per-minute cron schedules need a Vercel plan that allows them.
 - **Payouts in flight.** A payout that is signed or sent but not yet final on the ledger is counted once: it is subtracted from the bank's spendable funds and is no longer listed as owed. A payout waiting on a slow ledger therefore never trips `SOLVENCY_HOLD`. The audit still checks it in full.
 - **Rebroadcast.** A `SENT` payout that the ledger has no receipt and no record of after 60 s is broadcast again with the **same signed transaction** (same txid and nonce). It is never re-signed. A payout whose broadcast was refused stays `SIGNED` and keeps its signed body until it lands.
+- **Held rejected repayments (`repaymentQueue`) & operator resolution.** Stale payouts rejected by `minepoa` (e.g., `bad nonce`) are moved into `repaymentQueue` (`status: HELD`), never auto-re-signed, and reserved against spendable bank coverage so LP withdrawals or bets cannot drain funds owed to held payouts. `/api/health`, `/api/settlement`, and `/api/audit/chain` expose `repaymentQueue` (count, total, and individual `items`) plus `heldRepaymentsPoa` and `deltaAfterHeldRepaymentsPoa`. An operator resolves one held order with `POST /api/admin/repayments/resolve` (admin token; dry-run by default): `{"orderId": "...", "action": "approve" | "dismiss", "confirm": true, "note": "..."}`. Approval re-verifies on-chain non-payment across minepoa, POAScan (when configured), and recipient history before re-queueing with `:repay=1` and a fresh bank nonce.
+- **Vercel / Nitro entry (`src/web-handler.mjs`).** Serverless deployments can mount `handleDiceWebRequest` (or `createWebHandler`) from `src/web-handler.mjs`, which bridges Fetch API requests to one process-local `src/server.mjs` listener with abort-signal propagation, authenticated internal client-IP forwarding, and pass-mode awareness.
 - **Foreign-outflow ack from any instance.** `POST /api/admin/foreign-outflows/ack` checks the txids against the writer's published list and records the decision in Postgres (claim `foreign-ack:<txid>`, optional `note`). The writer applies it on its next pass.
 
 ### Ledger recovery (state lost or never written)
@@ -316,5 +318,7 @@ Settling a bet is all-or-nothing: if the accounting check fails, every change ma
 | `POA_DICE_CHAT_REQUIRE_V2=1` | Enforce strict `POA_DICE_CHAT_V2` timestamp + nonce replay-safe chat signatures |
 | `POA_DICE_PG_SSL_STRICT=1` | Enforce strict TLS certificate verification on Postgres pool connections |
 | `POA_DICE_RATE_LIMIT_PER_MIN` | Per-IP HTTP rate limit (default `600`, `0` disables) |
+| `POA_DICE_TRUST_PROXY=1` | Trust `X-Forwarded-For` behind a reverse proxy (default off; `X-Vercel-Forwarded-For` and authenticated `web-handler.mjs` forwarding are trusted automatically) |
+| `POA_DICE_DISALLOW_CUSTODIAL_PRIVKEY=1` | Reject server-side `privkey` signing on HTTP/MCP endpoints (enforce strictly pre-signed `signed_tx` / `signed_txs` only) |
 | `POA_DICE_URL` | Remote server URL for `node src/mcp-server.mjs --stdio` proxy mode and CLI |
 | `POA_BASE_URL` | minepoa node (default `https://minepoa.com`) |

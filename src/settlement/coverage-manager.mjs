@@ -44,10 +44,12 @@ export const coverageManagerMethods = {
     for (const item of this.engine.outboundQueue) {
       if (item.status === 'PENDING' && !this.state.outbound[item.orderId]) pendingOut += BigInt(item.amountMicros);
     }
+    const heldRepay = typeof this._heldRepaymentMicros === 'function' ? this._heldRepaymentMicros() : 0n;
     const onChainFree =
       row.effectiveMicros -
       this._inFlightOutMicros(row.listedIds) -
       pendingOut -
+      heldRepay -
       this.engine.devReserveMicros -
       this.engine.incentivePoolMicros;
     const nav = this.engine.bankNavMicros;
@@ -71,6 +73,7 @@ export const coverageManagerMethods = {
       limitMicros: limit > 0n ? limit : 0n,
       baseMicros: base,
       onChainFreeMicros: onChainFree,
+      heldRepaymentMicros: heldRepay,
       navMicros: nav,
       withdrawalLiabilityMicros: withdrawLiab
     };

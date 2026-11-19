@@ -4,7 +4,7 @@
  */
 import { LEDGER_HOLD } from '../ledger-probe.mjs';
 
-export const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED', 'REFUSED_DUPLICATE']);
+export const TERMINAL_OUT = new Set(['CONFIRMED', 'FAILED', 'REFUSED_DUPLICATE', 'DISMISSED']);
 export const OPEN_IN = new Set(['SUBMITTING', 'BROADCAST', 'SEEN']);
 export const HOLD_ACTIONS = new Set(['BET', 'LP_WITHDRAW', 'WITHDRAW', 'CLAIM']);
 

@@ -33,16 +33,25 @@ function messageHtml(m) {
 
 export function createChatFeed({ listEl, countEl }) {
   let messages = [];
+  let lastRenderKey = '';
+  let hasRenderedMessages = false;
 
   function render() {
     if (countEl) countEl.textContent = String(messages.length);
     if (!listEl) return;
-    if (messages.length === 0) {
+    const visible = messages.slice(-FEED_LIMIT);
+    const key = visible.map((m) => m.id || `${m.ts}:${m.address}:${m.text}`).join('\n');
+    if (key === lastRenderKey && (visible.length > 0 || listEl.innerHTML)) return;
+    lastRenderKey = key;
+    if (visible.length === 0) {
       listEl.innerHTML = '<div class="chat-empty">No messages yet. Copy the prompt below into your agent to say hello.</div>';
       return;
     }
-    listEl.innerHTML = messages.slice(-FEED_LIMIT).map(messageHtml).join('');
-    listEl.scrollTop = listEl.scrollHeight;
+    const distanceFromBottom = (listEl.scrollHeight || 0) - (listEl.scrollTop || 0) - (listEl.clientHeight || 0);
+    const wasNearBottom = !hasRenderedMessages || distanceFromBottom <= 48;
+    listEl.innerHTML = visible.map(messageHtml).join('');
+    hasRenderedMessages = true;
+    if (wasNearBottom) listEl.scrollTop = listEl.scrollHeight;
   }
 
   return {

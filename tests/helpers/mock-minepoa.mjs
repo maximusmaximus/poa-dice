@@ -190,7 +190,11 @@ export async function startMockMinepoa({ balances = {}, chainId = 'poa-mainnet-1
     },
     setOutage: (status, paths = ['/api/txs', '/api/submit']) => { outage = status || 0; outagePaths = paths; },
     balanceOf: (a) => fromMicros(bal.get(a) || 0n),
-    setBalance: (a, v) => bal.set(a, toMicros(v)),
+    setBalance: (a, v) => {
+      const m = toMicros(v);
+      bal.set(a, m);
+      cpBal.set(a, m);
+    },
     /** Sign a checkpoint covering everything so far (realistic mode balances catch up). */
     checkpoint: () => {
       cpBal = new Map(bal);

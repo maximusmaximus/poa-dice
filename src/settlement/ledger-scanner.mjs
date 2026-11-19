@@ -48,6 +48,7 @@ export const ledgerScannerMethods = {
     for (const t of txs) {
       if (t.to === this.bankAddress && t.from !== this.bankAddress) {
         if (this.state.inbound[t.id] || this.engine.processedTxids.has(t.id)) continue;
+        if (this._isCompactedInbound(t.id, t.ts)) continue;
         let memo = t.memoKnown ? String(t.memo || '') : undefined;
         if (memo === undefined) {
           try {
@@ -210,7 +211,19 @@ export const ledgerScannerMethods = {
     return { complete, reason };
   },
 
-  async _backfillBankHistory(hist, listing, { wasComplete = false, hotBefore = new Set() } = {}) {
+  _isCompactedInbound(txid, ts, priorCompactedIds = null) {
+    if (!txid) return false;
+    const recentIn = this.state.compacted?.recentInboundIds;
+    if (Array.isArray(recentIn) && recentIn.includes(txid)) return true;
+    const histCompacted = this.state.bankHistory?.recentCompactedIds;
+    if (Array.isArray(histCompacted) && histCompacted.includes(txid)) return true;
+    if (priorCompactedIds && priorCompactedIds.has(txid)) return true;
+    const throughTs = Number(this.state.compacted?.inboundThroughTs || 0);
+    if (throughTs > 0 && Number(ts || 0) > 0 && Number(ts) < throughTs) return true;
+    return false;
+  },
+
+  async _backfillBankHistory(hist = bankHistoryOf(this.state), listing = [], { wasComplete = false, hotBefore = new Set() } = {}) {
     const ix = this.indexer;
     const st = this._historyBackfill;
     if (!ix || typeof ix.addressTxs !== 'function') {
@@ -270,6 +283,10 @@ export const ledgerScannerMethods = {
       return { ok: false, reason: st.reason };
     }
 
+    // Snapshot compaction guardsets BEFORE resetting hist.checkpoint on a full genesis-to-tip read,
+    // so historical LP_ADD / BET txs already processed & compacted are NEVER re-booked as new inbound.
+    const priorCompactedIds = new Set(hist.recentCompactedIds || []);
+
     // If a full genesis-to-tip read ran while older txs were compacted into hist.checkpoint,
     // reset checkpoint first so full finalRows are never double-counted against folded totals.
     if (!rows.partial && Number(hist.checkpoint?.count || 0) > 0) {
@@ -309,6 +326,7 @@ export const ledgerScannerMethods = {
         this._backfillDirtied = true;
       } else if (t.to === this.bankAddress && t.from !== this.bankAddress) {
         if (this.state.inbound[t.id] || this.engine.processedTxids.has(t.id)) continue;
+        if (this._isCompactedInbound(t.id, t.ts, priorCompactedIds)) continue;
         let memo = t.memo !== undefined && t.memo !== null ? String(t.memo) : undefined;
         if (memo === undefined) {
           try {

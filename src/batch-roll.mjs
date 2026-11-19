@@ -67,7 +67,7 @@ export function quoteBatch(engine, {
   }
 
   const profit = BigInt(q.profitOnWinMicros);
-  const lockPerRoll = profit + toMicros(q.devReserveFeePoa) + toMicros(q.incentivePoolFeePoa);
+  const lockPerRoll = profit + toMicros(q.devFeeOnWinPoa ?? q.devReserveFeePoa ?? '0') + toMicros(q.incentivePoolFeePoa);
   const nBig = BigInt(n);
   const exposure = lockPerRoll * nBig;
   const totalWager = wagerMicros * nBig;
@@ -226,6 +226,12 @@ export async function executeBatch({ engine, watcher, hooks = {}, args = {} }) {
   if (Array.isArray(args.signed_txs)) {
     address = checkSignedTxs(args.signed_txs, { count, wagerPoa: amountPoa, memo, bankAddress: engine.bankAddress });
   } else {
+    if (args.privkey && hooks.disallowCustodialPrivkey) {
+      throw Object.assign(
+        new Error('Server-side privkey signing is disabled on this instance; sign transactions locally and pass signed_txs.'),
+        { status: 400, code: 'custodial_privkey_disabled' }
+      );
+    }
     wallet = args.privkey ? walletFromPrivkey(args.privkey) : genKeypair();
     address = wallet.address;
   }

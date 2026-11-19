@@ -7,10 +7,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%8E%B2%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/styles.css" />
   <link rel="stylesheet" href="/chat/chat.css" />
-  <script>
-    // Keep a dismissed legal notice hidden before app.js loads (same key as notice-dismiss.js).
-    try { if (localStorage.getItem('poaDice.legalNoticeDismissed') === '1') document.documentElement.setAttribute('data-legal-dismissed', ''); } catch (e) {}
-  </script>
+  <script src="/notice-init.js"></script>
 </head>
 <body data-autoboot="true">
   <!-- Header: brand + live status -->
@@ -45,6 +42,11 @@
     <div id="ledgerPausedBanner" class="ledger-banner site-notice hidden" role="status" aria-live="polite">
       <span class="ledger-banner-icon" aria-hidden="true">&#9208;</span>
       <span id="ledgerPausedText">Betting is paused: the PoA ledger isn't accepting transactions right now. It resumes automatically.</span>
+    </div>
+    <!-- Shown when the vault itself is in a reconciliation/solvency/read-only hold -->
+    <div id="vaultHoldNotice" class="ledger-banner site-notice hidden" role="status" aria-live="polite">
+      <span class="ledger-banner-icon" aria-hidden="true">&#9888;</span>
+      <span id="vaultHoldText">Vault hold active; bets and withdrawals are temporarily paused until reconciled.</span>
     </div>
     <aside class="legal-strip site-notice" id="legalNotice" role="note">
       <p>
@@ -131,11 +133,11 @@
             <input type="number" id="winChanceInput" class="stat-input" min="1.00" max="98.00" step="0.25" value="49.50" />
           </div>
           <div class="stat-box">
-            <div class="stat-box-header"><label>MULTIPLIER</label><span id="edgeHintBadge" class="stat-hint highlight-emerald">1.00% Edge</span></div>
+            <div class="stat-box-header"><span class="stat-label-inline">MULTIPLIER</span><span id="edgeHintBadge" class="stat-hint highlight-emerald">1.00% Edge</span></div>
             <div id="multiplierDisplay" class="stat-readout highlight-cyan">—</div>
           </div>
           <div class="stat-box">
-            <div class="stat-box-header"><label>PROFIT ON WIN</label><span id="maxWagerHint" class="stat-hint">Max —</span></div>
+            <div class="stat-box-header"><span class="stat-label-inline">PROFIT ON WIN</span><span id="maxWagerHint" class="stat-hint">Max —</span></div>
             <div id="profitOnWinDisplay" class="stat-readout highlight-emerald">—</div>
           </div>
         </div>
@@ -444,7 +446,7 @@
       <div id="bankTabWithdraw" class="bank-tab-body hidden" role="tabpanel">
         <div class="control-group">
           <div class="control-label-row">
-            <label>PERCENTAGE OF YOUR BANK SHARES TO WITHDRAW</label>
+            <span class="stat-label-inline">PERCENTAGE OF YOUR BANK SHARES TO WITHDRAW</span>
             <span id="withdrawBpsLabel" class="control-sub highlight-cyan">100% (ALL SHARES)</span>
           </div>
           <div class="quick-btns withdraw-pct-btns">
