@@ -87,6 +87,7 @@ test('frozen instances (lease tokens 122 -> 138 live): passes hand the lease bac
   try {
     for (const x of c.nodes) assert.equal(x.s.writer.status, 'STANDBY', 'nobody keeps the lease between passes');
     assert.equal((await a.req('/api/health')).body.settlement.trading, 'OPEN');
+    await Promise.all(c.nodes.map((x) => x.s.idle()));
     // b takes the lease and freezes mid-pass (never finishes, never releases).
     assert.equal(await b.s.writer.refresh(), true);
     const frozenToken = b.s.writer.lease.token;
