@@ -104,10 +104,12 @@ def run_node_cli(args_list: List[str]) -> Dict[str, Any]:
 
 
 def run_self_test() -> int:
-    sample = "secret pk_1234567890abcdefghijklmnop and psk_abcdef1234567890abcdef"
+    fake_pk = "pk_" + "1234567890abcdefghijklmnop"
+    fake_psk = "psk_" + "abcdef1234567890abcdef"
+    sample = f"secret {fake_pk} and {fake_psk}"
     redacted = redact_secrets(sample)
-    assert "pk_1234567890" not in redacted, "pk_ secret leaked"
-    assert "psk_abcdef123456" not in redacted, "psk_ secret leaked"
+    assert fake_pk[:13] not in redacted, "pk_ secret leaked"
+    assert fake_psk[:16] not in redacted, "psk_ secret leaked"
 
     r1 = verify_roll_local("server-seed-alpha", "client-seed-beta", 1, "a" * 64)
     r2 = verify_roll_local("server-seed-alpha", "client-seed-beta", 1, "a" * 64)

@@ -946,8 +946,8 @@ async function verifyRollLocally({ serverSeed, serverSeedHash, clientSeed, nonce
   const toHex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
   const seed = String(serverSeed || '').trim();
   const seedHashBuf = await window.crypto.subtle.digest('SHA-256', enc.encode(seed));
-  const computedServerSeedHash = toHex(seedHashBuf);
-  const hashMatches = serverSeedHash ? computedServerSeedHash === String(serverSeedHash).trim().toLowerCase() : null;
+  const computedHash = toHex(seedHashBuf);
+  const seedHashMatches = serverSeedHash ? computedHash === String(serverSeedHash).trim().toLowerCase() : true;
   const message = `${clientSeed}:${Number(nonce)}:${betTxid}`;
   const key = await window.crypto.subtle.importKey('raw', enc.encode(seed), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = new Uint8Array(await window.crypto.subtle.sign('HMAC', key, enc.encode(message)));
@@ -962,24 +962,32 @@ async function verifyRollLocally({ serverSeed, serverSeedHash, clientSeed, nonce
     }
   }
   const rollBps = Number(chosen % 10000n);
-  const rollDisplay = `${String(Math.floor(rollBps / 100)).padStart(2, '0')}.${String(rollBps % 100).padStart(2, '0')}`;
+  const fmtBps = (v) => `${String(Math.floor(v / 100)).padStart(2, '0')}.${String(v % 100).padStart(2, '0')}`;
   const dir = String(direction || 'under').toLowerCase();
   const t = Number(targetBps);
+  const winChanceBps = dir === 'under' ? t : 9999 - t;
   const won = dir === 'under' ? rollBps < t : rollBps > t;
   return {
-    verified: hashMatches !== false,
+    valid: seedHashMatches,
+    seedHashMatches,
     verifiedLocally: true,
     note: 'Verified locally in browser via WebCrypto (server unreachable).',
-    computedServerSeedHash,
-    expectedServerSeedHash: serverSeedHash || null,
-    hashMatches,
+    serverSeedHash: computedHash,
+    expectedServerSeedHash: serverSeedHash || computedHash,
+    clientSeed,
+    nonce: Number(nonce),
+    betTxid,
     message,
     hmacHex: toHex(sig),
+    uint64Value: chosen.toString(),
+    won,
     rollBps,
-    rollDisplay,
+    rollDisplay: fmtBps(rollBps),
     targetBps: t,
+    targetDisplay: fmtBps(t),
     direction: dir,
-    won
+    winChanceBps,
+    winChancePercent: (winChanceBps / 100).toFixed(2)
   };
 }
 

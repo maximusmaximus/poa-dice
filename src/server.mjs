@@ -56,11 +56,22 @@ const MIME_TYPES = {
   '.js': 'application/javascript; charset=utf-8',
   '.mjs': 'application/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml'
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8'
 };
 
 /** POST paths that move POA; refused (503) while chain mode is read-only. */
 const WRITE_PATHS = new Set(['/api/tx/submit', '/api/action/sign-and-submit', '/api/action/auto-bet', '/api/action/batch-roll', '/api/dev/sweep', '/api/epoch/advance']);
+
+function isPrivilegedPath(pathname) {
+  return (
+    pathname.startsWith('/api/admin/') ||
+    pathname === '/api/seed/rotate' ||
+    pathname === '/api/dev/sweep' ||
+    pathname === '/api/epoch/advance' ||
+    pathname === '/api/settlement/tick'
+  );
+}
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -72,14 +83,28 @@ const SECURITY_HEADERS = {
 const HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://minepoa.com; frame-ancestors 'none'; base-uri 'self'; object-src 'none'";
 
-function sendJson(res, status, data) {
+function requestSecurityHeaders(req, { isHtml = false } = {}) {
+  const proto = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const isHttps = proto === 'https' || Boolean(req?.socket?.encrypted);
+  return {
+    ...SECURITY_HEADERS,
+    ...(isHttps ? { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } : {}),
+    ...(isHtml ? { 'Content-Security-Policy': HTML_CSP, 'Cross-Origin-Opener-Policy': 'same-origin' } : {})
+  };
+}
+
+function sendJsonResponse(res, status, data, { cors = true, req = null } = {}) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
-    ...SECURITY_HEADERS,
+    ...requestSecurityHeaders(req),
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    ...(cors
+      ? {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+        }
+      : {}),
     'Cache-Control': 'no-store',
     ...(status === 413 || status === 408 ? { Connection: 'close' } : {})
   });
@@ -540,13 +565,18 @@ export function createDiceServer(options = {}) {
     return sha256Equal(auth.slice(7), secret);
   }
 
-  function denyAdmin(res) {
-    return sendJson(res, adminToken ? 401 : 403, {
-      ok: false,
-      error: adminToken
-        ? 'Admin action: send Authorization: Bearer <POA_DICE_ADMIN_TOKEN>'
-        : 'Admin actions are disabled (set POA_DICE_ADMIN_TOKEN on the server to enable)'
-    });
+  function denyAdmin(res, req = null) {
+    return sendJsonResponse(
+      res,
+      adminToken ? 401 : 403,
+      {
+        ok: false,
+        error: adminToken
+          ? 'Admin action: send Authorization: Bearer <POA_DICE_ADMIN_TOKEN>'
+          : 'Admin actions are disabled (set POA_DICE_ADMIN_TOKEN on the server to enable)'
+      },
+      { cors: false, req }
+    );
   }
 
   async function assertChainSpendable(address, amountPoa) {
@@ -646,19 +676,32 @@ export function createDiceServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
+    const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const pathname = urlObj.pathname;
+    const privileged = isPrivilegedPath(pathname);
+    const sendJson = (r, status, data) => sendJsonResponse(r, status, data, { cors: !privileged, req });
+    const respondJson = (status, data) => sendJson(res, status, data);
     try {
       if (req.method === 'OPTIONS') {
         res.writeHead(204, {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+          ...requestSecurityHeaders(req),
+          ...(!privileged
+            ? {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+              }
+            : {})
         });
         res.end();
         return;
       }
 
-      const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-      const pathname = urlObj.pathname;
+      if (pathname === '/favicon.ico' && (req.method === 'GET' || req.method === 'HEAD')) {
+        res.writeHead(204, { ...requestSecurityHeaders(req), 'Cache-Control': 'public, max-age=86400' });
+        res.end();
+        return;
+      }
       // Hosts that freeze idle instances stall setInterval; any request nudges a stale settlement loop.
       // Serverless instances have no loop timer at all; the request kick (and the cron tick) drive them.
       if (settlement && (!readOnlyState || readOnlyState.retrying) && !settlement.passMode && (!settlement.lastTick || Date.now() - settlement.lastTick > 20000)) settlement.kick();
@@ -691,9 +734,9 @@ export function createDiceServer(options = {}) {
       // is finished by whichever instance holds the lease next. Bearer CRON_SECRET or the admin token.
       if (pathname === '/api/settlement/tick' && (req.method === 'GET' || req.method === 'POST')) {
         if (!bearerIs(req, cronSecret) && !isAdmin(req)) {
-          return sendJson(res, cronSecret || adminToken ? 401 : 403, { ok: false, error: cronSecret || adminToken ? 'Send Authorization: Bearer <CRON_SECRET>' : 'The tick endpoint is disabled (set CRON_SECRET on the server)' });
+          return respondJson(cronSecret || adminToken ? 401 : 403, { ok: false, error: cronSecret || adminToken ? 'Send Authorization: Bearer <CRON_SECRET>' : 'The tick endpoint is disabled (set CRON_SECRET on the server)' });
         }
-        if (!settlement) return sendJson(res, 503, { ok: false, error: readOnlyState ? readOnlyState.status : 'chain settlement is not running on this instance' });
+        if (!settlement) return respondJson(503, { ok: false, error: readOnlyState ? readOnlyState.status : 'chain settlement is not running on this instance' });
         const started = Date.now();
         let timer;
         const finished = await Promise.race([
@@ -703,7 +746,7 @@ export function createDiceServer(options = {}) {
           })
         ]).finally(() => clearTimeout(timer));
         const sum = settlement.summary();
-        return sendJson(res, 200, {
+        return respondJson(200, {
           ok: true,
           finished,
           tookMs: Date.now() - started,
@@ -1304,8 +1347,7 @@ export function createDiceServer(options = {}) {
         const ext = path.extname(filePath).toLowerCase();
         const contentType = MIME_TYPES[ext] || 'application/octet-stream';
         res.writeHead(200, {
-          ...SECURITY_HEADERS,
-          ...(ext === '.html' ? { 'Content-Security-Policy': HTML_CSP } : {}),
+          ...requestSecurityHeaders(req, { isHtml: ext === '.html' }),
           'Content-Type': contentType,
           'Cache-Control': 'no-cache'
         });
@@ -1313,9 +1355,9 @@ export function createDiceServer(options = {}) {
         return;
       }
 
-      return sendJson(res, 404, { error: `Route not found: ${pathname}` });
+      return respondJson(404, { error: `Route not found: ${pathname}` });
     } catch (err) {
-      return sendJson(res, err.status || 400, {
+      return respondJson(err.status || 400, {
         ok: false,
         ...(err.code ? { code: err.code } : {}),
         ...(err.retryable !== undefined ? { retryable: Boolean(err.retryable) } : {}),
@@ -1410,6 +1452,21 @@ if (isMain) {
     console.log(`  Dev Reserve  : ${DEV_RESERVE_ADDRESS} (0.1% reserved)`);
   });
   });
+
+  let shuttingDown = false;
+  const shutdown = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[poa-dice] Received ${sig}; flushing vault state and releasing writer lease...`);
+    const forceExit = setTimeout(() => process.exit(1), 10000);
+    if (forceExit.unref) forceExit.unref();
+    app
+      .close()
+      .catch((err) => console.error(`[poa-dice] shutdown error: ${redactSecrets(err?.message || err)}`))
+      .finally(() => process.exit(0));
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 /** One SSE frame per event (id line + JSON data line). */

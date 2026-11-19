@@ -340,7 +340,7 @@ button {
   font-family: var(--font-mono);
   font-size: 0.7rem;
   color: var(--text-muted);
-  margin-bottom: 8px;
+  margin-bottom: 20px;
 }
 
 .slider-track-wrap {
@@ -540,8 +540,14 @@ button {
   gap: 10px;
 }
 
+.prompt-actions {
+  margin-top: 10px;
+  display: flex;
+}
+
 .btn-primary-roll {
   flex: 1;
+  width: 100%;
   background: linear-gradient(135deg, #10b981 0%, #059669 100%);
   color: #041f16;
   font-weight: 800;
@@ -560,9 +566,16 @@ button {
   opacity: 0.88;
 }
 
-.btn-primary-roll:hover {
+.btn-primary-roll:hover:not(:disabled) {
   transform: translateY(-1px);
   filter: brightness(1.06);
+}
+
+.btn-primary-roll:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.55);
+  box-shadow: none;
 }
 
 .btn-secondary-roll {
@@ -1188,9 +1201,11 @@ html[data-legal-dismissed] .legal-strip {
 }
 .count-picker { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
 .count-btn {
-  padding: 10px 0; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle); background: var(--bg-input);
-  color: var(--text-primary); font: 700 14px var(--font-mono); cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  padding: 8px 4px; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle); background: var(--bg-input);
+  color: var(--text-primary); font: 700 14px/1.15 var(--font-mono); cursor: pointer;
 }
+.count-btn small { font-size: 0.66rem; font-weight: 600; opacity: 0.78; letter-spacing: 0.02em; }
 .count-btn.active { border-color: var(--cyan); background: rgba(56, 189, 248, 0.14); color: var(--cyan); }
 .count-btn:disabled { opacity: 0.38; cursor: not-allowed; text-decoration: line-through; }
 .batch-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
@@ -1519,4 +1534,13 @@ body.modal-open { overflow: hidden; }
   .stat-sub { font-size: 11px; }
   .site-notice { padding: 10px 12px; font-size: 0.84rem; }
   .site-notices .ledger-banner { margin: 10px 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

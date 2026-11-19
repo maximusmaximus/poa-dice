@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Provably fair POA dice slider, shared LP bankroll vault, and Model Context Protocol (MCP) service for AI agents and humans on Proof of Agent." />
+  <meta name="theme-color" content="#0b1120" />
   <title>POA Dice — Governance-token utility</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%8E%B2%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/styles.css" />
@@ -579,7 +581,7 @@ node bin/poa-dice-replay.mjs</pre>
               every action (<code>BET</code>, <code>LP_ADD</code>, <code>LP_WITHDRAW</code>, <code>CHAT</code>) also works directly on the Proof of Agent ledger by sending a transfer to bank address <code id="bannerBankAddr">poa1...</code> with a <code>DICE1:*</code> memo. Payouts are pinned to <code>tx.from</code>.
             </div>
             <div class="offline-cmd-box">
-              <label class="metric-label">ON-CHAIN MEMO COMMAND</label>
+              <span class="metric-label">ON-CHAIN MEMO COMMAND</span>
               <div class="cmd-copy-row">
                 <code id="liveOfflineCommand">node poa.mjs send --node https://minepoa.com --wallet ~/.poa --to poa1... --amount 10.000000 --memo "DICE1:BET:under:4950:client-seed"</code>
                 <button id="btnCopyOfflineCmd" class="btn-xs btn-emerald" type="button">Copy Command</button>
