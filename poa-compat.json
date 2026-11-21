@@ -1,0 +1,28 @@
+{
+  "project": "poa-dice",
+  "network": {
+    "origin": "https://minepoa.com",
+    "chainId": "poa-mainnet-1",
+    "clientMustMatch": "engine",
+    "expectFacts": { "chain_id": "poa-mainnet-1", "economics.K": 5 },
+    "expectStatus": { "K": 5 }
+  },
+  "failClosedOnPinMismatch": false,
+  "pins": [],
+  "surface": {
+    "snapshot": ".poa-compat/surface.json",
+    "uses": {
+      "exports": ["b58enc", "b58dec", "genKeypair", "addrOf", "pubOfAddr", "canonical", "sha256hex", "txidOf", "signBody", "verifyBody", "signRaw", "toMicros", "fromMicros", "buildTx"],
+      "critical": ["canonical", "txidOf", "signBody", "verifyBody", "signRaw", "addrOf", "pubOfAddr", "b58enc", "b58dec", "toMicros", "fromMicros"],
+      "txTypes": ["transfer"],
+      "fields": { "body": ["type", "from", "to", "amount", "memo", "nonce", "parents", "ts", "cid", "sig"] },
+      "constants": ["B58"]
+    }
+  },
+  "evidence": ".poa-compat/evidence.json",
+  "tests": [
+    "npm ci --ignore-scripts --no-audit --no-fund",
+    "node --test $(ls tests/*.test.mjs | grep -v -e e2e-browser-smoke -e chain-settlement -e claim-yield-principal)"
+  ],
+  "pr": { "base": "main", "branch": "poa-compat/update", "titlePrefix": "PoA core update", "labels": ["poa-compat"] }
+}
